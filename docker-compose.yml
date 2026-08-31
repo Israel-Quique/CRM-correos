@@ -1,0 +1,40 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: crm_integrador_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: crm_integrador
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - '5432:5432'
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: crm_integrador_ollama
+    restart: unless-stopped
+    ports:
+      - '11434:11434'
+    env_file:
+      - .env
+    volumes:
+      - ./ollama:/root/.ollama
+
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: crm_integrador_ollama_init
+    depends_on:
+      - ollama
+    env_file:
+      - .env
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${AI_MODEL:-llama3.1:8b}
+    entrypoint: ['/bin/sh', '-c']
+    command:
+      - |
+        until curl -sf http://ollama:11434/api/tags >/dev/null; do sleep 2; done
+        ollama pull "${OLLAMA_MODEL:-llama3.1:8b}"
