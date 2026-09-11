@@ -1,201 +1,170 @@
-﻿// @ts-nocheck
+// @ts-nocheck
 
 export const renderInternationalPipelineView = (ctx: any) => {
   const {
     state,
-    menuGroups,
     escapeHtml,
-    getBrandIcon,
-    getMenuGroupIcon,
-    getRobotIcon,
-    formatBoliviaTestPhone,
-    getFilteredContacts,
-    getContactPreviewLine,
-    getContactLastMessagePreview,
-    getContactConnectionLabel,
-    getContactConnectionClass,
     formatConversationTimestamp,
-    getStatusClass,
-    getFilteredEmsContacts,
-    getEmsStatusContacts,
-    getEmsStatusKey,
-    getEmsStatusLabel,
     getEmsStatusToneClass,
-    getEmsPhaseLabel,
-    getEmsPhaseDescription,
-    getChatContacts,
-    isAutoCreatedChatContact,
-    getConversationMessagesChronological,
-    renderConversationMessageMedia,
-    getConversationMediaUrl,
-    getAttachmentKindLabel,
-    isAiAssistedConversation,
-    getWhatsAppReference,
-    hasWhatsAppChannel,
-    isContactConnected,
-    getTrackingApiPagination,
-    renderTrackingApiRows,
-    renderTrackingApiPagination,
-    getContactPackagesPagination,
-    renderContactPackagesRows,
-    renderContactPackagesPagination,
     getTrackingPipelineColumns,
     getTrackingPipelineStage,
     renderCountryWithFlag,
     getTrackingOriginPhoneValue,
     getTrackingDestinationPhoneValue,
-    getContactPackageRemitenteName,
-    getContactPackageDestinatarioName,
-    getContactPackageRemitentePhone,
-    getContactPackageDestinatarioPhone,
-    getProntsColumnConfig,
-    getProntsColumnContacts,
-    getProntsSelectedContact,
-    getProntsTokenChips,
-    buildProntsSimulationResponse,
-    findPhoneCountry,
-    getFlagIconClass,
-    defaultWhatsAppCountry,
-    contactChannelOptions,
-    phoneCountryOptions,
-    truncateText,
-    getPhoneCountryLabel,
-    getCountryLabel,
-    getCountryIso2,
-    getCountryIso2FromLabel,
-    getGroupPickerResultsMarkup
   } = ctx
-  const columns = getTrackingPipelineColumns()
-  const totalItems = state.trackingApiPackages.length
-  const pipelineColumns = state.pipelineConfig.columns
 
-  const renderPipelineCard = (item: TrackingApiPackage) => {
-    const stage = getTrackingPipelineStage(item)
-    const stageLabel =
-      stage === 'delivered'
+  const columns = getTrackingPipelineColumns('international')
+  const pipelineColumns = state.pipelineConfig.columns
+  const orderedColumns = ['received', 'transit', 'regional', 'courier', 'delivered', 'cancelled']
+  const totalItems = orderedColumns.reduce((total, key) => total + (columns[key]?.length ?? 0), 0)
+  const isLoading = state.trackingApiState === 'loading' || state.trackingApiCatalogState === 'loading'
+
+  const getColumnTitle = (key: string) =>
+    pipelineColumns[key]?.title ??
+    (key === 'cancelled'
+      ? 'Cancelado'
+      : key === 'delivered'
         ? 'Entregado'
-          : stage === 'courier'
-            ? 'Cartero'
+        : key === 'courier'
+          ? 'Cartero'
+          : key === 'regional'
+            ? 'Recibido Destino'
+            : key === 'transit'
+              ? 'En Camino'
+              : 'Recibido Origen')
+
+  const getColumnHelper = (key: string) =>
+    pipelineColumns[key]?.helper ??
+    (key === 'cancelled'
+      ? 'Paquetes cancelados, anulados o rechazados.'
+      : key === 'delivered'
+        ? 'Entregas confirmadas y cerradas.'
+        : key === 'courier'
+          ? 'Paquetes asignados a reparto.'
+          : key === 'regional'
+            ? 'Paquetes recibidos en la regional de destino.'
+            : key === 'transit'
+              ? 'En tránsito hacia el destino final.'
+              : 'Paquetes recibidos en origen y agrupados para despacho.')
+
+  const getStageLabel = (stage: string) =>
+    stage === 'delivered'
+      ? 'Entregado'
+      : stage === 'courier'
+        ? 'Cartero'
         : stage === 'transit'
           ? 'En camino'
           : stage === 'regional'
-            ? 'Recibido regional'
-            : 'Recibido inicial'
+            ? 'Recibido destino'
+            : stage === 'cancelled'
+              ? 'Cancelado'
+              : 'Recibido origen'
+
+  const getPackageCode = (item: any) => item.codigo_s10 || item.codigo || 'Sin código'
+
+  const renderPipelineCard = (item: any) => {
+    const stage = getTrackingPipelineStage(item)
+    const code = getPackageCode(item)
+    const originName = item.origen?.nombre || item.origen?.codigo || 'Sin origen'
+    const destinationName = item.destino?.nombre || item.destino?.codigo || 'Sin destino'
 
     return `
-      <article class="international-pipeline-card">
-        <div class="international-pipeline-card-head">
-          <strong>${escapeHtml(item.codigo_s10 || item.codigo || 'Sin código')}</strong>
-          <span class="international-pipeline-badge ${stage}">${escapeHtml(stageLabel)}</span>
+      <button
+        class="ems-package-card ${stage}"
+        data-tracking-info="${escapeHtml(String(item.mailitm_pid ?? code))}"
+        type="button"
+      >
+        <div class="ems-package-card-top">
+          <div class="ems-package-avatar">${escapeHtml(String(code).slice(0, 1))}</div>
+          <div class="ems-package-copy">
+            <strong>${escapeHtml(code)}</strong>
+            <span>${escapeHtml(item.contenido || item.tipo_servicio || item.clase_correo || 'Tracking SITRA')}</span>
+          </div>
         </div>
-        <div class="international-pipeline-card-meta">
-          ${renderCountryWithFlag(item.origen.nombre || item.origen.codigo || 'Sin origen', item.origen.codigo)}
-          <span class="international-pipeline-arrow">-></span>
-          ${renderCountryWithFlag(item.destino.nombre || item.destino.codigo || 'Sin destino', item.destino.codigo)}
+        <p class="ems-package-message">${renderCountryWithFlag(originName, item.origen?.codigo)} <span class="international-pipeline-arrow">→</span> ${renderCountryWithFlag(destinationName, item.destino?.codigo)}</p>
+        <div class="ems-package-meta">
+          <span>${escapeHtml(item.remitente?.nombre || 'Tracking API')}</span>
+          <small>${escapeHtml(getTrackingOriginPhoneValue(item))} · Origen</small>
         </div>
-        <div class="international-pipeline-card-grid">
-          <span><strong>Servicio</strong>${escapeHtml(item.tipo_servicio || item.clase_correo || '—')}</span>
-          <span><strong>Peso</strong>${escapeHtml(item.peso == null ? '—' : `${item.peso} Kg`)}</span>
-          <span><strong>Tel. origen</strong>${escapeHtml(getTrackingOriginPhoneValue(item))}</span>
-          <span><strong>Tel. destino</strong>${escapeHtml(getTrackingDestinationPhoneValue(item))}</span>
+        <div class="ems-package-meta">
+          <span>${escapeHtml(item.destinatario?.nombre || 'Sin destinatario')}</span>
+          <small>${escapeHtml(getTrackingDestinationPhoneValue(item))} · Destino</small>
         </div>
-        <div class="international-pipeline-card-actions">
-          <small>${escapeHtml(formatConversationTimestamp(item.fecha_registro))}</small>
-          <button class="table-action-btn" data-tracking-info="${item.mailitm_pid}" type="button">Información</button>
+        <div class="ems-package-foot">
+          <span class="ems-package-time">${escapeHtml(formatConversationTimestamp(item.fecha_registro))}</span>
+          <span class="ems-package-badge ${getEmsStatusToneClass(stage)}">${escapeHtml(getStageLabel(stage))}</span>
         </div>
-      </article>
+      </button>
     `
   }
 
-  const renderColumn = (key: EmsColumnKey, items: TrackingApiPackage[]) => `
-    <section class="international-pipeline-column ${key}">
-      <div class="international-pipeline-column-head">
-        <div>
-          <strong>${escapeHtml(pipelineColumns[key].title)}</strong>
-          <small>${escapeHtml(pipelineColumns[key].helper)}</small>
+  const renderColumn = (key: string, index: number) => {
+    const items = columns[key] ?? []
+
+    return `
+      <section class="ems-kanban-column ${key}">
+        <div class="ems-kanban-column-head">
+          <div class="ems-kanban-column-title">
+            <span class="ems-dot ${key}"></span>
+            <div class="ems-kanban-column-heading">
+              <strong>${index + 1}. ${escapeHtml(getColumnTitle(key).toUpperCase())}</strong>
+              <span>${escapeHtml(getColumnHelper(key))}</span>
+            </div>
+          </div>
+          <div class="ems-column-head-actions">
+            <span class="ems-column-count">${items.length}</span>
+          </div>
         </div>
-        <span>${items.length}</span>
-      </div>
-      <button class="primary-btn ems-column-state-btn" data-open-api-pipeline-states type="button">+ Estados de paquetes</button>
-      <div class="international-pipeline-list">
-        ${
-          items.length > 0
-            ? items.map((item) => renderPipelineCard(item)).join('')
-            : `<div class="international-pipeline-empty">Sin paquetes en este estado.</div>`
-        }
-      </div>
-    </section>
-  `
+        <label class="ems-column-search">
+          <input type="text" value="" placeholder="Buscar por código..." disabled />
+        </label>
+        <div class="ems-column-actions">
+          <button class="secondary-btn ems-column-state-btn is-states" data-open-api-pipeline-states="${escapeHtml(key)}" type="button">+ Estados</button>
+          <button class="primary-btn ems-column-state-btn is-packages" type="button" disabled>+ Paquetes</button>
+        </div>
+        <div class="ems-column-list ems-dropzone">
+          ${
+            isLoading && items.length === 0
+              ? `<div class="empty-state ems-empty-column">Cargando paquetes...</div>`
+              : items.length > 0
+                ? items.slice(0, 8).map((item: any) => renderPipelineCard(item)).join('')
+                : `<div class="empty-state ems-empty-column">Sin paquetes en este estado.</div>`
+          }
+        </div>
+        <div class="ems-column-pagination">
+          <button class="secondary-btn" type="button" disabled>&lt;</button>
+          <span>${items.length > 8 ? `Mostrando 8 de ${items.length}` : `Total ${items.length}`}</span>
+          <button class="secondary-btn" type="button" disabled>&gt;</button>
+        </div>
+      </section>
+    `
+  }
 
   return `
     <section class="section-panel international-panel international-pipeline-panel ${state.activeView === 'internacionales-pipeline' ? 'is-visible' : ''}">
-      <div class="international-header international-header-compact">
-        <div>
-          <p class="section-kicker">Pipeline de Internacionales</p>
-          <h2>Flujo de seguimiento internacional</h2>
-          <p class="international-helper">Agrupa los paquetes por estado para ver el avance de cada envío.</p>
-        </div>
-      </div>
-
-      ${
-        state.trackingApiError
-          ? `<div class="notice-banner notice-banner-error">${escapeHtml(state.trackingApiError)}</div>`
-          : ''
-      }
-
-      ${
-        state.pipelineConfigError
-          ? `<div class="notice-banner notice-banner-error">${escapeHtml(state.pipelineConfigError)}</div>`
-          : ''
-      }
-
-      <div class="international-pipeline-summary">
-        <strong>${totalItems}</strong>
-        <span>paquetes cargados desde la API</span>
-      </div>
-
-      <section class="table-card pipeline-config-card">
-        <div class="table-toolbar pipeline-config-toolbar">
-          <div>
-            <strong>Configuración del pipeline</strong>
-            <span>Edita los nombres y descripciones de cada columna. Los prompts usan esta misma estructura.</span>
+      <div class="ems-control-board international-ems-board">
+        <div class="ems-control-header">
+          <div class="ems-control-copy">
+            <p class="section-kicker">Pipeline de internacionales</p>
+            <h2>Flujo de seguimiento internacional</h2>
+            <p class="ems-control-subtitle">Agrupa los paquetes de Tracking SITRA por estado para ver el avance de cada envío internacional.</p>
+            <strong class="international-pipeline-total">${totalItems} paquetes cargados desde Tracking API</strong>
           </div>
-          <div class="pipeline-config-actions">
-            <button class="secondary-btn" id="pipeline-reset-defaults" type="button">Restablecer</button>
-            <button class="primary-btn" id="pipeline-save-config" type="button" ${state.pipelineConfigState === 'submitting' ? 'disabled' : ''}>${state.pipelineConfigState === 'submitting' ? 'Guardando...' : 'Guardar pipeline'}</button>
+          <div class="ems-control-actions">
+            <button class="secondary-btn" id="refresh-tracking-packages" type="button" ${isLoading ? 'disabled' : ''}>Actualizar paquetes</button>
           </div>
         </div>
-        <div class="pipeline-config-grid">
-          ${(['received', 'transit', 'regional', 'courier', 'delivered'] as EmsColumnKey[])
-            .map(
-              (key) => `
-                <article class="pipeline-config-item">
-                  <strong>${escapeHtml(pipelineColumns[key].title)}</strong>
-                  <label>
-                    <span>Título</span>
-                    <input type="text" value="${escapeHtml(pipelineColumns[key].title)}" data-pipeline-title-input="${key}" />
-                  </label>
-                  <label>
-                    <span>Descripción</span>
-                    <input type="text" value="${escapeHtml(pipelineColumns[key].helper)}" data-pipeline-helper-input="${key}" />
-                  </label>
-                </article>
-              `,
-            )
-            .join('')}
-        </div>
-      </section>
 
-      <div class="international-pipeline-grid">
-        ${renderColumn('received', columns.received)}
-        ${renderColumn('transit', columns.transit)}
-        ${renderColumn('regional', columns.regional)}
-        ${renderColumn('courier', columns.courier)}
-        ${renderColumn('delivered', columns.delivered)}
+        ${
+          state.trackingApiError
+            ? `<div class="notice-banner notice-banner-error">${escapeHtml(state.trackingApiError)}</div>`
+            : ''
+        }
+
+        <div class="ems-kanban-grid international-kanban-board">
+          ${orderedColumns.map((key, index) => renderColumn(key, index)).join('')}
+        </div>
       </div>
     </section>
   `
 }
-
-
-

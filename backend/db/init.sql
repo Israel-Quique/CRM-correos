@@ -82,6 +82,28 @@ create table if not exists message_logs (
   created_at timestamptz not null default now()
 );
 
+create table if not exists whatsapp_auto_reply_queue (
+  id bigserial primary key,
+  contact_id integer references contacts (id) on delete set null,
+  sender text not null,
+  message_body text not null,
+  inbound_message_id bigint,
+  provider_message_id text,
+  media_descriptor jsonb not null default '{}'::jsonb,
+  status text not null default 'pending',
+  attempt_count integer not null default 0,
+  enqueued_at timestamptz not null default now(),
+  started_at timestamptz,
+  finished_at timestamptz,
+  error_message text
+);
+
+create index if not exists whatsapp_auto_reply_queue_status_id_idx
+  on whatsapp_auto_reply_queue (status, id);
+
+create index if not exists whatsapp_auto_reply_queue_enqueued_at_idx
+  on whatsapp_auto_reply_queue (enqueued_at, id);
+
 create table if not exists system_logs (
   id bigserial primary key,
   level text not null default 'info',
@@ -99,6 +121,9 @@ create table if not exists system_logs (
 create index if not exists system_logs_created_at_idx on system_logs (created_at desc);
 create index if not exists system_logs_level_idx on system_logs (level);
 create index if not exists system_logs_path_idx on system_logs (path);
+create index if not exists system_logs_created_at_id_idx on system_logs (created_at desc, id desc);
+create index if not exists system_logs_level_created_at_idx on system_logs (level, created_at desc);
+create index if not exists system_logs_path_created_at_idx on system_logs (path, created_at desc);
 
 alter table message_logs
   add column if not exists media_path text;
@@ -134,12 +159,16 @@ create table if not exists pipeline_states (
   state_key text not null,
   title text not null,
   helper text not null default '',
+  allowed_states jsonb not null default '[]'::jsonb,
   stage_order integer not null check (stage_order > 0),
   is_system boolean not null default false,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique (pipeline_key, state_key)
 );
+
+alter table if exists pipeline_states
+  add column if not exists allowed_states jsonb not null default '[]'::jsonb;
 
 create index if not exists pipeline_states_pipeline_order_idx
   on pipeline_states (pipeline_key, stage_order, id);

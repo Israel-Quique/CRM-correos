@@ -66,7 +66,7 @@ const siteBlocks = [
   'Portal de seguimiento comercial por cliente',
 ]
 
-const pipelineStageKeys = ['received', 'transit', 'regional', 'courier', 'delivered']
+const pipelineStageKeys = ['received', 'transit', 'regional', 'courier', 'delivered', 'cancelled']
 
 const defaultProntsConfig = {
   received: {
@@ -129,6 +129,18 @@ const defaultProntsConfig = {
     response:
       '// Presiona "Ejecutar Simulación de Prompt" para probar el comportamiento de esta columna en tiempo real.',
   },
+  cancelled: {
+    presetKey: 'cancelled',
+    systemPrompt:
+      'Eres un coordinador de excepciones EMS. Informas cancelaciones, anulaciones y rechazos con tono claro y directo, sin dejar dudas sobre el estado final.',
+    userTemplate:
+      'Genera una actualizacion para un envio cancelado:\n- Cliente: {cliente}\n- Tracking: {tracking}\n- Destino: {destino}\n- Estado: {estado}\n- Grupo: {grupoNombre}',
+    temperature: 0.2,
+    action: 'Registrar cancelacion y notificar WhatsApp',
+    sampleContactId: null,
+    response:
+      '// Presiona "Ejecutar Simulacion de Prompt" para probar el comportamiento de esta columna en tiempo real.',
+  },
 }
 
 const defaultPipelineConfig = {
@@ -152,6 +164,10 @@ const defaultPipelineConfig = {
     delivered: {
       title: 'Entregado',
       helper: 'Entregas confirmadas o cerradas',
+    },
+    cancelled: {
+      title: 'Cancelado',
+      helper: 'Paquetes cancelados, anulados o rechazados',
     },
   },
   customColumns: [],
@@ -234,15 +250,179 @@ const getContactPackagesApiDefaults = () => ({
     'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwOlwvXC9kZXYuY29ycmVvcy5nb2IuYm86MTgxMDAiLCJhdWQiOiJib2xpcG9zdC1kaXJlY2Npb25lcy1kZXN0aW5vIiwic3ViIjoiMiIsImp0aSI6IjhiMmM1YzM0YzFkZDkxODU3MTQ5Y2Q1YmVlYTM4M2MzYmMwMjMxOGJkYWI1NzRiZmFmNDgzYjAyMGRmN2Y1MmQiLCJuYW1lIjoiUG9zdG1hbiBwYXF1ZXRlcyBjb250YWN0b3MiLCJpYXQiOjE3ODczMzMxOTR9._6br-DyMNSkMen2NN2qBUouWjRlwk6A6KlUaYN1xcEQ',
 })
 
+const getStoredContactPackageCode = (row) => {
+  const profiles = Array.isArray(row?.social_profiles) ? row.social_profiles : []
+  const emsProfile = profiles.find((profile) => normalizeReference(profile?.channel).toLowerCase() === 'ems')
+  return normalizeReference(emsProfile?.reference)
+}
+
+const mapStoredContactToContactPackage = (row) => {
+  const code = getStoredContactPackageCode(row)
+  const destination = normalizeReference(row?.company).replace(/^Paquetes-Contactos API\s*·\s*/i, '')
+  const whatsappProfile = (Array.isArray(row?.social_profiles) ? row.social_profiles : []).find(
+    (profile) => normalizeReference(profile?.channel).toLowerCase() === 'whatsapp',
+  )
+
+  return {
+    id: row.id,
+    codigo: code,
+    tipo: 'SIOP',
+    fecha_registro: row?.updated_at,
+    estado: {
+      nombre: normalizeReference(row?.status) || 'Sin estado',
+    },
+    origen: {
+      nombre: 'Integracion EMS',
+      telefono: null,
+    },
+    remitente: {
+      nombre: 'Integracion EMS',
+      telefono: null,
+    },
+    destino: {
+      nombre: destination || 'Sin destino',
+      direccion: destination || '',
+      telefono: normalizeReference(whatsappProfile?.reference) || null,
+    },
+    destinatario: {
+      nombre: normalizeReference(row?.name) || 'Sin destinatario',
+      telefono: normalizeReference(whatsappProfile?.reference) || null,
+    },
+  }
+}
+
+const mapStoredContactToTrackingPackage = (row) => {
+  const code = getStoredContactPackageCode(row)
+  const destination = normalizeReference(row?.company).replace(/^Tracking API\s*·\s*/i, '')
+  const whatsappProfile = (Array.isArray(row?.social_profiles) ? row.social_profiles : []).find(
+    (profile) => normalizeReference(profile?.channel).toLowerCase() === 'whatsapp',
+  )
+
+  return {
+    mailitm_pid: row.id,
+    codigo: code,
+    codigo_s10: code,
+    fecha_registro: row?.updated_at,
+    numero_despacho: null,
+    tipo_servicio: 'SITRA',
+    peso: null,
+    clase_correo: 'SITRA',
+    contenido: normalizeReference(row?.segment) || 'Tracking API',
+    estado_postal: normalizeReference(row?.status) || 'Sin estado',
+    telefonos: {
+      remitente: null,
+      destinatario: normalizeReference(whatsappProfile?.reference) || null,
+    },
+    estado: {
+      nombre: normalizeReference(row?.status) || 'Sin estado',
+    },
+    remitente: {
+      nombre: 'Tracking API',
+      telefono: null,
+    },
+    destinatario: {
+      nombre: normalizeReference(row?.name) || 'Sin destinatario',
+      telefono: normalizeReference(whatsappProfile?.reference) || null,
+      direccion: destination || '',
+    },
+    origen: {
+      nombre: 'Tracking API',
+    },
+    destino: {
+      nombre: destination || 'Sin destino',
+    },
+    eventos: [],
+  }
+}
+
+const fetchStoredTrackingPackagesPage = async ({ page = 1, perPage = 10 } = {}) => {
+  await ensureDatabaseReady()
+  const safePage = Math.max(1, Number.parseInt(String(page), 10) || 1)
+  const safePerPage = Math.min(Math.max(1, Number.parseInt(String(perPage), 10) || 10), 200)
+  const offset = (safePage - 1) * safePerPage
+
+  const [itemsResult, countResult] = await Promise.all([
+    pool.query(
+      `
+        select id, name, company, channel, social_profiles, segment, owner_name, status, score, updated_at
+        from contacts
+        where segment ilike '%Tracking API%'
+        order by updated_at desc, id desc
+        limit $1 offset $2;
+      `,
+      [safePerPage, offset],
+    ),
+    pool.query(`
+      select count(*)::integer as total
+      from contacts
+      where segment ilike '%Tracking API%';
+    `),
+  ])
+
+  const total = Number(countResult.rows[0]?.total ?? 0)
+  const totalPages = Math.max(1, Math.ceil(total / safePerPage))
+
+  return {
+    data: itemsResult.rows.map(mapStoredContactToTrackingPackage),
+    paginacion: {
+      total_registros: total,
+      pagina_actual: safePage,
+      por_pagina: safePerPage,
+      ultima_pagina: totalPages,
+      desde: total === 0 ? 0 : offset + 1,
+      hasta: Math.min(offset + safePerPage, total),
+    },
+    source: 'local-db',
+  }
+}
+
+const fetchStoredContactPackagesPage = async ({ page = 1, perPage = 10 } = {}) => {
+  await ensureDatabaseReady()
+  const safePage = Math.max(1, Number.parseInt(String(page), 10) || 1)
+  const safePerPage = Math.min(Math.max(1, Number.parseInt(String(perPage), 10) || 10), 200)
+  const offset = (safePage - 1) * safePerPage
+
+  const [itemsResult, countResult] = await Promise.all([
+    pool.query(
+      `
+        select id, name, company, channel, social_profiles, segment, owner_name, status, score, updated_at
+        from contacts
+        where segment ilike '%Paquetes-contactos API%'
+        order by updated_at desc, id desc
+        limit $1 offset $2;
+      `,
+      [safePerPage, offset],
+    ),
+    pool.query(`
+      select count(*)::integer as total
+      from contacts
+      where segment ilike '%Paquetes-contactos API%';
+    `),
+  ])
+
+  const total = Number(countResult.rows[0]?.total ?? 0)
+  const totalPages = Math.max(1, Math.ceil(total / safePerPage))
+
+  return {
+    data: itemsResult.rows.map(mapStoredContactToContactPackage),
+    paginacion: {
+      total_registros: total,
+      pagina_actual: safePage,
+      por_pagina: safePerPage,
+      ultima_pagina: totalPages,
+      desde: total === 0 ? 0 : offset + 1,
+      hasta: Math.min(offset + safePerPage, total),
+    },
+    source: 'local-db',
+  }
+}
+
 const getPackageEventsApiDefaults = () => ({
   endpoint:
     process.env.PAQUETES_EVENTOS_API_URL?.trim() ??
-    'https://dev.correos.gob.bo:18100/api/paquetes-eventos',
+    'http://dev.correos.gob.bo:18100/api/paquetes-eventos',
   token:
     process.env.PAQUETES_EVENTOS_API_TOKEN?.trim() ??
-    process.env.PAQUETES_CONTACTOS_API_TOKEN?.trim() ??
-    process.env.TRACKING_SQLSERVER_TOKEN?.trim() ??
-    process.env.TRACKING_API_TOKEN?.trim() ??
     'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwOlwvXC9kZXYuY29ycmVvcy5nb2IuYm86MTgxMDAiLCJhdWQiOiJib2xpcG9zdC1kaXJlY2Npb25lcy1kZXN0aW5vIiwic3ViIjoiMTAsImp0aSI6IjU0NDE1OTNkYjM2MmExMjRlOThkYTQyZjNkMjgwNWE3NjZmZmZlZTk3ZTY2NzE1OWU3M2U1Y2FmNDYwN2Q4ZmUiLCJuYW1lIjoiRVZFTlRPUyBTSU9QIiwiaWF0IjoxNzg3NzU2ODQ5fQ.EKabodylKElq04t3EhXRwN7pxtAiWp5RuRvldZcFKq4',
 })
 
@@ -393,6 +573,16 @@ const fetchJsonWithTimeout = async (url, options = {}, timeoutMs = 15000) => {
   }
 }
 
+const describeFetchFailure = (error, fallbackMessage) => {
+  const parts = [
+    normalizeReference(error?.message),
+    normalizeReference(error?.cause?.code),
+    normalizeReference(error?.cause?.message),
+  ].filter(Boolean)
+
+  return parts.length > 0 ? `${fallbackMessage}: ${parts.join(' - ')}` : fallbackMessage
+}
+
 const getCachedValue = (cache, key) => {
   const cached = cache.get(key)
   if (!cached) return null
@@ -411,6 +601,8 @@ const setCachedValue = (cache, key, value, ttlMs) => {
   return value
 }
 
+const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
+
 const getNormalizedTimeoutMs = (value, fallbackMs) => {
   if (!Number.isFinite(value) || value <= 0) {
     return fallbackMs
@@ -423,6 +615,28 @@ app.get('/api/tracking/paquetes', cors(), authMiddleware, async (request, respon
   try {
     reloadLocalEnv()
     const trackingApiDefaults = getTrackingApiDefaults()
+
+    if (String(request.query.all ?? '').trim() === '1') {
+      let payload = null
+      try {
+        payload = await fetchAllTrackingPackagesCatalog({
+          forceRefresh: String(request.query.fresh ?? '').trim() === '1',
+        })
+      } catch (error) {
+        const fallbackPayload = await fetchStoredTrackingPackagesPage({ page: 1, perPage: 200 })
+        payload = {
+          data: fallbackPayload.data,
+          total: fallbackPayload.paginacion.total_registros,
+          cachedAt: new Date().toISOString(),
+          source: 'local-db',
+          warning: 'No se pudo consultar la API externa de tracking; se muestran datos locales sincronizados.',
+          upstreamError: error instanceof Error ? error.message : 'Error desconocido.',
+        }
+      }
+      response.json(payload)
+      return
+    }
+
     const upstreamUrl = new URL('/api/tracking/paquetes', trackingApiDefaults.baseUrl)
     const searchParams = new URLSearchParams()
 
@@ -459,9 +673,15 @@ app.get('/api/tracking/paquetes', cors(), authMiddleware, async (request, respon
 
     response.status(upstreamResponse.status).json(payload)
   } catch (error) {
-    response.status(502).json({
-      error: 'No se pudo consultar la API de tracking.',
-      message: error instanceof Error ? error.message : 'Error desconocido.',
+    const fallbackPayload = await fetchStoredTrackingPackagesPage({
+      page: request.query.page,
+      perPage: request.query.per_page,
+    })
+
+    response.json({
+      ...fallbackPayload,
+      warning: 'No se pudo consultar la API externa de tracking; se muestran datos locales sincronizados.',
+      upstreamError: error instanceof Error ? error.message : 'Error desconocido.',
     })
   }
 })
@@ -506,20 +726,32 @@ app.get('/api/internacionales/paquetes-contactos', cors(), authMiddleware, async
 
     response.status(upstreamResponse.status).json(payload)
   } catch (error) {
-    response.status(502).json({
-      error: 'No se pudo consultar la API de paquetes-contactos.',
-      message: error instanceof Error ? error.message : 'Error desconocido.',
+    const fallbackPayload = await fetchStoredContactPackagesPage({
+      page: request.query.page,
+      perPage: request.query.per_page,
+    })
+
+    response.json({
+      ...fallbackPayload,
+      warning: 'No se pudo consultar la API externa de paquetes-contactos; se muestran datos locales sincronizados.',
+      upstreamError: error instanceof Error ? error.message : 'Error desconocido.',
     })
   }
 })
 
 const normalizeReference = (value) => String(value ?? '').trim()
 const normalizePhoneNumber = (value) => normalizeReference(value).replace(/[^\d]/g, '')
-const fetchAllContactPackagesCatalog = async () => {
+const fetchAllContactPackagesCatalog = async ({ forceRefresh = false } = {}) => {
   const cacheKey = 'all'
   const cachedCatalog = getCachedValue(contactPackagesCatalogCache, cacheKey)
-  if (cachedCatalog) {
+  if (!forceRefresh && cachedCatalog) {
     return cachedCatalog
+  }
+
+  const inFlightCacheKey = `${cacheKey}-in-flight`
+  const pendingCatalog = getCachedValue(contactPackagesCatalogCache, inFlightCacheKey)
+  if (!forceRefresh && pendingCatalog) {
+    return pendingCatalog
   }
 
   reloadLocalEnv()
@@ -527,7 +759,7 @@ const fetchAllContactPackagesCatalog = async () => {
   const timeoutMs = Number.parseInt(process.env.CONTACT_PACKAGES_CATALOG_TIMEOUT_MS || '30000', 10)
   const upstreamUrl = new URL(contactPackagesApiDefaults.endpoint)
 
-  const items = await fetchAllPaginatedItems({
+  const catalogPromise = fetchAllPaginatedItems({
     url: upstreamUrl,
     headers: {
       Authorization: `Bearer ${contactPackagesApiDefaults.token}`,
@@ -537,17 +769,24 @@ const fetchAllContactPackagesCatalog = async () => {
     maxPages: 500,
     timeoutMs,
   })
+    .then((items) =>
+      setCachedValue(
+        contactPackagesCatalogCache,
+        cacheKey,
+        {
+          data: items,
+          total: items.length,
+          cachedAt: new Date().toISOString(),
+        },
+        CONTACT_PACKAGES_CATALOG_TTL_MS,
+      ),
+    )
+    .finally(() => {
+      contactPackagesCatalogCache.delete(inFlightCacheKey)
+    })
 
-  return setCachedValue(
-    contactPackagesCatalogCache,
-    cacheKey,
-    {
-      data: items,
-      total: items.length,
-      cachedAt: new Date().toISOString(),
-    },
-    CONTACT_PACKAGES_CATALOG_TTL_MS,
-  )
+  setCachedValue(contactPackagesCatalogCache, inFlightCacheKey, catalogPromise, CONTACT_PACKAGES_CATALOG_TTL_MS)
+  return catalogPromise
 }
 
 app.get('/api/internacionales/paquetes-contactos/catalog', cors(), authMiddleware, async (_request, response) => {
@@ -555,9 +794,14 @@ app.get('/api/internacionales/paquetes-contactos/catalog', cors(), authMiddlewar
     const catalog = await fetchAllContactPackagesCatalog()
     response.json(catalog)
   } catch (error) {
-    response.status(502).json({
-      error: 'No se pudo consultar el catalogo completo de paquetes-contactos.',
-      message: error instanceof Error ? error.message : 'Error desconocido.',
+    const fallbackPayload = await fetchStoredContactPackagesPage({ page: 1, perPage: 200 })
+    response.json({
+      data: fallbackPayload.data,
+      total: fallbackPayload.paginacion.total_registros,
+      cachedAt: new Date().toISOString(),
+      source: 'local-db',
+      warning: 'No se pudo consultar el catalogo externo de paquetes-contactos; se muestran datos locales sincronizados.',
+      upstreamError: error instanceof Error ? error.message : 'Error desconocido.',
     })
   }
 })
@@ -645,6 +889,56 @@ const fetchPackageEventsForCode = async (packageCode) => {
   }
 
   return setCachedValue(packageEventsCache, cacheKey, result, CONTACT_PACKAGES_CATALOG_TTL_MS)
+}
+
+const fetchAllPackageEventsCatalog = async ({ forceRefresh = false } = {}) => {
+  const cacheKey = 'all'
+  const cachedEvents = getCachedValue(packageEventsCache, cacheKey)
+  if (!forceRefresh && cachedEvents) {
+    return cachedEvents
+  }
+
+  const inFlightCacheKey = `${cacheKey}-in-flight`
+  const pendingEvents = getCachedValue(packageEventsCache, inFlightCacheKey)
+  if (!forceRefresh && pendingEvents) {
+    return pendingEvents
+  }
+
+  reloadLocalEnv()
+
+  const packageEventsApiDefaults = getPackageEventsApiDefaults()
+  const timeoutMs = Number.parseInt(process.env.PACKAGE_EVENTS_CATALOG_TIMEOUT_MS || '30000', 10)
+  const baseUrl = new URL(packageEventsApiDefaults.endpoint)
+  const headers = {
+    Authorization: `Bearer ${packageEventsApiDefaults.token}`,
+    Accept: 'application/json',
+  }
+
+  const catalogPromise = fetchAllPaginatedItems({
+    url: baseUrl,
+    headers,
+    perPage: 200,
+    maxPages: 500,
+    timeoutMs,
+  })
+    .then((data) =>
+      setCachedValue(
+        packageEventsCache,
+        cacheKey,
+        {
+          data,
+          total: data.length,
+          cachedAt: new Date().toISOString(),
+        },
+        CONTACT_PACKAGES_CATALOG_TTL_MS,
+      ),
+    )
+    .finally(() => {
+      packageEventsCache.delete(inFlightCacheKey)
+    })
+
+  setCachedValue(packageEventsCache, inFlightCacheKey, catalogPromise, CONTACT_PACKAGES_CATALOG_TTL_MS)
+  return catalogPromise
 }
 
 const normalizeBoliviaTestNumber = (value) => {
@@ -1062,7 +1356,7 @@ const saveSettingsByKey = async (integrationKey, settings) => {
 }
 
 const sanitizeProntsColumnConfig = (columnKey, config = {}) => {
-  const fallback = defaultProntsConfig[columnKey]
+  const fallback = defaultProntsConfig[columnKey] ?? defaultProntsConfig.received
   const sampleContactId = Number(config.sampleContactId)
   const temperature = Number(config.temperature)
 
@@ -1107,7 +1401,7 @@ const saveProntsConfig = async (partialConfig = {}) => {
 }
 
 const sanitizePipelineColumnConfig = (columnKey, config = {}) => {
-  const fallback = defaultPipelineConfig.columns[columnKey]
+  const fallback = defaultPipelineConfig.columns[columnKey] ?? defaultPipelineConfig.columns.received
 
   return {
     title: normalizeReference(config.title) || fallback.title,
@@ -1184,6 +1478,55 @@ const getStoredPipelineConfig = async (client = pool) => {
   )
 
   return buildPipelineConfigFromRows(result.rows)
+}
+
+const EmsStageKeys = ['received', 'transit', 'regional', 'courier', 'delivered', 'cancelled']
+
+const normalizeEmsStageOverrideKey = (value) => normalizeReference(value).toUpperCase()
+
+const normalizeEmsStageOverrideValue = (value) => {
+  const normalized = normalizeReference(value).toLowerCase()
+
+  if (EmsStageKeys.includes(normalized)) {
+    return normalized
+  }
+
+  return normalizeEmsStatus(normalized)
+}
+
+const normalizeEmsStageOverrideMap = (settings = {}) =>
+  Object.fromEntries(
+    Object.entries(settings)
+      .map(([key, value]) => [normalizeEmsStageOverrideKey(key), normalizeEmsStageOverrideValue(value)])
+      .filter(([key, value]) => Boolean(key) && Boolean(value)),
+  )
+
+const getStoredEmsStageOverrides = async (client = pool) => {
+  const settings = await getStoredSettingsByKey('crm_ems_stage_overrides', client)
+  return normalizeEmsStageOverrideMap(settings)
+}
+
+const saveEmsStageOverrides = async (partialOverrides = {}) => {
+  const currentOverrides = await getStoredEmsStageOverrides()
+  const nextOverrides = {
+    ...currentOverrides,
+    ...normalizeEmsStageOverrideMap(partialOverrides),
+  }
+
+  await saveSettingsByKey('crm_ems_stage_overrides', nextOverrides)
+  packageContextCache.clear()
+  return nextOverrides
+}
+
+const saveEmsStageOverride = async (packageCode, stage) => {
+  const key = normalizeEmsStageOverrideKey(packageCode)
+  const normalizedStage = normalizeEmsStageOverrideValue(stage)
+
+  if (!key || !normalizedStage) {
+    return getStoredEmsStageOverrides()
+  }
+
+  return saveEmsStageOverrides({ [key]: normalizedStage })
 }
 
 const savePipelineConfig = async (partialConfig = {}) => {
@@ -1327,15 +1670,67 @@ const extractContactPackagesPhoneCandidates = (item) => [
 ].map(normalizePhoneNumber).filter(Boolean)
 
 const getTrackingLatestEvent = (item) => {
-  const events = Array.isArray(item?.eventos) ? item.eventos : []
+  const events = Array.isArray(item?.eventos) ? item.eventos.filter(Boolean) : []
+  return events[events.length - 1] ?? null
+}
 
-  return events
-    .slice()
-    .sort((firstEvent, secondEvent) => {
-      const firstTime = Date.parse(normalizeReference(firstEvent?.fecha))
-      const secondTime = Date.parse(normalizeReference(secondEvent?.fecha))
-      return (Number.isNaN(secondTime) ? 0 : secondTime) - (Number.isNaN(firstTime) ? 0 : firstTime)
-    })[0] ?? null
+const getPackageLatestEvent = (item) => {
+  return getTrackingLatestEvent(item)
+}
+
+const getRegisteredLatestPackageEvent = (events = []) => {
+  const eventItems = Array.isArray(events) ? events.filter(Boolean) : []
+  return eventItems[0] ?? null
+}
+
+const buildLatestPackageEventsByCode = (events = []) => {
+  const latestEventsByCode = new Map()
+
+  ;(Array.isArray(events) ? events : []).forEach((event) => {
+    const eventCodes = getPackageEventCodeValuesForLookup(event)
+    eventCodes.forEach((code) => {
+      if (!code) return
+
+      const currentEvent = latestEventsByCode.get(code)
+      if (!currentEvent || getPackageEventTimestampValue(event) >= getPackageEventTimestampValue(currentEvent)) {
+        latestEventsByCode.set(code, event)
+      }
+    })
+  })
+
+  return latestEventsByCode
+}
+
+const getNationalPackageStageFromEvent = (event) => {
+  if (!event) return null
+
+  const eventId = Number(event?.evento_id ?? event?.codigo_evento)
+  if ([318, 295, 2239, 2240, 240, 2241, 297, 2242].includes(eventId)) return 'received'
+  if ([168, 296].includes(eventId)) return 'transit'
+  if ([310, 312, 183, 4410, 2103, 4405, 4404, 3345, 4400].includes(eventId)) return 'regional'
+  if ([4409, 315].includes(eventId)) return 'courier'
+  if (eventId === 316) return 'delivered'
+  if (eventId === 4402) return 'cancelled'
+
+  const eventText = normalizeReference(
+    [event?.nombre, event?.evento_api, event?.evento_original, event?.movimiento_bolivia, event?.detalle]
+      .filter(Boolean)
+      .join(' '),
+  ).toLowerCase()
+
+  if (eventText.includes('cartero') || eventText.includes('reparto')) return 'courier'
+  if (eventText.includes('listo para entregar') || eventText.includes('oficina de entrega')) return 'regional'
+  if (eventText.includes('cancel') || eventText.includes('anul') || eventText.includes('rechaz')) return 'cancelled'
+  if (eventText.includes('devuelto')) return 'cancelled'
+  if (eventText.includes('entreg')) return 'delivered'
+  if (eventText.includes('saca interna') || eventText.includes('salida') || eventText.includes('transito')) return 'transit'
+  if (eventText.includes('recibido') || eventText.includes('origen')) return 'received'
+
+  return null
+}
+
+const getPackageStageFromEvents = (item) => {
+  return getNationalPackageStageFromEvent(getPackageLatestEvent(item))
 }
 
 const getPackageStageRank = (stage) => {
@@ -1344,15 +1739,20 @@ const getPackageStageRank = (stage) => {
   if (stage === 'regional') return 2
   if (stage === 'courier') return 3
   if (stage === 'delivered') return 4
+  if (stage === 'cancelled') return 5
   return -1
 }
 
 const inferTrackingPackageStage = (item) => {
   const latestEvent = getTrackingLatestEvent(item)
+  const eventStage = getPackageStageFromEvents(item)
+  if (eventStage) return eventStage
+
   return (
     normalizeEmsStatus(
       [
         item?.estado_postal,
+        latestEvent?.nombre,
         latestEvent?.evento_api,
         latestEvent?.evento_original,
         latestEvent?.detalle,
@@ -1365,9 +1765,50 @@ const inferTrackingPackageStage = (item) => {
   )
 }
 
+const getPackageEventLabel = (event) =>
+  normalizeReference(
+    event?.nombre ||
+      event?.evento_api ||
+      event?.evento_original ||
+      event?.movimiento_bolivia ||
+      event?.detalle ||
+      'Nuevo movimiento',
+  )
+
+const getPackageEventSignature = (event) => {
+  if (!event) return ''
+
+  return [
+    event?.evento_id,
+    event?.codigo_evento,
+    getPackageEventLabel(event),
+    getPackageEventLocation(event),
+    normalizeReference(event?.fecha),
+  ]
+    .map((value) => normalizeReference(value).toUpperCase())
+    .filter(Boolean)
+    .join('|')
+}
+
 const inferContactPackageStage = (item) => {
   const statusText = normalizeReference(item?.estado?.nombre)
   const normalizedStatus = statusText.toLowerCase()
+  const latestEventStage = getPackageStageFromEvents(item)
+
+  if (latestEventStage) {
+    return latestEventStage
+  }
+
+  if (
+    normalizedStatus.includes('regional') ||
+    normalizedStatus.includes('destino') ||
+    normalizedStatus.includes('recibido destino') ||
+    normalizedStatus.includes('recibido regional') ||
+    normalizedStatus.includes('sucursal de destino') ||
+    normalizedStatus.includes('pasar a recoger')
+  ) {
+    return 'regional'
+  }
 
   if (
     normalizedStatus.includes('cartero') ||
@@ -1384,6 +1825,16 @@ const inferContactPackageStage = (item) => {
     normalizedStatus.includes('cerrad')
   ) {
     return 'delivered'
+  }
+
+  if (
+    normalizedStatus.includes('cancel') ||
+    normalizedStatus.includes('anul') ||
+    normalizedStatus.includes('rechaz') ||
+    normalizedStatus.includes('cancelado') ||
+    normalizedStatus.includes('cancelada')
+  ) {
+    return 'cancelled'
   }
 
   if (
@@ -1439,6 +1890,7 @@ const getPackageContactStatusForStage = (stage) => {
   if (stage === 'regional') return 'Recibido Destino'
   if (stage === 'courier') return 'Cartero'
   if (stage === 'delivered') return 'Entregado'
+  if (stage === 'cancelled') return 'Cancelado'
   return 'Nuevo'
 }
 
@@ -1447,6 +1899,7 @@ const getPackageContactScoreForStage = (stage) => {
   if (stage === 'courier') return 85
   if (stage === 'regional') return 70
   if (stage === 'transit') return 55
+  if (stage === 'cancelled') return 95
   return 40
 }
 
@@ -1484,6 +1937,8 @@ const mergeUniqueProfiles = (baseProfiles = [], nextProfiles = []) => {
 
 const getPackageCodeFromItem = (item) =>
   normalizePackageCodeForLookup(item?.codigo_s10 || item?.codigo || item?.codigoSeguimiento || item?.tracking)
+
+const isNationalPackageCode = (code) => /^[A-Z]{1,2}\d+[A-Z]{2}$/.test(normalizePackageCodeForLookup(code)) && normalizePackageCodeForLookup(code).endsWith('BO')
 
 const getPackageSyncPhoneCandidates = (item, source = 'tracking') => {
   if (source === 'contact') {
@@ -1624,11 +2079,17 @@ const upsertPackageContact = async (client, entry) => {
   return insertedRow ? { ...insertedRow, action: 'created' } : null
 }
 
-const fetchAllTrackingPackagesCatalog = async () => {
+const fetchAllTrackingPackagesCatalog = async ({ forceRefresh = false } = {}) => {
   const cacheKey = 'all'
   const cachedCatalog = getCachedValue(packagePipelineSyncCache, cacheKey)
-  if (cachedCatalog) {
+  if (!forceRefresh && cachedCatalog) {
     return cachedCatalog
+  }
+
+  const inFlightCacheKey = `${cacheKey}-tracking-in-flight`
+  const pendingCatalog = getCachedValue(packagePipelineSyncCache, inFlightCacheKey)
+  if (!forceRefresh && pendingCatalog) {
+    return pendingCatalog
   }
 
   reloadLocalEnv()
@@ -1636,26 +2097,225 @@ const fetchAllTrackingPackagesCatalog = async () => {
   const trackingApiDefaults = getTrackingApiDefaults()
   const trackingUrl = new URL('/api/tracking/paquetes', trackingApiDefaults.baseUrl)
 
-  const items = await fetchAllPaginatedItems({
+  const catalogPromise = fetchAllPaginatedItems({
     url: trackingUrl,
     headers: {
       Authorization: `Bearer ${trackingApiDefaults.token}`,
       Accept: 'application/json',
     },
-    perPage: 100,
-    maxPages: 50,
+    perPage: 200,
+    maxPages: 500,
+  })
+    .then((items) =>
+      setCachedValue(
+        packagePipelineSyncCache,
+        cacheKey,
+        {
+          data: items,
+          total: items.length,
+          cachedAt: new Date().toISOString(),
+        },
+        CONTACT_PACKAGES_CATALOG_TTL_MS,
+      ),
+    )
+    .finally(() => {
+      packagePipelineSyncCache.delete(inFlightCacheKey)
+    })
+
+  setCachedValue(packagePipelineSyncCache, inFlightCacheKey, catalogPromise, CONTACT_PACKAGES_CATALOG_TTL_MS)
+  return catalogPromise
+}
+
+const getCachedTrackingPackagesCatalog = () => {
+  const cachedCatalog = getCachedValue(packagePipelineSyncCache, 'all')
+  if (!cachedCatalog || !Array.isArray(cachedCatalog.data)) {
+    return null
+  }
+
+  return cachedCatalog
+}
+
+const getCachedContactPackagesCatalog = () => {
+  const cachedCatalog = getCachedValue(contactPackagesCatalogCache, 'all')
+  if (!cachedCatalog || !Array.isArray(cachedCatalog.data)) {
+    return null
+  }
+
+  return cachedCatalog
+}
+
+const getEmsPipelineMonthKey = (value) => {
+  const normalized = normalizeReference(value)
+  if (!normalized) return ''
+
+  const parsed = Date.parse(normalized)
+  if (!Number.isFinite(parsed)) return ''
+
+  const date = new Date(parsed)
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`
+}
+
+const getEmsStatusLabel = (status) => {
+  if (status === 'received') return 'Recibido Origen'
+  if (status === 'transit') return 'En Camino'
+  if (status === 'regional') return 'Recibido Destino'
+  if (status === 'courier') return 'Cartero'
+  if (status === 'delivered') return 'Entregado'
+  if (status === 'cancelled') return 'Cancelado'
+  return normalizeReference(status) || 'Sin estado'
+}
+
+const getEmsStageFromContactStatus = (status) => {
+  const normalizedStatus = normalizeReference(status).toLowerCase()
+  if (normalizedStatus.includes('cancel')) return 'cancelled'
+  if (normalizedStatus.includes('entregado') || normalizedStatus.includes('cerrado')) return 'delivered'
+  if (normalizedStatus.includes('cartero') || normalizedStatus.includes('reparto')) return 'courier'
+  if (normalizedStatus.includes('destino') || normalizedStatus.includes('regional')) return 'regional'
+  if (
+    normalizedStatus.includes('camino') ||
+    normalizedStatus.includes('transito') ||
+    normalizedStatus.includes('tránsito') ||
+    normalizedStatus.includes('seguimiento')
+  ) {
+    return 'transit'
+  }
+  return 'received'
+}
+
+const getEmsPackageCodeFromContact = (contact) => {
+  const profiles = Array.isArray(contact?.social_profiles) ? contact.social_profiles : []
+  const emsProfile = profiles.find((profile) => normalizeReference(profile?.channel).toLowerCase() === 'ems')
+  const profileReference = normalizeReference(emsProfile?.reference)
+  if (profileReference) return profileReference
+
+  return (
+    extractPackageCode(
+      [
+        contact?.name,
+        contact?.company,
+        contact?.segment,
+        JSON.stringify(contact?.social_profiles ?? []),
+      ].join(' '),
+    ) || ''
+  )
+}
+
+const fetchStoredEmsPipelineContacts = async () => {
+  await ensureDatabaseReady()
+  const result = await pool.query(`
+    select id, name, company, channel, social_profiles, segment, owner_name, status, score, updated_at
+    from contacts
+    where segment ilike '%Paquetes-contactos API%'
+    order by updated_at desc, id desc;
+  `)
+
+  return result.rows
+}
+
+const buildEmsPipelineCards = async () => {
+  // NO TOCAR: Pipeline Nacional validado. Usa Paquetes-Contactos API como fuente principal; Tracking API corresponde a Internacional.
+  await Promise.all([
+    getCachedContactPackagesCatalog() ? Promise.resolve() : fetchAllContactPackagesCatalog(),
+    getCachedValue(packageEventsCache, 'all') ? Promise.resolve() : fetchAllPackageEventsCatalog().catch(() => null),
+  ])
+
+  const contactCatalog = getCachedContactPackagesCatalog()?.data ?? []
+  const packageEventsCatalog = getCachedValue(packageEventsCache, 'all')?.data ?? []
+  const storedContacts = await fetchStoredEmsPipelineContacts()
+  const latestEventsByCode = buildLatestPackageEventsByCode(packageEventsCatalog)
+  const [pipelineConfig, overrides] = await Promise.all([getStoredPipelineConfig(), getStoredEmsStageOverrides()])
+  const customColumns = Array.isArray(pipelineConfig?.customColumns) ? pipelineConfig.customColumns : []
+  const overrideMap = normalizeEmsStageOverrideMap(overrides)
+  const cards = []
+  const registeredCardCodes = new Set()
+
+  contactCatalog.forEach((item, index) => {
+    const code = normalizeReference(item?.codigo) || `CP-${index + 1}`
+    if (!code) return
+    const normalizedCode = normalizePackageCodeForLookup(code)
+    if (registeredCardCodes.has(normalizedCode)) return
+    registeredCardCodes.add(normalizedCode)
+
+    const registeredLatestEvent = latestEventsByCode.get(normalizedCode)
+    const stage = overrideMap[code] ?? getNationalPackageStageFromEvent(registeredLatestEvent) ?? inferContactPackageStage(item)
+    const senderName =
+      normalizeReference(item?.remitente?.nombre) || normalizeReference(item?.origen?.nombre) || 'Sin remitente'
+    const recipientName =
+      normalizeReference(item?.destinatario?.nombre) || normalizeReference(item?.destino?.nombre) || 'Sin destinatario'
+
+    cards.push({
+      id: `contact-${item?.id ?? code}`,
+      stage,
+      code,
+      title: code,
+      summary: `${senderName} -> ${recipientName}`,
+      senderName,
+      senderReference:
+        normalizeReference(item?.remitente?.telefono) || normalizeReference(item?.origen?.telefono) || 'Sin referencia',
+      recipientName,
+      recipientReference:
+        normalizeReference(item?.destinatario?.telefono) || normalizeReference(item?.destino?.telefono) || 'Sin referencia',
+      destination:
+        normalizeReference(item?.destino?.direccion) ||
+        normalizeReference(item?.destino?.nombre) ||
+        normalizeReference(item?.destinatario?.direccion) ||
+        'Sin destino',
+      status: getPackageEventLabel(registeredLatestEvent) || normalizeReference(item?.estado?.nombre) || getEmsStatusLabel(stage),
+      updatedAt:
+        getPackageContextDateValue(registeredLatestEvent?.fecha_registro) ||
+        getPackageContextDateValue(registeredLatestEvent?.fecha) ||
+        getPackageContextDateValue(item?.fecha_registro) ||
+        new Date().toISOString(),
+      sourceKind: 'contact',
+    })
   })
 
-  return setCachedValue(
-    packagePipelineSyncCache,
-    cacheKey,
-    {
-      data: items,
-      total: items.length,
-      cachedAt: new Date().toISOString(),
-    },
-    CONTACT_PACKAGES_CATALOG_TTL_MS,
-  )
+  storedContacts.forEach((contact) => {
+    const code = normalizePackageCodeForLookup(getEmsPackageCodeFromContact(contact))
+    if (!code || registeredCardCodes.has(code)) return
+
+    const registeredLatestEvent = latestEventsByCode.get(code)
+    const stage = overrideMap[code] ?? getNationalPackageStageFromEvent(registeredLatestEvent) ?? getEmsStageFromContactStatus(contact?.status)
+    const eventLabel = getPackageEventLabel(registeredLatestEvent) || getPackageEventTitle(registeredLatestEvent)
+    const eventLocation = getPackageEventLocation(registeredLatestEvent)
+    registeredCardCodes.add(code)
+    cards.push({
+      id: `stored-contact-${contact.id}`,
+      stage,
+      code,
+      title: code,
+      summary: eventLabel || normalizeReference(contact?.company) || normalizeReference(contact?.segment) || 'Paquete sincronizado',
+      senderName: normalizeReference(contact?.owner_name) || 'Integracion EMS',
+      senderReference: 'Sin referencia',
+      recipientName: normalizeReference(contact?.name) || 'Sin destinatario',
+      recipientReference:
+        (Array.isArray(contact?.social_profiles)
+          ? normalizeReference(
+              contact.social_profiles.find((profile) => normalizeReference(profile?.channel).toLowerCase() === 'whatsapp')
+                ?.reference,
+            )
+          : '') || 'Sin referencia',
+      destination: eventLocation || normalizeReference(contact?.company) || 'Sin destino',
+      status: eventLabel || normalizeReference(contact?.status) || getEmsStatusLabel(stage),
+      updatedAt:
+        getPackageContextDateValue(registeredLatestEvent?.fecha_registro) ||
+        getPackageContextDateValue(registeredLatestEvent?.fecha) ||
+        getPackageContextDateValue(registeredLatestEvent?.created_at) ||
+        (contact?.updated_at ? new Date(contact.updated_at).toISOString() : new Date().toISOString()),
+      sourceKind: 'stored-contact',
+    })
+  })
+
+  cards.sort((firstCard, secondCard) => {
+    const firstTime = Date.parse(firstCard.updatedAt)
+    const secondTime = Date.parse(secondCard.updatedAt)
+    if (Number.isFinite(firstTime) && Number.isFinite(secondTime) && firstTime !== secondTime) {
+      return secondTime - firstTime
+    }
+    return String(firstCard.code).localeCompare(String(secondCard.code), 'es')
+  })
+
+  return { cards, customColumns }
 }
 
 const syncPackagePipelineFromApis = async () => {
@@ -1663,9 +2323,14 @@ const syncPackagePipelineFromApis = async () => {
   reloadLocalEnv()
 
   const [trackingItems, contactPackageCatalog] = await Promise.all([
-    fetchAllTrackingPackagesCatalog().then((payload) => payload.data ?? []),
-    fetchAllContactPackagesCatalog().then((payload) => payload.data ?? []),
+    fetchAllTrackingPackagesCatalog({ forceRefresh: true }).then((payload) => payload.data ?? []),
+    fetchAllContactPackagesCatalog({ forceRefresh: true }).then((payload) => payload.data ?? []),
   ])
+  const latestEventsByCode = buildLatestPackageEventsByCode(
+    await fetchAllPackageEventsCatalog({ forceRefresh: true })
+      .then((payload) => payload.data ?? [])
+      .catch(() => []),
+  )
 
   const packageEntriesByCode = new Map()
   const registerEntry = (entry) => {
@@ -1685,11 +2350,9 @@ const syncPackagePipelineFromApis = async () => {
     existing.phoneCandidates = new Set([...(existing.phoneCandidates ?? []), ...(entry.phoneCandidates ?? [])])
 
     const shouldReplace =
-      getPackageStageRank(entry.stage) > getPackageStageRank(existing.stage) ||
-      (getPackageStageRank(entry.stage) === getPackageStageRank(existing.stage) &&
-        (entry.updatedAt > existing.updatedAt ||
-          (entry.updatedAt === existing.updatedAt &&
-            getPackageSyncEntrySpecificity(entry) > getPackageSyncEntrySpecificity(existing))))
+      entry.updatedAt > existing.updatedAt ||
+      (entry.updatedAt === existing.updatedAt &&
+        getPackageSyncEntrySpecificity(entry) > getPackageSyncEntrySpecificity(existing))
 
     if (shouldReplace) {
       packageEntriesByCode.set(entry.code, {
@@ -1705,13 +2368,15 @@ const syncPackagePipelineFromApis = async () => {
     const code = getPackageCodeFromItem(item)
     if (!code) return
 
-    const latestEvent = getTrackingLatestEvent(item)
-    const stage = inferTrackingPackageStage(item)
+    const registeredLatestEvent = latestEventsByCode.get(normalizePackageCodeForLookup(code))
+    const latestEvent = registeredLatestEvent ?? getTrackingLatestEvent(item)
+    const stage = getNationalPackageStageFromEvent(registeredLatestEvent) ?? inferTrackingPackageStage(item)
     registerEntry({
       code,
       source: 'tracking',
       stage,
       updatedAt:
+        getPackageContextDateValue(latestEvent?.fecha_registro) ||
         getPackageContextDateValue(latestEvent?.fecha) ||
         getPackageContextDateValue(item?.fecha_registro) ||
         0,
@@ -1724,6 +2389,10 @@ const syncPackagePipelineFromApis = async () => {
         '',
       senderName: normalizeReference(item?.remitente?.nombre) || '',
       primaryPhone: getPackageSyncPhoneCandidates(item, 'tracking')[0] || '',
+      latestEventLabel: getPackageEventLabel(latestEvent),
+      latestEventLocation: getPackageEventLocation(latestEvent),
+      latestEventDate: normalizeReference(latestEvent?.fecha),
+      latestEventSignature: getPackageEventSignature(latestEvent),
       sources: ['Tracking'],
       phoneCandidates: getPackageSyncPhoneCandidates(item, 'tracking'),
     })
@@ -1733,12 +2402,17 @@ const syncPackagePipelineFromApis = async () => {
     const code = getPackageCodeFromItem(item)
     if (!code) return
 
-    const stage = inferContactPackageStage(item)
+    const registeredLatestEvent = latestEventsByCode.get(normalizePackageCodeForLookup(code))
+    const stage = getNationalPackageStageFromEvent(registeredLatestEvent) ?? inferContactPackageStage(item)
     registerEntry({
       code,
       source: 'contact',
       stage,
-      updatedAt: getPackageContextDateValue(item?.fecha_registro) || 0,
+      updatedAt:
+        getPackageContextDateValue(registeredLatestEvent?.fecha_registro) ||
+        getPackageContextDateValue(registeredLatestEvent?.fecha) ||
+        getPackageContextDateValue(item?.fecha_registro) ||
+        0,
       originLabel: getPackageLocationLabel(item?.origen, 'Sin origen'),
       destinationLabel:
         getPackageDepartmentLabel(item?.destino) ||
@@ -1752,6 +2426,16 @@ const syncPackagePipelineFromApis = async () => {
       recipientName: normalizeReference(item?.destinatario?.nombre) || '',
       senderName: normalizeReference(item?.remitente?.nombre) || '',
       primaryPhone: getPackageSyncPhoneCandidates(item, 'contact')[0] || '',
+      latestEventLabel: getPackageEventLabel(registeredLatestEvent) || normalizeReference(item?.estado?.nombre) || 'Paquete registrado',
+      latestEventLocation: getPackageEventLocation(registeredLatestEvent) || getPackageLocationLabel(item?.origen, ''),
+      latestEventDate: normalizeReference(registeredLatestEvent?.fecha_registro) || normalizeReference(registeredLatestEvent?.fecha) || normalizeReference(item?.fecha_registro),
+      latestEventSignature: getPackageEventSignature(registeredLatestEvent) || [
+        normalizeReference(item?.estado?.nombre) || 'Paquete registrado',
+        normalizeReference(item?.fecha_registro),
+      ]
+        .map((value) => normalizeReference(value).toUpperCase())
+        .filter(Boolean)
+        .join('|'),
       sources: ['Paquetes-Contactos'],
       phoneCandidates: getPackageSyncPhoneCandidates(item, 'contact'),
     })
@@ -1762,6 +2446,7 @@ const syncPackagePipelineFromApis = async () => {
   const syncedAt = new Date().toISOString()
   let createdCount = 0
   let updatedCount = 0
+  const syncedEntries = []
 
   try {
     await client.query('begin')
@@ -1772,6 +2457,9 @@ const syncPackagePipelineFromApis = async () => {
         createdCount += 1
       } else if (nextResult?.action === 'updated') {
         updatedCount += 1
+      }
+      if (nextResult?.id) {
+        syncedEntries.push({ ...entry, contactId: nextResult.id })
       }
     }
 
@@ -1793,6 +2481,17 @@ const syncPackagePipelineFromApis = async () => {
       syncedAt,
     },
   }).catch(() => {})
+
+  await notifyPackageEventChanges(syncedEntries).catch(async (error) => {
+    await writeSystemLog({
+      level: 'error',
+      event: 'package_event_change_notification_failed',
+      statusCode: 500,
+      details: {
+        error: error instanceof Error ? error.message : 'Error desconocido.',
+      },
+    }).catch(() => {})
+  })
 
   return {
     syncedAt,
@@ -1827,6 +2526,158 @@ const ensurePackagePipelineSync = async ({ force = false } = {}) => {
 
   setCachedValue(packagePipelineSyncCache, 'in-flight', syncPromise, PACKAGE_PIPELINE_SYNC_TTL_MS)
   return syncPromise
+}
+
+const getPackagePipelineSyncSnapshot = () => {
+  const cached = getCachedValue(packagePipelineSyncCache, 'last-sync')
+  return cached && typeof cached === 'object' ? cached : null
+}
+
+const buildPackageEventChangeMessage = ({ contact, entry }) => {
+  const contactName = normalizeReference(contact?.name) || 'Hola'
+  const packageCode = normalizeReference(entry?.code) || 'tu guia'
+  const destination = normalizeReference(entry?.destinationLabel) || 'destino'
+  const eventLabel = normalizeReference(entry?.latestEventLabel) || 'Nuevo movimiento registrado'
+  const eventLocation = normalizeReference(entry?.latestEventLocation)
+  const eventDate = normalizeReference(entry?.latestEventDate)
+  const locationText = eventLocation ? ` en ${eventLocation}` : ''
+  const dateText = eventDate ? ` (${eventDate})` : ''
+
+  return [
+    `¡Hola, ${contactName}! 👋 Tenemos una actualización de tu paquete ${packageCode}.`,
+    '',
+    `📍 Nuevo evento: ${eventLabel}${locationText}${dateText}.`,
+    `🚚 Destino: ${destination}. Te avisaremos cuando se confirme el siguiente movimiento.`,
+  ].join('\n')
+}
+
+const notifyPackageEventChanges = async (entries = []) => {
+  const config = await getStoredWhatsAppConfig()
+  const configError = validateWhatsAppConfig(config)
+
+  if (configError) {
+    return { sent: 0, skipped: entries.length, reason: configError }
+  }
+
+  let sent = 0
+  let skipped = 0
+
+  for (const entry of entries) {
+    const packageCode = normalizePackageCodeForLookup(entry?.code)
+    const eventSignature = normalizeReference(entry?.latestEventSignature)
+    const targetPhone = normalizePhoneNumber(entry?.primaryPhone)
+
+    if (!packageCode || !eventSignature || !targetPhone || !entry?.contactId) {
+      skipped += 1
+      continue
+    }
+
+    const lastObservedResult = await pool.query(
+      `
+        select details
+        from system_logs
+        where event in ('package_event_observed', 'whatsapp_package_event_update_sent')
+          and details->>'packageCode' = $1
+        order by created_at desc, id desc
+        limit 1;
+      `,
+      [packageCode],
+    )
+    const lastSignature = normalizeReference(lastObservedResult.rows[0]?.details?.eventSignature)
+
+    if (lastSignature === eventSignature) {
+      skipped += 1
+      continue
+    }
+
+    const baseDetails = {
+      contactId: entry.contactId,
+      recipient: targetPhone,
+      packageCode,
+      eventSignature,
+      packageStage: entry.stage,
+      eventLabel: entry.latestEventLabel,
+      eventLocation: entry.latestEventLocation,
+      eventDate: entry.latestEventDate,
+    }
+
+    if (!lastSignature) {
+      await writeSystemLog({
+        event: 'package_event_observed',
+        statusCode: 200,
+        details: baseDetails,
+      }).catch(() => {})
+      skipped += 1
+      continue
+    }
+
+    const outboundHistoryResult = await pool.query(
+      `
+        select id
+        from message_logs
+        where channel = 'WhatsApp'
+          and direction = 'outbound'
+          and contact_id = $1
+        order by created_at desc, id desc
+        limit 1;
+      `,
+      [entry.contactId],
+    )
+
+    if (!outboundHistoryResult.rows[0]) {
+      await writeSystemLog({
+        event: 'package_event_observed',
+        statusCode: 200,
+        details: {
+          ...baseDetails,
+          reason: 'conversation-not-started',
+        },
+      }).catch(() => {})
+      skipped += 1
+      continue
+    }
+
+    const contact = await findPackageContactByCode(packageCode)
+    const messageBody = buildPackageEventChangeMessage({ contact, entry })
+    const providerResponse = await sendWhatsAppCloudMessage({
+      accessToken: config.accessToken,
+      apiVersion: config.apiVersion,
+      phoneNumberId: config.phoneNumberId,
+      to: targetPhone,
+      body: messageBody,
+    })
+    const providerMessageId = providerResponse?.messages?.[0]?.id ?? providerResponse?.message_id ?? null
+
+    await pool.query(
+      `
+        insert into message_logs (
+          contact_id,
+          channel,
+          direction,
+          recipient_reference,
+          message_text,
+          provider_name,
+          provider_message_id,
+          status
+        )
+        values ($1, 'WhatsApp', 'outbound', $2, $3, 'Meta Cloud API', $4, 'sent');
+      `,
+      [entry.contactId, targetPhone, messageBody, providerMessageId],
+    )
+
+    await writeSystemLog({
+      event: 'whatsapp_package_event_update_sent',
+      statusCode: 200,
+      details: {
+        ...baseDetails,
+        providerMessageId,
+      },
+    }).catch(() => {})
+
+    sent += 1
+  }
+
+  return { sent, skipped }
 }
 
 const getPackageContextDateValue = (value) => {
@@ -1879,10 +2730,25 @@ const getTrackingDestinationPlace = (item) =>
   getPackageLocationLabel(item?.destino, 'Sin destino')
 
 const getPaginatedPayloadItems = (payload) => {
-  return Array.isArray(payload?.data) ? payload.data : []
+  if (Array.isArray(payload)) return payload
+
+  const candidateArrays = [
+    payload?.data,
+    payload?.items,
+    payload?.eventos,
+    payload?.results,
+    payload?.records,
+    payload?.paquetes,
+  ]
+
+  for (const candidate of candidateArrays) {
+    if (Array.isArray(candidate)) return candidate
+  }
+
+  return []
 }
 
-const getPaginatedPayloadTotal = (payload, fallbackItemsLength = 0) => {
+const getPaginatedPayloadTotal = (payload) => {
   const numericCandidates = [
     payload?.total_registros,
     payload?.paginacion?.total_registros,
@@ -1922,7 +2788,7 @@ const getPaginatedPayloadTotal = (payload, fallbackItemsLength = 0) => {
     return lastPage * perPage
   }
 
-  return fallbackItemsLength
+  return null
 }
 
 const fetchAllPaginatedItems = async ({
@@ -1940,7 +2806,18 @@ const fetchAllPaginatedItems = async ({
     paginatedUrl.searchParams.set('page', String(page))
     paginatedUrl.searchParams.set('per_page', String(perPage))
 
-    const response = await fetchJsonWithTimeout(paginatedUrl, { headers }, timeoutMs).catch(() => null)
+    let response = null
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      response = await fetchJsonWithTimeout(paginatedUrl, { headers }, timeoutMs).catch(() => null)
+      if (response?.status !== 429) break
+
+      const retryAfterSeconds = Number(response.headers?.get?.('retry-after'))
+      const retryDelayMs = Number.isFinite(retryAfterSeconds)
+        ? Math.min(Math.max(retryAfterSeconds * 1000, 1000), 10000)
+        : attempt * 1500
+      await sleep(retryDelayMs)
+    }
+
     if (!response?.ok) {
       break
     }
@@ -1957,8 +2834,8 @@ const fetchAllPaginatedItems = async ({
       break
     }
 
-    const totalItems = getPaginatedPayloadTotal(payload, allItems.length)
-    if (allItems.length >= totalItems) {
+    const totalItems = getPaginatedPayloadTotal(payload)
+    if (Number.isFinite(totalItems) && allItems.length >= totalItems) {
       break
     }
   }
@@ -1998,6 +2875,18 @@ const extractPackageCodeCandidates = (messageBody) => {
     if (letterCount > 0 && compactCandidate.length < 10) continue
     if (PACKAGE_CODE_STOP_WORDS.has(compactCandidate)) continue
     if (seen.has(compactCandidate)) continue
+
+    seen.add(compactCandidate)
+    uniqueCandidates.push(compactCandidate)
+  }
+
+  const shortCodeMatches = normalized.matchAll(/\b(?:CODIGO|C[OÓ]DIGO|GUIA|GU[IÍ]A|TRACKING|PAQUETE)\s*(?:N(?:RO|UMERO)?\.?|#|:)?\s*(\d{3,7})\b/g)
+
+  for (const match of shortCodeMatches) {
+    const compactCandidate = normalizePackageCodeForLookup(match[1])
+    if (!compactCandidate || seen.has(compactCandidate) || PACKAGE_CODE_STOP_WORDS.has(compactCandidate)) {
+      continue
+    }
 
     seen.add(compactCandidate)
     uniqueCandidates.push(compactCandidate)
@@ -2154,7 +3043,7 @@ const findPackageCodeInPaginatedApi = async ({
     statusCode = response.status
     const payload = await response.json().catch(() => null)
     const items = getPaginatedPayloadItems(payload)
-    totalItems = getPaginatedPayloadTotal(payload, totalItems || items.length)
+    totalItems = getPaginatedPayloadTotal(payload) ?? Math.max(totalItems, page * perPage, items.length)
 
     const match = items.find((item) => getPackageCodeValuesForLookup(item).includes(code))
     if (match) {
@@ -2223,7 +3112,7 @@ const fetchExactPackageCodeMatches = async ({
     ok: true,
     statusCode: response.status,
     items,
-    totalItems: getPaginatedPayloadTotal(payload, items.length),
+    totalItems: getPaginatedPayloadTotal(payload) ?? items.length,
     payload,
   }
 }
@@ -2840,13 +3729,19 @@ const uploadWhatsAppMedia = async ({ accessToken, apiVersion, phoneNumberId, fil
     file.originalname || 'media',
   )
 
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-    },
-    body: formData,
-  })
+  let response
+
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: formData,
+    })
+  } catch (error) {
+    throw new Error(describeFetchFailure(error, 'No se pudo conectar con WhatsApp Meta para subir el archivo'))
+  }
 
   const payload = await response.json().catch(() => null)
 
@@ -2920,14 +3815,20 @@ const sendWhatsAppCloudMessage = async ({
     }
   }
 
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(messagePayload),
-  })
+  let response
+
+  try {
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(messagePayload),
+    })
+  } catch (error) {
+    throw new Error(describeFetchFailure(error, 'No se pudo conectar con WhatsApp Meta para enviar el mensaje'))
+  }
 
   const raw = await response.text()
   let payload = null
@@ -3111,6 +4012,7 @@ const emsStatusToContactStatus = (emsStatus) => {
   if (emsStatus === 'regional') return 'Recibido Destino'
   if (emsStatus === 'courier') return 'Cartero'
   if (emsStatus === 'delivered') return 'Activo'
+  if (emsStatus === 'cancelled') return 'Cancelado'
   return 'Nuevo'
 }
 
@@ -3120,6 +4022,7 @@ const getEmsStatusRank = (status) => {
   if (status === 'regional') return 2
   if (status === 'courier') return 3
   if (status === 'delivered') return 4
+  if (status === 'cancelled') return 5
   return 0
 }
 
@@ -3134,6 +4037,16 @@ const normalizeEmsStatus = (value) => {
     normalized.includes('distribución')
   ) {
     return 'courier'
+  }
+
+  if (
+    normalized.includes('cancel') ||
+    normalized.includes('anul') ||
+    normalized.includes('rechaz') ||
+    normalized.includes('devuelto') ||
+    normalized.includes('retornado')
+  ) {
+    return 'cancelled'
   }
 
   if (normalized.includes('recibido destino') || normalized.includes('recibido regional')) {
@@ -3325,43 +4238,11 @@ const syncContactEmsStatus = async ({
     (whatsappReference ? await fetchMatchingPackageContext(whatsappReference) : null)
 
   const conversationContext = buildAiConversationContext(messages.slice().reverse())
-  const prompt = [
-    'Clasifica el estado EMS del contacto en una sola palabra exacta:',
-    '- received',
-    '- transit',
-    '- regional',
-    '- courier',
-    '- delivered',
-    '',
-    `Contacto: ${contact.name || 'Sin nombre'}`,
-    `Empresa: ${contact.company || 'No registrada'}`,
-    `Estado actual: ${contact.status || 'Sin estado'}`,
-    '',
-    conversationContext ? `Ultimas interacciones (hasta 4 chats recientes):\n${conversationContext}` : 'Sin historial reciente.',
-    '',
-      'Responde solo con una de estas palabras: received, transit, regional, courier, delivered.',
-  ].join('\n')
 
   let inferredStatus =
     packageContext?.matched && packageContext.stage
       ? packageContext.stage
       : inferEmsStatusFromText(conversationContext || contact.status) || 'received'
-
-  const shouldCallAiForStatus =
-    !packageContext?.matched &&
-    normalizeReference(conversationContext || contact.status).length > 0
-
-  if (shouldCallAiForStatus) {
-    try {
-      const aiResult = await callOllamaGenerate({ prompt })
-      const aiStatus = normalizeEmsStatus(aiResult.response)
-      if (aiStatus) {
-        inferredStatus = aiStatus
-      }
-    } catch (error) {
-      console.warn('No se pudo clasificar el estado EMS con IA:', error.message)
-    }
-  }
 
   const currentStage = normalizeEmsStatus(contact.status) || 'received'
   const nextStage =
@@ -3393,232 +4274,190 @@ const syncContactEmsStatus = async ({
   }
 }
 
+const BOLIVIA_BRANCH_LOCATIONS = [
+  {
+    terms: ['la paz', 'oficina central', 'lapaz', 'sede central'],
+    label: 'La Paz',
+    address: 'Av. Mariscal Santa Cruz N 1260, esq. Calle Oruro (Edificio Telecomunicaciones).',
+  },
+  {
+    terms: ['cochabamba', 'cbba'],
+    label: 'Cochabamba',
+    address: 'Calle Ayacucho N 113 esq. Av. Heroinas.',
+  },
+  {
+    terms: ['santa cruz', 'scz'],
+    label: 'Santa Cruz',
+    address: 'Calle Cobija entre Sucre y Ballivian N 24.',
+  },
+  {
+    terms: ['oruro'],
+    label: 'Oruro',
+    address: 'Calle Presidente Montes esq. Junin N 1456.',
+  },
+  {
+    terms: ['potosi', 'villa imperial'],
+    label: 'Potosi',
+    address: 'Calle Hoyos esq. Topater, Villa Imperial de Potosi.',
+  },
+  {
+    terms: ['tarija'],
+    label: 'Tarija',
+    address: 'Calle Mariscal Sucre esq. Virginio Lema N 397.',
+  },
+  {
+    terms: ['sucre', 'chuquisaca'],
+    label: 'Sucre (Chuquisaca)',
+    address: 'Calle Junin esq. Ayacucho N 699.',
+  },
+  {
+    terms: ['beni', 'trinidad'],
+    label: 'Beni',
+    address: 'Calle Cipriano Barace N 10 entre Manuel Limpias y Calle Sucre.',
+  },
+  {
+    terms: ['pando', 'cobija'],
+    label: 'Pando',
+    address: 'Av. Bruno Racua N 59.',
+  },
+]
+
+const normalizeSearchText = (value) => normalizeReference(value).toLowerCase()
+
+const getBoliviaBranchLocation = (value) => {
+  const normalized = normalizeSearchText(value)
+  if (!normalized) {
+    return null
+  }
+
+  for (const branch of BOLIVIA_BRANCH_LOCATIONS) {
+    if (branch.terms.some((term) => normalized.includes(normalizeSearchText(term)))) {
+      return branch
+    }
+  }
+
+  return null
+}
+
+const getPackageDestinationBranch = (packageContext = null) =>
+  getBoliviaBranchLocation(
+    normalizeReference(packageContext?.currentDestinationDepartment) ||
+      normalizeReference(packageContext?.currentDestinationLabel) ||
+      normalizeReference(packageContext?.currentDestinationAddress) ||
+      normalizeReference(packageContext?.summaryText),
+  )
+
+const getPackageOriginBranch = (packageContext = null) =>
+  getBoliviaBranchLocation(
+    normalizeReference(packageContext?.currentOriginDepartment) ||
+      normalizeReference(packageContext?.currentOriginLabel) ||
+      normalizeReference(packageContext?.currentOriginAddress) ||
+      normalizeReference(packageContext?.summaryText),
+  )
+
+const formatPackageAgencyContext = (packageContext = null) => {
+  const agencies = [
+    packageContext?.currentOriginLabel
+      ? `Origen: ${normalizeReference(packageContext.currentOriginLabel)}${
+          normalizeReference(packageContext.currentOriginDepartment)
+            ? ` (${normalizeReference(packageContext.currentOriginDepartment)})`
+            : ''
+        }`
+      : '',
+    packageContext?.currentDestinationLabel
+      ? `Destino: ${normalizeReference(packageContext.currentDestinationLabel)}${
+          normalizeReference(packageContext.currentDestinationDepartment)
+            ? ` (${normalizeReference(packageContext.currentDestinationDepartment)})`
+            : ''
+        }`
+      : '',
+    packageContext?.currentDestinationAddress
+      ? `Direccion destino: ${normalizeReference(packageContext.currentDestinationAddress)}`
+      : '',
+  ].filter(Boolean)
+
+  return agencies.join('\n')
+}
+
 const buildFallbackAgentReplyLegacy = ({ contact, messageBody, currentStatus, packageContext = null }) => {
   const normalizedMessage = normalizeReference(messageBody).toLowerCase()
   const contactName = normalizeReference(contact?.name) || 'Hola'
-  const originDepartmentMatch = /departamento origen ([^|\n]+)/i.exec(packageContext?.summaryText || '')
-  const destinationDepartmentMatch = /departamento destino ([^|\n]+)/i.exec(packageContext?.summaryText || '')
-  const originMatch = /origen ([^|\n]+)/i.exec(packageContext?.summaryText || '')
-  const destinationPlaceMatch = /destino ([^|\n]+)/i.exec(packageContext?.summaryText || '')
-  const destinationMatch =
-    /direccion destino ([^|\n]+)/i.exec(packageContext?.summaryText || '') ||
-    destinationPlaceMatch
-  const originText = normalizeReference(originDepartmentMatch?.[1]) || normalizeReference(originMatch?.[1])
-  const destinationText = normalizeReference(destinationDepartmentMatch?.[1]) || normalizeReference(destinationMatch?.[1])
+  const packageCode = normalizeReference(packageContext?.currentPackageCode)
+  const originDepartment = normalizeReference(packageContext?.currentOriginDepartment)
+  const originLabel = normalizeReference(packageContext?.currentOriginLabel)
+  const destinationDepartment = normalizeReference(packageContext?.currentDestinationDepartment)
+  const destinationLabel = normalizeReference(packageContext?.currentDestinationLabel)
+  const destinationAddress = normalizeReference(packageContext?.currentDestinationAddress)
+  const originBranch = getPackageOriginBranch(packageContext)
+  const destinationBranch = getPackageDestinationBranch(packageContext)
+  const originDisplay = originDepartment || originBranch?.label || originLabel || 'origen'
+  const destinationDisplay = destinationDepartment || destinationBranch?.label || destinationLabel || destinationAddress || 'destino'
+  const originLocationText = originBranch?.address
+    ? `${originDisplay} (${originBranch.address})`
+    : originDisplay
+  const destinationLocationText = destinationBranch?.address
+    ? `${destinationDisplay} (${destinationBranch.address})`
+    : destinationDisplay
   const isDeliveryQuestion =
     normalizedMessage.includes('llego') ||
-    normalizedMessage.includes('llegó') ||
+    normalizedMessage.includes('lleg??') ||
     normalizedMessage.includes('entregado') ||
     normalizedMessage.includes('paquete') ||
     normalizedMessage.includes('envio') ||
-    normalizedMessage.includes('envío')
+    normalizedMessage.includes('env??o')
 
   if (packageContext?.matched && packageContext.stage === 'delivered') {
-    return `Perfecto, ${contactName}. Veo el paquete como entregado. Gracias por confirmarlo; si necesitas algo adicional, quedo atento para ayudarte.`
+    return `Revisé la guía ${packageCode || 'indicada'} y figura como entregada${destinationLocationText ? ` en ${destinationLocationText}` : ''}. Si necesitas más detalle sobre la entrega, puedo ayudarte a revisarlo.`
   }
 
-  if (packageContext?.matched && packageContext.stage === 'transit') {
-    const destinationMatch = /direccion destino ([^|\n]+)/i.exec(packageContext.summaryText) || /destino ([^|\n]+)/i.exec(packageContext.summaryText)
-    const destinationText = normalizeReference(destinationMatch?.[1])
-
-    if (destinationText) {
-      return `Gracias por escribirnos, ${contactName}. Tu paquete esta en transito y va con destino a ${destinationText}. Seguimos monitoreando el avance para avisarte el siguiente movimiento confirmado.`
-    }
-
-    return `Gracias por escribirnos, ${contactName}. Tu paquete esta en transito y con seguimiento activo. Seguimos monitoreando el avance para avisarte el siguiente movimiento confirmado.`
-  }
-
-  if (packageContext?.matched && packageContext.stage === 'regional') {
-    return `Su paquete ${packageContext.currentPackageCode || ''} ya se encuentra en nuestra sucursal de destino${destinationText ? `, ${destinationText}` : ''}. Le informaremos cuando pase a reparto.`
-      .replace('  ', ' ')
+  if (packageContext?.matched && packageContext.stage === 'cancelled') {
+    return `Revisé la guía ${packageCode || 'indicada'} y figura como cancelada${originLocationText ? ` en la Sucursal ${originLocationText}` : ''}. Para revisar el motivo, comunícate con esa sucursal o atención al cliente.`
   }
 
   if (packageContext?.matched && packageContext.stage === 'courier') {
-    return `Su paquete ${packageContext.currentPackageCode || ''} está con el cartero y se dirige a su destino. Le informaremos cuando se confirme la entrega.`.replace('  ', ' ')
+    return `Revisé la guía ${packageCode || 'indicada'} y figura asignada a cartero${destinationLocationText ? ` en ${destinationLocationText}` : ''}. Está en proceso de reparto; no aparece como entregada todavía.`
   }
 
   if (packageContext?.matched && packageContext.stage === 'transit') {
-    return isDeliveryQuestion
-      ? `Gracias, ${contactName}. Veo tu paquete en transito y con seguimiento activo. Te compartire la siguiente novedad apenas tengamos un nuevo movimiento confirmado.`
-      : `Gracias por escribirnos, ${contactName}. Tu paquete sigue en transito y ya estamos monitoreando el avance para avisarte la siguiente actualizacion.`
-  }
-
-  if (packageContext?.matched && packageContext.stage === 'received') {
-    return `Gracias por escribirnos, ${contactName}. Ya identificamos tu paquete y figura como recibido en nuestra sucursal de origen${originText ? `, ${originText}` : ''}${destinationText ? `, con destino a ${destinationText}` : ''}. Te iremos guiando con la siguiente actualizacion disponible.`
-  }
-
-  if (currentStatus === 'Activo' || currentStatus === 'Entregado') {
-    return `¡Perfecto, ${contactName}! Gracias por avisarnos. Damos tu caso por entregado y quedamos atentos por si necesitas algo más.`
-  }
-
-  if (currentStatus === 'En seguimiento') {
-    return isDeliveryQuestion
-      ? `¡Gracias, ${contactName}! Veo tu paquete en seguimiento y ya estamos revisando el avance. Te confirmo apenas tengamos una actualización.`
-      : `Gracias por escribirnos, ${contactName}. Ya estamos revisando tu envío y te compartiremos la actualización en cuanto avance.`
-  }
-
-  return `Gracias por escribirnos, ${contactName}. Estamos revisando tu caso y te responderemos con una actualización apenas la tengamos.`
-}
-
-const buildProactivePackageUpdateMessage = ({ packageContext = null, contact = null }) => {
-  const contactName = normalizeReference(contact?.name)
-  const packageCode = normalizeReference(packageContext?.currentPackageCode)
-  const originText =
-    normalizeReference(packageContext?.currentOriginDepartment) ||
-    normalizeReference(packageContext?.currentOriginLabel)
-  const destinationText =
-    normalizeReference(packageContext?.currentDestinationDepartment) ||
-    normalizeReference(packageContext?.currentDestinationLabel) ||
-    normalizeReference(packageContext?.currentDestinationAddress)
-
-  if (!packageContext?.matched || !packageContext?.stage) {
-    return ''
-  }
-
-  if (packageContext.stage === 'transit') {
-    return `Tu paquete ${packageCode || ''} ya fue despachado${originText ? ` desde ${originText}` : ''}${destinationText ? ` con destino a ${destinationText}` : ''}. Te avisaremos cuando registre el siguiente movimiento.`
-      .replace(/\s+/g, ' ')
-      .trim()
-  }
-
-  if (packageContext.stage === 'regional') {
-    return `Tu paquete ${packageCode || ''} ya llego a nuestra sucursal de ${destinationText || 'destino'} y esta listo para recoger. Te esperamos.`
-      .replace(/\s+/g, ' ')
-      .trim()
-  }
-
-  if (packageContext.stage === 'courier') {
-    return `Tu paquete ${packageCode || ''} ya salio a reparto${destinationText ? ` hacia ${destinationText}` : ''}. Te avisaremos cuando se confirme la entrega.`
-      .replace(/\s+/g, ' ')
-      .trim()
-  }
-
-  if (packageContext.stage === 'delivered') {
-    return `Tu paquete ${packageCode || ''} ya fue entregado${destinationText ? ` en ${destinationText}` : ''}. ${contactName ? `Gracias, ${contactName}. ` : ''}Si necesitas ayuda adicional, aqui estoy.`
-      .replace(/\s+/g, ' ')
-      .trim()
-  }
-
-  return `Tu paquete ${packageCode || ''} fue recibido${originText ? ` en ${originText}` : ''}${destinationText ? ` con destino a ${destinationText}` : ''}. Te avisaremos cuando sea despachado.`
-    .replace(/\s+/g, ' ')
-    .trim()
-}
-
-const buildFallbackAgentReply = ({ contact, messageBody, currentStatus, packageContext = null }) => {
-  const normalizedMessage = normalizeReference(messageBody).toLowerCase()
-  const originText =
-    normalizeReference(packageContext?.currentOriginDepartment) ||
-    normalizeReference(packageContext?.currentOriginLabel)
-  const destinationText =
-    normalizeReference(packageContext?.currentDestinationDepartment) ||
-    normalizeReference(packageContext?.currentDestinationLabel) ||
-    normalizeReference(packageContext?.currentDestinationAddress)
-  const statusMatch = /estado ([^|\n]+)/i.exec(packageContext?.summaryText || '')
-  const packageStatusText = normalizeReference(statusMatch?.[1]) || 'transito'
-  const isLocationQuestion =
-    normalizedMessage.includes('donde esta') ||
-    normalizedMessage.includes('donde estan') ||
-    normalizedMessage.includes('a donde va') ||
-    normalizedMessage.includes('por donde va') ||
-    normalizedMessage.includes('ubicacion')
-  const isDeliveryQuestion =
-    normalizedMessage.includes('llego') ||
-    normalizedMessage.includes('entregado') ||
-    normalizedMessage.includes('paquete') ||
-    normalizedMessage.includes('envio')
-  const isPickupConfirmation =
-    normalizedMessage.includes('pasare a recoger') ||
-    normalizedMessage.includes('pasaré a recoger') ||
-    normalizedMessage.includes('voy a recoger') ||
-    normalizedMessage.includes('ire a recoger') ||
-    normalizedMessage.includes('iré a recoger') ||
-    normalizedMessage.includes('pasare manana') ||
-    normalizedMessage.includes('pasaré mañana') ||
-    normalizedMessage.includes('mañana paso') ||
-    normalizedMessage.includes('manana paso')
-  const isDeliveryConfirmation =
-    normalizedMessage.includes('ya lo recibi') ||
-    normalizedMessage.includes('ya lo recibí') ||
-    normalizedMessage.includes('ya recibi') ||
-    normalizedMessage.includes('ya recibí') ||
-    normalizedMessage.includes('me entregaron') ||
-    normalizedMessage.includes('ya me llego') ||
-    normalizedMessage.includes('ya me llegó')
-  const isGreetingOnly = isGreetingMessage(messageBody)
-  const isPackageInquiry = isPackageInquiryMessage(messageBody)
-  const packageEventsText = normalizeReference(packageContext?.packageEventsText)
-  const shouldShowPackageEvents =
-    packageContext?.matched &&
-    packageEventsText &&
-    (isLocationQuestion ||
-      normalizedMessage.includes('eventos') ||
-      normalizedMessage.includes('historial') ||
-      normalizedMessage.includes('por donde estuvo') ||
-      normalizedMessage.includes('donde estuvo'))
-
-  if (isGreetingOnly) {
-    return `¡Hola! ${getBoliviaDayGreeting()}. Soy Jaimito, de Correos de Bolivia. ¿En qué te puedo ayudar hoy?`
-  }
-
-  if (isPackageInquiry && !hasPackageCode(messageBody)) {
-    return '¡Con gusto te ayudo a rastrearlo! 📦 ¿Me compartes tu número de seguimiento, por favor?'
-  }
-
-  if (packageContext?.matched && packageContext.stage === 'delivered') {
-    return isDeliveryConfirmation
-      ? 'Perfecto. Gracias por confirmarnos la entrega. Si necesitas algo mas, aqui estoy para ayudarte.'
-      : 'Tu paquete ya fue entregado. Si necesitas revisar algun detalle adicional, aqui te ayudo.'
-  }
-
-  if (shouldShowPackageEvents) {
-    const packageCode = normalizeReference(packageContext?.currentPackageCode) || 'el paquete'
-    const finalLocation =
-      normalizeReference(packageContext?.currentDestinationAddress) ||
-      normalizeReference(packageContext?.currentDestinationLabel) ||
-      normalizeReference(packageContext?.currentDestinationDepartment) ||
-      normalizeReference(packageContext?.currentOriginLabel) ||
-      'sin ubicacion precisa'
-
     return [
-      `Claro, ${contactName}. Te comparto el historial de ${packageCode}:`,
-      packageEventsText,
+      `¡Hola, ${contactName}! 👋 Muchas gracias por escribirnos.`,
       '',
-      `En resumen, la ultima ubicacion conocida es ${finalLocation}.`,
+      `🚚 Tu paquete ya está en tránsito con destino a **${destinationDisplay}** 📦. Seguimos monitoreando su avance 🔎 para avisarte en cuanto se confirme el siguiente movimiento 📲.`,
+    ].join('\n')
+  }
+
+  if (packageContext?.matched && packageContext.stage === 'regional') {
+    return [
+      `¡Perfecto! Confirmamos la guia ${packageCode || 'sin codigo'}:`,
+      '',
+      `📍 ¿Dónde está tu paquete hoy? Recibido y procesado en la Sucursal ${originLocationText}.`,
+      `🚛 Próximo paso: Saldrá en el próximo despacho con destino a ${destinationDisplay}.`,
+      '',
+      `Te notificaremos apenas entre en tránsito. Si prefieres hacer una gestión presencial antes de que salga, puedes pasar por la sucursal de ${originDisplay} con tu carnet de identidad original.`,
     ]
       .filter(Boolean)
       .join('\n')
   }
 
-  if (packageContext?.matched && packageContext.stage === 'transit') {
-    if (isLocationQuestion && destinationText) {
-      return `Tu paquete esta en transito y va hacia ${destinationText}. Apenas registre un nuevo movimiento, te avisamos.`
-    }
-
-    if (destinationText) {
-      return `Tu paquete esta en ${packageStatusText} y va hacia ${destinationText}. Te avisamos apenas registre un nuevo movimiento.`
-    }
-
-    return isDeliveryQuestion
-      ? `Tu paquete sigue en ${packageStatusText}. En cuanto haya una novedad, te la compartimos.`
-      : `Tu paquete sigue en ${packageStatusText}. Te avisamos apenas registre un nuevo movimiento.`
-  }
-
-  if (packageContext?.matched && packageContext.stage === 'regional') {
-    return isPickupConfirmation
-      ? `Perfecto. Tu paquete quedara disponible para recoger en nuestra sucursal de ${destinationText || 'destino'}. Te esperamos manana.`
-      : `¡Buenas noticias! Tu paquete ya llegó y está listo para que lo pases a recoger en nuestra sucursal de ${destinationText || 'destino'}. ¡Te esperamos! ✨`
-  }
-
   if (packageContext?.matched && packageContext.stage === 'received') {
-    return `Tu paquete fue recibido en nuestra sucursal de origen${originText ? `, ${originText}` : ''}${destinationText ? `, con destino a ${destinationText}` : ''}. En cuanto sea despachado, te compartimos la siguiente actualizacion.`
+    return [
+      `¡Perfecto! Confirmamos la guia ${packageCode || 'sin codigo'}:`,
+      '',
+      `📍 ¿Dónde está tu paquete hoy? Recibido y procesado en la Sucursal ${originLocationText}.`,
+      `🚛 Próximo paso: Saldrá en el próximo despacho con destino a ${destinationDisplay}.`,
+      '',
+      `Te notificaremos apenas entre en tránsito. Si prefieres hacer una gestión presencial antes de que salga, puedes pasar por la sucursal de ${originDisplay} con tu carnet de identidad original.`,
+    ]
+      .filter(Boolean)
+      .join('\n')
   }
 
   if (currentStatus === 'Recibido Destino') {
-    return `¡Buenas noticias! Tu paquete ya llegó y está listo para que lo pases a recoger en nuestra sucursal de ${destinationText || 'destino'}. ¡Te esperamos! ✨`
+    return `Perfecto! Tu paquete ya llego y esta listo para que lo pases a recoger en ${destinationDisplay}.`
   }
 
   if (currentStatus === 'Nuevo') {
-    return `Tu paquete fue recibido en nuestra sucursal de origen${originText ? `, ${originText}` : ''}${destinationText ? `, con destino a ${destinationText}` : ''}. En cuanto sea despachado, te compartimos la siguiente actualizacion.`
+    return `Tu paquete fue recibido en nuestra sucursal de origen${originDisplay ? `, ${originDisplay}` : ''}${destinationDisplay ? `, con destino a ${destinationDisplay}` : ''}. En cuanto sea despachado, te compartimos la siguiente actualizacion.`
   }
 
   if (currentStatus === 'Activo' || currentStatus === 'Entregado') {
@@ -3628,11 +4467,100 @@ const buildFallbackAgentReply = ({ contact, messageBody, currentStatus, packageC
   if (currentStatus === 'En seguimiento') {
     return isDeliveryQuestion
       ? 'Tu paquete esta en seguimiento. Apenas tengamos una actualizacion, te la compartimos.'
-      : `Ya estamos revisando tu envio. En cuanto avance, te compartimos la actualizacion.`
+      : 'Ya estamos revisando tu envio. En cuanto avance, te compartimos la actualizacion.'
   }
 
-  return `Estamos revisando tu caso. Apenas tengamos una actualizacion, te la compartimos.`
+  return 'Estamos revisando tu caso. Apenas tengamos una actualizacion, te la compartimos.'
 }
+const buildFriendlyFallbackAgentReply = ({ contact, messageBody, currentStatus, packageContext = null }) => {
+  const normalizedMessage = normalizeReference(messageBody).toLowerCase()
+  const contactName = normalizeReference(contact?.name) || 'Hola'
+  const packageCode = normalizeReference(packageContext?.currentPackageCode)
+  const originDepartment = normalizeReference(packageContext?.currentOriginDepartment)
+  const originLabel = normalizeReference(packageContext?.currentOriginLabel)
+  const destinationDepartment = normalizeReference(packageContext?.currentDestinationDepartment)
+  const destinationLabel = normalizeReference(packageContext?.currentDestinationLabel)
+  const destinationAddress = normalizeReference(packageContext?.currentDestinationAddress)
+  const originBranch = getPackageOriginBranch(packageContext)
+  const destinationBranch = getPackageDestinationBranch(packageContext)
+  const originDisplay = originDepartment || originBranch?.label || originLabel || 'origen'
+  const destinationDisplay = destinationDepartment || destinationBranch?.label || destinationLabel || destinationAddress || 'destino'
+  const originLocationText = originBranch?.address ? `${originDisplay} (${originBranch.address})` : originDisplay
+  const destinationLocationText = destinationBranch?.address
+    ? `${destinationDisplay} (${destinationBranch.address})`
+    : destinationDisplay
+  const isDeliveryQuestion =
+    normalizedMessage.includes('llego') ||
+    normalizedMessage.includes('llegó') ||
+    normalizedMessage.includes('entregado') ||
+    normalizedMessage.includes('paquete') ||
+    normalizedMessage.includes('envio') ||
+    normalizedMessage.includes('envío')
+
+  if (packageContext?.matched && packageContext.stage === 'delivered') {
+    return `Revisé la guía ${packageCode || 'indicada'} 📦 y figura como entregada ✅${destinationLocationText ? ` en ${destinationLocationText} 📍` : ''}. Si necesitas más detalle sobre la entrega, puedo ayudarte a revisarlo 😊.`
+  }
+
+  if (packageContext?.matched && packageContext.stage === 'cancelled') {
+    return `Revisé la guía ${packageCode || 'indicada'} 📦 y figura como cancelada ❌${originLocationText ? ` en la Sucursal ${originLocationText} 📍` : ''}. Para revisar el motivo, comunícate con esa sucursal o atención al cliente 📞.`
+  }
+
+  if (packageContext?.matched && packageContext.stage === 'courier') {
+    return `Revisé la guía ${packageCode || 'indicada'} 📦 y figura asignada a cartero 🛵${destinationLocationText ? ` en ${destinationLocationText} 📍` : ''}. Está en proceso de reparto 🚚; no aparece como entregada todavía ⏳.`
+  }
+
+  if (packageContext?.matched && packageContext.stage === 'transit') {
+    return [
+      `¡Hola, ${contactName}! 👋 Muchas gracias por escribirnos.`,
+      '',
+      `🚚 Tu paquete está en tránsito con destino a ${destinationDisplay} 📦. Seguimos monitoreando su avance 🔎 y te avisaremos cuando haya un nuevo movimiento 📲.`,
+    ].join('\n')
+  }
+
+  if (packageContext?.matched && packageContext.stage === 'regional') {
+    return [
+      `¡Perfecto! 👌 Confirmamos la guía ${packageCode || 'sin código'} 📦:`,
+      '',
+      `📍 ¿Dónde está tu paquete hoy? Fue recibido y procesado en la Sucursal ${originLocationText}.`,
+      `🚛 Próximo paso: pasará a reparto o estará disponible según el proceso de la regional de destino ${destinationDisplay}.`,
+      '',
+      'Te notificaremos 📲 apenas haya una nueva actualización. Si necesitas gestión presencial, lleva tu carnet de identidad original 🪪.',
+    ].join('\n')
+  }
+
+  if (packageContext?.matched && packageContext.stage === 'received') {
+    return [
+      `¡Perfecto! 👌 Confirmamos la guía ${packageCode || 'sin código'} 📦:`,
+      '',
+      `📍 ¿Dónde está tu paquete hoy? Fue recibido y procesado en la Sucursal ${originLocationText}.`,
+      `🚛 Próximo paso: saldrá en el próximo despacho con destino a ${destinationDisplay}.`,
+      '',
+      'Te notificaremos 📲 apenas entre en tránsito. Si necesitas gestión presencial, puedes pasar por la sucursal con tu carnet de identidad original 🪪.',
+    ].join('\n')
+  }
+
+  if (currentStatus === 'Recibido Destino') {
+    return `¡Perfecto! 🙌 Tu paquete ya llegó y está listo para que lo pases a recoger en ${destinationDisplay} 📍. Lleva tu carnet de identidad original 🪪.`
+  }
+
+  if (currentStatus === 'Nuevo') {
+    return `Tu paquete fue recibido en nuestra sucursal de origen 📦${originDisplay ? `, ${originDisplay}` : ''}${destinationDisplay ? `, con destino a ${destinationDisplay}` : ''}. Te avisaremos cuando sea despachado 📲.`
+  }
+
+  if (currentStatus === 'Activo' || currentStatus === 'Entregado') {
+    return 'Tu paquete figura como entregado ✅. Si necesitas revisar algún detalle adicional, aquí te ayudo 😊.'
+  }
+
+  if (currentStatus === 'En seguimiento') {
+    return isDeliveryQuestion
+      ? 'Tu paquete está en seguimiento 🔎. Apenas tengamos una actualización, te la compartimos 📲.'
+      : 'Ya estamos revisando tu envío 🔎. En cuanto avance, te compartimos la actualización 📲.'
+  }
+
+  return 'Estamos revisando tu caso 🔎. Apenas tengamos una actualización, te la compartimos 📲.'
+}
+
+const buildFallbackAgentReply = buildFriendlyFallbackAgentReply
 
 const getBoliviaDayGreeting = () => {
   const hour = Number(
@@ -3655,15 +4583,195 @@ const getBoliviaDayGreeting = () => {
 }
 
 const isGreetingMessage = (messageBody) =>
-  /^(?:(?:hola|buenas?)\s+)?(?:buenos?\s+(?:dias|días)|buenas?\s+(?:tardes|noches)|hola|buenas)[!.,?\s]*$/i.test(
+  /^(?:(?:hola|buenas?)\s+)?(?:buenos?\s+(?:dias|días)|buenas?\s+(?:tardes|noches|nohces)|hola|buenas)[!.,?\s]*$/i.test(
     normalizeReference(messageBody),
   )
 
+const normalizeIntentText = (value) =>
+  normalizeReference(value)
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+const getEditDistance = (firstValue, secondValue) => {
+  const first = normalizeReference(firstValue)
+  const second = normalizeReference(secondValue)
+
+  if (first === second) return 0
+  if (!first) return second.length
+  if (!second) return first.length
+
+  const previousRow = Array.from({ length: second.length + 1 }, (_, index) => index)
+
+  for (let firstIndex = 0; firstIndex < first.length; firstIndex += 1) {
+    const currentRow = [firstIndex + 1]
+
+    for (let secondIndex = 0; secondIndex < second.length; secondIndex += 1) {
+      const insertCost = currentRow[secondIndex] + 1
+      const deleteCost = previousRow[secondIndex + 1] + 1
+      const replaceCost = previousRow[secondIndex] + (first[firstIndex] === second[secondIndex] ? 0 : 1)
+      currentRow.push(Math.min(insertCost, deleteCost, replaceCost))
+    }
+
+    previousRow.splice(0, previousRow.length, ...currentRow)
+  }
+
+  return previousRow[second.length]
+}
+
+const isSimilarWord = (word, expectedWords) => {
+  const normalizedWord = normalizeIntentText(word)
+  if (!normalizedWord) return false
+
+  return expectedWords.some((expectedWord) => {
+    const normalizedExpected = normalizeIntentText(expectedWord)
+    const distance = getEditDistance(normalizedWord, normalizedExpected)
+    const allowedDistance = normalizedExpected.length <= 5 ? 1 : 2
+    return distance <= allowedDistance
+  })
+}
+
+const hasSimilarToken = (words, expectedWords) =>
+  words.some((word) => isSimilarWord(word, expectedWords))
+
+const getEmptyPackageContext = () => ({
+  matched: false,
+  isTestModeNumber: false,
+  stage: null,
+  currentPackageCode: '',
+  currentPackageUpdatedAt: 0,
+  packageCodes: [],
+  summaryText: '',
+  agentFactsText: '',
+  lifecycleInstruction: '',
+})
+
+const buildMultiPackageContextReply = (packageResults) => {
+  const foundResults = packageResults.filter((result) => result.context?.matched)
+  const missingCodes = packageResults
+    .filter((result) => !result.context?.matched)
+    .map((result) => result.code)
+
+  const formatLocation = (context) =>
+    normalizeReference(context.currentDestinationDepartment) ||
+    normalizeReference(context.currentDestinationLabel) ||
+    normalizeReference(context.currentDestinationAddress) ||
+    normalizeReference(context.currentOriginDepartment) ||
+    normalizeReference(context.currentOriginLabel) ||
+    'sin ubicacion precisa'
+
+  const formatResult = ({ code, context }) => {
+    const packageCode = normalizeReference(context.currentPackageCode) || code
+    const location =
+      context.stage === 'courier'
+        ? `va en reparto hacia ${formatLocation(context)}`
+        : context.stage === 'regional'
+          ? `ya llego a destino en ${formatLocation(context)}`
+          : context.stage === 'delivered'
+            ? `ya figura entregado en ${formatLocation(context)}`
+            : context.stage === 'transit'
+              ? `esta en camino hacia ${formatLocation(context)}`
+              : context.stage === 'cancelled'
+                ? `figura cancelado en ${formatLocation(context)}`
+                : `esta en ${formatLocation(context)}`
+    const latestEvent = Array.isArray(context.packageEvents)
+      ? context.packageEvents
+          .slice()
+          .sort((firstEvent, secondEvent) => getPackageEventTimestampValue(secondEvent) - getPackageEventTimestampValue(firstEvent))[0]
+      : null
+    const latestEventText = latestEvent && context.stage !== 'courier' && context.stage !== 'regional'
+      ? ` Ultimo evento: ${getPackageEventTitle(latestEvent)}${getPackageEventLocation(latestEvent) ? ` en ${getPackageEventLocation(latestEvent)}` : ''}.`
+      : ''
+
+    return `- ${packageCode}: ${location}.${latestEventText}`
+  }
+
+  const deliveryResults = foundResults.filter((result) => result.context?.stage === 'courier')
+  const arrivedResults = foundResults.filter((result) => ['regional', 'delivered'].includes(result.context?.stage))
+  const transitResults = foundResults.filter((result) => result.context?.stage === 'transit')
+  const cancelledResults = foundResults.filter((result) => result.context?.stage === 'cancelled')
+  const otherResults = foundResults.filter(
+    (result) => !['courier', 'regional', 'delivered', 'transit', 'cancelled'].includes(result.context?.stage),
+  )
+
+  const lines = [
+    ...deliveryResults.map((result) => formatResult(result)),
+    ...arrivedResults.map((result) => formatResult(result)),
+    ...transitResults.map((result) => formatResult(result)),
+    ...cancelledResults.map((result) => formatResult(result)),
+    ...otherResults.map((result) => formatResult(result)),
+  ]
+
+  if (missingCodes.length > 0) {
+    lines.push(`No pude localizar: ${missingCodes.join(', ')}. Verifica esos codigos, por favor.`)
+  }
+
+  if (!lines.length) {
+    return ''
+  }
+
+  return [
+    'Claro, revise las guias que me enviaste:',
+    ...lines,
+    deliveryResults.length > 0
+      ? 'Los que estan con cartero son los que van camino a entrega.'
+      : 'No veo ninguna de esas guias marcada como cartero/reparto por ahora.',
+  ].join('\n')
+}
+
 const isPackageInquiryMessage = (messageBody) => {
-  const normalized = normalizeReference(messageBody).toLowerCase()
-  return /\b(paquete|envio|envío|seguimiento|codigo|código|tracking|donde esta|dónde está|ubicacion|ubicación)\b/.test(
+  const normalized = normalizeIntentText(messageBody)
+  const words = normalized.split(' ').filter(Boolean)
+  const hasPackageWord = hasSimilarToken(words, ['paquete', 'paquetes', 'envio', 'seguimiento', 'tracking', 'guia', 'codigo'])
+  const hasLocationWord = hasSimilarToken(words, ['donde', 'ubicacion', 'esta', 'estara'])
+  const hasQuestionPhrase = /\b(quiero|quisiera|saber|consultar|rastrear|buscar|ver)\b/.test(normalized)
+
+  return hasPackageWord || (hasLocationWord && hasQuestionPhrase)
+}
+
+const isGratitudeOnlyMessage = (messageBody) => {
+  const normalized = normalizeReference(messageBody)
+    .toLowerCase()
+    .replace(/[!¡¿?.,;:"'()[\]{}]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  return /^(muchas gracias|gracias|ok gracias|listo gracias|perfecto gracias|muchisimas gracias|mil gracias|dale gracias|bueno gracias)$/.test(
     normalized,
   )
+}
+
+const PROMPT_INJECTION_SAFE_REPLY =
+  'No puedo ayudarte con eso. Solo puedo ayudarte con consultas relacionadas con Correos de Bolivia, seguimiento de paquetes y atencion al cliente.'
+
+const isPromptInjectionAttempt = (messageBody) => {
+  const normalized = normalizeIntentText(messageBody)
+
+  if (!normalized) {
+    return false
+  }
+
+  const injectionPatterns = [
+    /\bignora\b.*\b(instrucciones|prompt|reglas|sistema|system)\b/,
+    /\bolvida\b.*\b(instrucciones|prompt|reglas|sistema|system)\b/,
+    /\bno\b.*\b(menciones|mencionar)\b.*\b(correos|bolivia)\b/,
+    /\bahora\b.*\beres\b/,
+    /\bactua\b.*\bcomo\b/,
+    /\brol\b.*\b(asistente|sistema|system)\b/,
+    /\bprompt\b.*\b(sistema|system|exactamente|muestra|revela|dime)\b/,
+    /\b(system|developer)\b.*\b(prompt|message|instructions)\b/,
+    /\b(codigo|codigo fuente|source code)\b.*\b(clasificar|eventos|prompt|sistema)\b/,
+    /\bmuestra\b.*\b(prompt|codigo|instrucciones|reglas)\b/,
+    /\brevela\b.*\b(prompt|codigo|instrucciones|reglas)\b/,
+    /\bdime\b.*\b(prompt|instrucciones|reglas internas)\b/,
+    /\breceta\b|\bcocina\b|\bsopa\b|\bmani\b/,
+    /\bsuma\b.*\b\d+\b.*\b\d+\b/,
+  ]
+
+  return injectionPatterns.some((pattern) => pattern.test(normalized))
 }
 
 const hasPackageCode = (messageBody) => {
@@ -3692,53 +4800,6 @@ const inferIntentHeuristically = (messageBody) => {
 
 const routeCustomerIntent = async ({ messageBody, recentConversation = '' }) => {
   const heuristicIntent = inferIntentHeuristically(messageBody)
-  const config = getAiConfig()
-
-  if (heuristicIntent !== 'GENERAL') {
-    return {
-      category: heuristicIntent,
-      model: 'heuristic',
-      source: 'heuristic',
-    }
-  }
-
-  const prompt = [
-    'Clasifica el mensaje del cliente en una sola palabra exacta.',
-    'Categorias validas: TRACKING, TARIFAS, GENERAL.',
-    recentConversation ? `Contexto reciente:\n${recentConversation}` : 'Sin contexto reciente.',
-    `Mensaje del cliente: ${normalizeReference(messageBody)}`,
-    'Respuesta final: una sola palabra.',
-  ].join('\n')
-
-  try {
-    const aiReachable = await isAiServiceReachable(config.baseUrl)
-
-    if (!aiReachable) {
-      return {
-        category: heuristicIntent,
-        model: 'heuristic',
-        source: 'heuristic',
-      }
-    }
-
-    const aiResult = await callOllamaGenerate({
-      prompt,
-      model: config.routerModel,
-      fallbackModels: ['phi3:mini', config.generalModel],
-      system: config.routerSystemPrompt,
-      timeoutMs: config.routerTimeoutMs,
-    })
-    const routedCategory = normalizeReference(aiResult.response).toUpperCase().split(/\s+/)[0]
-    if (AI_ROUTER_CATEGORIES.has(routedCategory)) {
-      return {
-        category: routedCategory,
-        model: aiResult.model,
-        source: 'ai-router',
-      }
-    }
-  } catch (error) {
-    console.warn('No se pudo clasificar la intencion con el router IA:', error.message)
-  }
 
   return {
     category: heuristicIntent,
@@ -3773,6 +4834,9 @@ const buildGeneralAgentPrompt = ({
     packageContext?.matched
       ? `Contexto del paquete disponible para ${normalizeReference(sender)}:\n${packageContext.summaryText}`
       : 'Sin contexto de paquete en APIs.',
+    packageContext?.matched && formatPackageAgencyContext(packageContext)
+      ? `Agencias obtenidas desde las APIs:\n${formatPackageAgencyContext(packageContext)}`
+      : 'Sin agencias confirmadas desde APIs.',
     packageContext?.packageEventsText
       ? `Historial cronologico de eventos del paquete:\n${packageContext.packageEventsText}\n\nRegla: si preguntan donde estaba el paquete, primero resume la secuencia de eventos y luego indica la ultima ubicacion conocida.`
       : '',
@@ -3800,8 +4864,13 @@ const buildTrackingAgentPrompt = ({
 }) =>
   [
     'Responde como asesor especialista en seguimiento de paquetes para WhatsApp.',
+    'Usa un tono cercano como Jaimito de Correos de Bolivia: saludo cordial, pedido de guia si falta y actualizacion natural del estado.',
     'Usa solo el contexto real del paquete y el historial dado.',
-    'Si el cliente pregunta donde esta o hacia donde va, menciona estado y destino disponible.',
+    'Si el cliente saluda, responde con un saludo breve y presentacion amable.',
+    'Si pide rastreo y no da guia, pide el numero de guia de forma breve.',
+    'Si ya hay guia y contexto real, responde con una actualizacion clara, amable y facil de leer.',
+    'Si el cliente pregunta donde esta o hacia donde va, menciona estado, destino y sucursal de origen o destino cuando exista.',
+    'Si existe una agencia o sucursal en las APIs, usa ese dato exacto y no inventes direcciones ni nombres.',
     'No inventes fechas exactas ni eventos no confirmados.',
     'Responde en espanol, maximo 40 palabras, 1 o 2 frases.',
     '',
@@ -3811,6 +4880,9 @@ const buildTrackingAgentPrompt = ({
     packageContext?.matched
       ? `Contexto del paquete para ${normalizeReference(sender)}:\n${packageContext.summaryText}\n\nRegla de etapa:\n${packageContext.lifecycleInstruction}`
       : 'Sin contexto de paquete confirmado.',
+    packageContext?.matched && formatPackageAgencyContext(packageContext)
+      ? `Agencias obtenidas desde las APIs:\n${formatPackageAgencyContext(packageContext)}`
+      : 'Sin agencias confirmadas desde APIs.',
     packageContext?.packageEventsText
       ? `Historial cronologico de eventos del paquete:\n${packageContext.packageEventsText}\n\nRegla: si el cliente pregunta donde estaba el paquete, responde primero con los eventos y despues con la ubicacion final conocida.`
       : '',
@@ -4431,10 +5503,26 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
       .filter(Boolean)
       .join('\n')
 
-    const packageCode = extractPackageCode(messageBody)
-    const packageContext = await fetchMatchingPackageContext(sender, packageCode)
-    const isGreetingOnly = isGreetingMessage(messageBody)
-    const isPackageInquiryWithoutCode = isPackageInquiryMessage(messageBody) && !hasPackageCode(messageBody)
+    const isInjectionAttempt = isPromptInjectionAttempt(messageBody)
+    const isGreetingOnly = !isInjectionAttempt && isGreetingMessage(messageBody)
+    const isGratitudeOnly = isGratitudeOnlyMessage(messageBody)
+    const packageCodes = extractPackageCodeCandidates(messageBody)
+    const packageCode = packageCodes[0] || ''
+    const hasPackageInquiry = !isInjectionAttempt && (isPackageInquiryMessage(messageBody) || Boolean(packageCode))
+    const isPackageInquiryWithoutCode = hasPackageInquiry && !hasPackageCode(messageBody)
+    const packageContext =
+      isGreetingOnly || isGratitudeOnly || !hasPackageInquiry
+        ? getEmptyPackageContext()
+        : await fetchMatchingPackageContext(sender, packageCode)
+    const multiPackageResults =
+      !isInjectionAttempt && packageCodes.length > 1
+        ? await Promise.all(
+            packageCodes.map(async (code) => ({
+              code,
+              context: code === packageCode ? packageContext : await fetchMatchingPackageContext(sender, code),
+            })),
+          )
+        : []
     const packageCodeNotFound = Boolean(packageCode) && !packageContext.matched
     const routedIntent = await routeCustomerIntent({
       messageBody,
@@ -4476,23 +5564,32 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
     ].join('\n')
 
     let finalReply = isGreetingOnly
-      ? `¡Hola! ${getBoliviaDayGreeting()}. Soy Jaimito, de Correos de Bolivia. ¿En qué te puedo ayudar hoy?`
+      ? `¡Hola! 👋 ${getBoliviaDayGreeting()}. Te habla Jaimito de Correos de Bolivia ✉️. ¿Cómo te puedo colaborar hoy? 😊`
       : isPackageInquiryWithoutCode
-        ? '¡Con gusto te ayudo a rastrearlo! 📦 ¿Me compartes tu número de seguimiento, por favor?'
+        ? '¡Perfecto! 👍 Déjame tu número de guía y lo revisamos de inmediato 📦.'
         : packageCodeNotFound
-          ? `No pude localizar el paquete ${packageCode}. Verifique el código e inténtelo nuevamente, por favor.`
+          ? `No pude localizar el paquete ${packageCode} 🔎. Verifica el código e inténtalo nuevamente, por favor 📦.`
           : packageCode && packageContext.matched
             ? buildFallbackAgentReply({ contact, messageBody, currentStatus: contact?.status ?? 'Nuevo', packageContext })
         : ''
 
-    if (packageCode && packageContext.matched && !isGreetingOnly && !isPackageInquiryWithoutCode && !packageCodeNotFound) {
-      finalReply = ''
+    if (multiPackageResults.length > 1) {
+      finalReply = buildMultiPackageContextReply(multiPackageResults)
+    }
+
+    if (isInjectionAttempt) {
+      finalReply = PROMPT_INJECTION_SAFE_REPLY
+    }
+
+    if (!isInjectionAttempt && isGratitudeOnly) {
+      finalReply = '¡Con gusto! 😊 Seguimos atentos a cualquier nuevo movimiento de tu paquete y te avisaremos apenas haya una actualización 📲.'
     }
 
     const shouldCallAiForReply =
       !finalReply &&
       !packageContext.matched &&
       !isGreetingOnly &&
+      !isGratitudeOnly &&
       !isPackageInquiryWithoutCode &&
       !packageCodeNotFound
 
@@ -4922,8 +6019,13 @@ app.get('/api/health', async (_request, response) => {
 app.get('/api/logs/report', authMiddleware, async (request, response) => {
   const requestedHours = Number(request.query.hours ?? 24)
   const requestedLimit = Number(request.query.limit ?? 100)
+  const requestedPage = Number(request.query.page ?? 1)
+  const requestedPerPage = Number(request.query.per_page ?? requestedLimit)
   const hours = Number.isFinite(requestedHours) ? Math.min(Math.max(requestedHours, 1), 720) : 24
   const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 500) : 100
+  const page = Number.isFinite(requestedPage) ? Math.max(1, requestedPage) : 1
+  const perPage = Number.isFinite(requestedPerPage) ? Math.min(Math.max(requestedPerPage, 1), 100) : limit
+  const offset = (page - 1) * perPage
   const level = String(request.query.level ?? '').trim().toLowerCase()
   const pathFilter = String(request.query.path ?? '').trim()
   const filters = ['created_at >= now() - ($1 * interval \'1 hour\')']
@@ -4943,7 +6045,7 @@ app.get('/api/logs/report', authMiddleware, async (request, response) => {
     await ensureDatabaseReady()
 
     const whereClause = filters.join(' and ')
-    const [summaryResult, endpointResult, recentResult] = await Promise.all([
+    const [summaryResult, endpointResult, recentResult, totalRecentResult] = await Promise.all([
       pool.query(
         `
           select level, count(*)::integer as count
@@ -4974,21 +6076,38 @@ app.get('/api/logs/report', authMiddleware, async (request, response) => {
           from system_logs
           where ${whereClause}
           order by created_at desc, id desc
-          limit $${params.length + 1};
+          limit $${params.length + 1}
+          offset $${params.length + 2};
         `,
-        [...params, limit],
+        [...params, perPage, offset],
+      ),
+      pool.query(
+        `
+          select count(*)::integer as total
+          from system_logs
+          where ${whereClause};
+        `,
+        params,
       ),
     ])
+    const totalItems = Number(totalRecentResult.rows[0]?.total ?? 0)
 
     response.json({
       generatedAt: new Date().toISOString(),
-      period: { hours, level: level || null, path: pathFilter || null },
+      period: { hours, level: level || null, path: pathFilter || null, month: null },
       totals: summaryResult.rows.reduce(
         (totals, row) => ({ ...totals, total: totals.total + row.count, [row.level]: row.count }),
         { total: 0, info: 0, warn: 0, error: 0 },
       ),
       byEndpoint: endpointResult.rows,
       recent: recentResult.rows,
+      months: [],
+      pagination: {
+        page,
+        perPage,
+        totalItems,
+        totalPages: Math.max(1, Math.ceil(totalItems / perPage)),
+      },
     })
   } catch (error) {
     response.status(500).json({
@@ -5254,73 +6373,39 @@ app.get('/api/dashboard', authMiddleware, async (request, response) => {
           c.status,
           c.score,
           c.updated_at,
-          (
-            select max(ml.created_at)
-            from message_logs ml
-            where (
-              ml.contact_id = c.id
-              or (
-                regexp_replace(coalesce(ml.recipient_reference, ''), '[^0-9]', '', 'g') = (
-                  select regexp_replace(coalesce(profile->>'reference', ''), '[^0-9]', '', 'g')
-                  from jsonb_array_elements(c.social_profiles) as profile
-                  where lower(coalesce(profile->>'channel', '')) = 'whatsapp'
-                  limit 1
-                )
-              )
-            )
-          ) as last_message_at,
-          (
-            select max(ml.created_at)
-            from message_logs ml
-            where ml.direction = 'inbound'
-              and (
-                ml.contact_id = c.id
-                or (
-                  regexp_replace(coalesce(ml.recipient_reference, ''), '[^0-9]', '', 'g') = (
-                    select regexp_replace(coalesce(profile->>'reference', ''), '[^0-9]', '', 'g')
-                    from jsonb_array_elements(c.social_profiles) as profile
-                    where lower(coalesce(profile->>'channel', '')) = 'whatsapp'
-                    limit 1
-                  )
-                )
-              )
-          ) as last_inbound_at
-          ,
-          (
-            select ml.message_text
-            from message_logs ml
-            where (
-              ml.contact_id = c.id
-              or (
-                regexp_replace(coalesce(ml.recipient_reference, ''), '[^0-9]', '', 'g') = (
-                  select regexp_replace(coalesce(profile->>'reference', ''), '[^0-9]', '', 'g')
-                  from jsonb_array_elements(c.social_profiles) as profile
-                  where lower(coalesce(profile->>'channel', '')) = 'whatsapp'
-                  limit 1
-                )
-              )
-            )
-            order by ml.created_at desc, ml.id desc
-            limit 1
-          ) as last_message_text,
-          (
-            select ml.direction
-            from message_logs ml
-            where (
-              ml.contact_id = c.id
-              or (
-                regexp_replace(coalesce(ml.recipient_reference, ''), '[^0-9]', '', 'g') = (
-                  select regexp_replace(coalesce(profile->>'reference', ''), '[^0-9]', '', 'g')
-                  from jsonb_array_elements(c.social_profiles) as profile
-                  where lower(coalesce(profile->>'channel', '')) = 'whatsapp'
-                  limit 1
-                )
-              )
-            )
-            order by ml.created_at desc, ml.id desc
-            limit 1
-          ) as last_message_direction
+          message_activity.last_message_at,
+          message_activity.last_inbound_at,
+          latest_message.message_text as last_message_text,
+          latest_message.direction as last_message_direction
         from contacts c
+        left join lateral (
+          select regexp_replace(coalesce(profile->>'reference', ''), '[^0-9]', '', 'g') as whatsapp_reference
+          from jsonb_array_elements(coalesce(c.social_profiles, '[]'::jsonb)) as profile
+          where lower(coalesce(profile->>'channel', '')) = 'whatsapp'
+          limit 1
+        ) whatsapp_profile on true
+        left join lateral (
+          select
+            max(ml.created_at) as last_message_at,
+            max(ml.created_at) filter (where ml.direction = 'inbound') as last_inbound_at
+          from message_logs ml
+          where ml.contact_id = c.id
+            or (
+              coalesce(whatsapp_profile.whatsapp_reference, '') <> ''
+              and regexp_replace(coalesce(ml.recipient_reference, ''), '[^0-9]', '', 'g') = whatsapp_profile.whatsapp_reference
+            )
+        ) message_activity on true
+        left join lateral (
+          select ml.message_text, ml.direction
+          from message_logs ml
+          where ml.contact_id = c.id
+            or (
+              coalesce(whatsapp_profile.whatsapp_reference, '') <> ''
+              and regexp_replace(coalesce(ml.recipient_reference, ''), '[^0-9]', '', 'g') = whatsapp_profile.whatsapp_reference
+            )
+          order by ml.created_at desc, ml.id desc
+          limit 1
+        ) latest_message on true
         order by c.updated_at desc;
       `),
       pool.query(`
@@ -5405,6 +6490,153 @@ app.get('/api/dashboard', authMiddleware, async (request, response) => {
     response.status(500).json({
       message: 'No se pudo cargar el dashboard desde PostgreSQL.',
       error: error.message,
+    })
+  }
+})
+
+app.get('/api/ems/pipeline', authMiddleware, async (request, response) => {
+  const scope = normalizeReference(request.query.scope).toLowerCase()
+  const query = normalizeReference(request.query.query).toLowerCase()
+  const month = normalizeReference(request.query.month).toLowerCase() || 'all'
+  const page = Math.max(1, Number.parseInt(String(request.query.page ?? '1'), 10) || 1)
+  const perPage = Math.max(1, Number.parseInt(String(request.query.per_page ?? '20'), 10) || 20)
+
+  try {
+    const { cards, customColumns } = await buildEmsPipelineCards()
+    const customColumn = customColumns.find((column) => column.id === scope)
+
+    const filteredCards = cards.filter((card) => {
+      const matchesMonth = month === 'all' || getEmsPipelineMonthKey(card.updatedAt) === month
+      const matchesScope =
+        !scope ||
+        scope === 'all' ||
+        (pipelineStageKeys.includes(scope) && card.stage === scope) ||
+        (customColumn &&
+          (normalizeReference(card.status).toLowerCase() === normalizeReference(customColumn.title).toLowerCase() ||
+            (Array.isArray(customColumn.allowedStates) && customColumn.allowedStates.includes(card.stage)) ||
+            (Array.isArray(customColumn.allowedStates) &&
+              customColumn.allowedStates.includes(normalizeReference(card.status).toLowerCase()))))
+      const matchesQuery =
+        !query ||
+        [
+          card.code,
+          card.title,
+          card.summary,
+          card.senderName,
+          card.senderReference,
+          card.recipientName,
+          card.recipientReference,
+          card.destination,
+          card.status,
+        ].some((value) => normalizeReference(value).toLowerCase().includes(query))
+
+      return matchesMonth && matchesScope && matchesQuery
+    })
+    const totalItems = filteredCards.length
+    const totalPages = Math.max(1, Math.ceil(totalItems / perPage))
+    const currentPage = Math.min(page, totalPages)
+    const fromIndex = (currentPage - 1) * perPage
+
+    response.json({
+      scope: scope || 'all',
+      page: currentPage,
+      per_page: perPage,
+      total: totalItems,
+      total_pages: totalPages,
+      data: filteredCards.slice(fromIndex, fromIndex + perPage),
+      pagination: {
+        page: currentPage,
+        per_page: perPage,
+        total_items: totalItems,
+        total_pages: totalPages,
+        has_more: currentPage < totalPages,
+      },
+    })
+  } catch (error) {
+    response.status(502).json({
+      message: 'No se pudo cargar la paginacion del pipeline EMS.',
+      error: error instanceof Error ? error.message : 'Error desconocido.',
+    })
+  }
+})
+
+app.get('/api/ems/month-options', authMiddleware, async (_request, response) => {
+  try {
+    await Promise.all([
+      getCachedTrackingPackagesCatalog() ? Promise.resolve() : fetchAllTrackingPackagesCatalog(),
+      getCachedContactPackagesCatalog() ? Promise.resolve() : fetchAllContactPackagesCatalog(),
+    ])
+
+    const monthMap = new Map()
+    const registerMonth = (value) => {
+      const key = getEmsPipelineMonthKey(value)
+      if (!key) return
+      monthMap.set(key, (monthMap.get(key) ?? 0) + 1)
+    }
+
+    ;(getCachedTrackingPackagesCatalog()?.data ?? []).forEach((item) =>
+      registerMonth(getTrackingLatestEvent(item)?.fecha || item?.fecha_registro),
+    )
+    ;(getCachedContactPackagesCatalog()?.data ?? []).forEach((item) => registerMonth(item?.fecha_registro))
+
+    const data = [...monthMap.entries()]
+      .sort((first, second) => second[0].localeCompare(first[0]))
+      .map(([value, count]) => {
+        const [yearPart, monthPart] = value.split('-')
+        const date = new Date(Date.UTC(Number(yearPart), Number(monthPart) - 1, 1))
+        return {
+          value,
+          label: new Intl.DateTimeFormat('es-BO', {
+            month: 'long',
+            year: 'numeric',
+            timeZone: 'America/La_Paz',
+          }).format(date),
+          count,
+        }
+      })
+
+    response.json({ data })
+  } catch (error) {
+    response.status(502).json({
+      message: 'No se pudieron cargar los meses del pipeline EMS.',
+      error: error instanceof Error ? error.message : 'Error desconocido.',
+    })
+  }
+})
+
+app.get('/api/ems/stage-overrides', authMiddleware, async (_request, response) => {
+  try {
+    await ensureDatabaseReady()
+    response.json({ overrides: await getStoredEmsStageOverrides() })
+  } catch (error) {
+    response.status(500).json({
+      message: 'No se pudieron cargar los estados guardados del tablero EMS.',
+      error: error instanceof Error ? error.message : 'Error desconocido.',
+    })
+  }
+})
+
+app.put('/api/ems/stage-overrides', authMiddleware, async (request, response) => {
+  const packageCode = normalizeReference(request.body?.packageCode).toUpperCase()
+  const stage = normalizeEmsStageOverrideValue(request.body?.stage)
+
+  if (!packageCode || !stage) {
+    response.status(400).json({ message: 'Falta el codigo del paquete o el estado EMS no es valido.' })
+    return
+  }
+
+  try {
+    await ensureDatabaseReady()
+    response.json({
+      ok: true,
+      packageCode,
+      stage,
+      overrides: await saveEmsStageOverride(packageCode, stage),
+    })
+  } catch (error) {
+    response.status(500).json({
+      message: 'No se pudo guardar el estado del paquete EMS.',
+      error: error instanceof Error ? error.message : 'Error desconocido.',
     })
   }
 })
@@ -7094,3 +8326,4 @@ app.listen(port, () => {
   console.log(`CRM API disponible en http://localhost:${port}${frontendMessage}`)
   startWhatsAppStageWatcher()
 })
+

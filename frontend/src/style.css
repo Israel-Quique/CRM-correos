@@ -281,8 +281,8 @@ button {
   flex-direction: column;
   gap: 16px;
   padding: 14px;
-  background: linear-gradient(180deg, #03203a, var(--sidebar));
-  border-right: 1px solid rgba(255, 203, 5, 0.16);
+  background: var(--bg);
+  border-right: 1px solid rgba(255, 255, 255, 0.05);
   transition: grid-column 180ms ease, width 180ms ease, padding 180ms ease;
 }
 
@@ -448,14 +448,19 @@ button {
 }
 
 .menu-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
   min-height: 36px;
   padding: 0 12px;
   border: 0;
   border-radius: 11px;
   background: rgba(255, 255, 255, 0.04);
   color: rgba(255, 255, 255, 0.82);
+  text-decoration: none;
   text-align: left;
   font-size: 0.94rem;
+  cursor: pointer;
 }
 
 .menu-item.is-current {
@@ -587,13 +592,18 @@ button {
 }
 
 .menu-flyout-item {
+  display: flex;
+  align-items: center;
+  width: 100%;
   min-height: 36px;
   padding: 0 10px;
   border: 0;
   border-radius: 11px;
   background: rgba(255, 255, 255, 0.06);
   color: rgba(255, 255, 255, 0.9);
+  text-decoration: none;
   text-align: left;
+  cursor: pointer;
 }
 
 .menu-flyout-item.is-current {
@@ -647,8 +657,9 @@ button {
   gap: 14px;
   min-height: 58px;
   padding: 0 18px;
-  background: var(--yellow);
-  border-bottom: 2px solid rgba(0, 43, 73, 0.2);
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+  box-shadow: 0 2px 10px rgba(0,0,0,0.02);
 }
 
 .search-wrap {
@@ -692,9 +703,9 @@ button {
 
 .topbar-center span {
   padding: 7px 14px;
-  border: 1px solid rgba(0, 43, 73, 0.14);
+  border: 1px solid var(--line);
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.28);
+  background: var(--surface-soft);
   color: var(--navy);
   font-size: 0.78rem;
   font-weight: 800;
@@ -775,7 +786,7 @@ button {
 .topbar-chip {
   padding: 6px 10px;
   border-radius: 999px;
-  background: rgba(0, 43, 73, 0.14);
+  background: var(--surface-strong);
   color: var(--navy);
   font-size: 0.72rem;
   font-weight: 800;
@@ -797,7 +808,7 @@ button {
   border-radius: 16px;
   border: 1px solid transparent;
   color: #fff;
-  box-shadow: 0 10px 18px rgba(15, 23, 42, 0.1);
+  box-shadow: 0 4px 10px rgba(15, 23, 42, 0.08);
 }
 
 .topbar-test-btn.is-inactive {
@@ -1391,6 +1402,43 @@ button {
   padding-inline: 16px;
 }
 
+.international-status-strip {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid rgba(37, 111, 255, 0.1);
+  border-radius: 16px;
+  background: rgba(248, 250, 253, 0.95);
+}
+
+.international-status-strip-label {
+  color: var(--navy);
+  font-size: 0.8rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.international-status-strip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.international-status-strip .ems-status-chip {
+  min-height: 32px;
+  padding-inline: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  background: #fff;
+  color: var(--navy);
+}
+
+.international-status-strip .ems-status-chip.is-active {
+  background: #0f172a;
+  color: #fff;
+}
+
 .package-code-lookup-card {
   display: grid;
   gap: 14px;
@@ -1517,9 +1565,11 @@ button {
   font-size: 0.76rem;
   font-weight: 700;
   min-width: 178px;
+  flex: 1 1 178px;
 }
 
 .compact-field select {
+  width: 100%;
   min-width: 178px;
   min-height: 40px;
   padding: 9px 36px 9px 12px;
@@ -1605,6 +1655,20 @@ button {
 .pagination-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.chat-pagination {
+  margin-top: 12px;
+  padding: 10px 12px;
+}
+
+.chat-pagination .international-pagination-info {
+  gap: 6px;
+  font-size: 0.84rem;
+}
+
+.chat-pagination .international-pagination-actions {
+  flex-wrap: wrap;
 }
 
 .international-table {
@@ -1774,6 +1838,20 @@ button {
   padding-bottom: 18px;
 }
 
+.international-kanban-board {
+  grid-template-columns: repeat(6, minmax(220px, 1fr));
+}
+
+.international-ems-board {
+  height: auto;
+  min-height: calc(100vh - 150px);
+}
+
+.international-pipeline-total {
+  color: rgba(226, 232, 240, 0.78);
+  font-size: 0.95rem;
+}
+
 .international-pipeline-summary {
   display: inline-flex;
   align-items: baseline;
@@ -1862,6 +1940,7 @@ button {
   border: 1px solid rgba(15, 34, 60, 0.08);
   border-radius: 18px;
   background: linear-gradient(180deg, #fbfdff, #f4f7fc);
+  align-content: start;
 }
 
 .international-pipeline-column.received {
@@ -1918,6 +1997,19 @@ button {
   display: grid;
   gap: 10px;
   min-height: 220px;
+  min-width: 0;
+  overflow: auto;
+}
+
+.international-pipeline-column .ems-column-state-btn {
+  justify-self: start;
+  align-self: start;
+  width: fit-content;
+  min-height: 34px;
+  padding: 0 12px;
+  border-radius: 12px;
+  font-size: 0.82rem;
+  box-shadow: 0 8px 16px rgba(255, 203, 5, 0.12);
 }
 
 .international-pipeline-card {
@@ -2175,6 +2267,10 @@ button {
 
 .ems-status-dot.is-delivered {
   background: #22c55e;
+}
+
+.ems-status-dot.is-cancelled {
+  background: #ef4444;
 }
 
 .ems-layout {
@@ -2555,6 +2651,12 @@ button {
   font-size: 0.9rem;
 }
 
+.conversation-contact-reminder {
+  color: #a16207;
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
 .ems-thread-shell {
   min-height: 0;
   height: 100%;
@@ -2784,9 +2886,31 @@ button {
 }
 
 .ems-column-state-btn {
-  width: 100%;
   min-height: 40px;
   border-radius: 14px;
+}
+
+.ems-column-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.ems-column-actions .ems-column-state-btn {
+  width: 100%;
+  padding-inline: 12px;
+  font-size: 0.82rem;
+}
+
+.ems-column-actions .ems-column-state-btn.is-states {
+  background: #fff;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  color: var(--navy);
+}
+
+.ems-column-actions .ems-column-state-btn.is-packages {
+  background: var(--yellow);
+  color: var(--navy);
 }
 
 .pipeline-column-modal-form {
@@ -2980,7 +3104,7 @@ button {
 
 .ems-kanban-grid {
   display: grid;
-  grid-template-columns: repeat(5, minmax(220px, 1fr));
+  grid-template-columns: repeat(6, minmax(220px, 1fr));
   gap: 14px;
   min-height: 0;
   overflow-x: auto;
@@ -2990,6 +3114,7 @@ button {
 .ems-kanban-column {
   display: grid;
   grid-template-rows: auto auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto auto;
   gap: 12px;
   min-height: 0;
   padding: 14px;
@@ -2998,6 +3123,14 @@ button {
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(245, 248, 252, 0.94));
   box-shadow: 0 18px 36px rgba(15, 23, 42, 0.08);
   overflow: hidden;
+}
+
+.ems-kanban-column.is-drag-over {
+  border-color: rgba(37, 111, 255, 0.55);
+  box-shadow:
+    inset 0 0 0 1px rgba(37, 111, 255, 0.32),
+    0 20px 40px rgba(37, 111, 255, 0.14);
+  transform: translateY(-1px);
 }
 
 .ems-kanban-column.received {
@@ -3018,6 +3151,10 @@ button {
 
 .ems-kanban-column.delivered {
   box-shadow: inset 0 0 0 1px rgba(34, 197, 94, 0.08);
+}
+
+.ems-kanban-column.cancelled {
+  box-shadow: inset 0 0 0 1px rgba(239, 68, 68, 0.1);
 }
 
 .ems-kanban-column.custom {
@@ -3078,6 +3215,10 @@ button {
 
 .ems-dot.delivered {
   background: #22c55e;
+}
+
+.ems-dot.cancelled {
+  background: #ef4444;
 }
 
 .ems-dot.custom {
@@ -3179,8 +3320,24 @@ button {
   align-content: start;
   gap: 10px;
   min-height: 0;
+  min-height: 160px;
   overflow: auto;
   padding-right: 2px;
+}
+
+.ems-dropzone {
+  min-height: 160px;
+  padding-bottom: 6px;
+  border-radius: 16px;
+  transition:
+    background-color 0.18s ease,
+    box-shadow 0.18s ease,
+    outline-color 0.18s ease;
+}
+
+.ems-dropzone.is-drag-over {
+  background: rgba(37, 111, 255, 0.06);
+  box-shadow: inset 0 0 0 1px rgba(37, 111, 255, 0.18);
 }
 
 .ems-remove-column-btn {
@@ -3206,10 +3363,23 @@ button {
     box-shadow 0.18s ease;
 }
 
+.ems-package-card[draggable='true'] {
+  cursor: grab;
+}
+
+.ems-package-card[draggable='true']:active {
+  cursor: grabbing;
+}
+
 .ems-package-card:hover {
   transform: translateY(-2px);
   border-color: rgba(37, 111, 255, 0.18);
   box-shadow: 0 18px 30px rgba(15, 23, 42, 0.1);
+}
+
+.ems-package-card.is-dragging {
+  opacity: 0.55;
+  transform: scale(0.985);
 }
 
 .ems-package-card.received {
@@ -3349,6 +3519,10 @@ button {
   color: #16a34a;
 }
 
+.ems-package-badge.is-cancelled {
+  color: #dc2626;
+}
+
 .ems-package-detail-modal {
   width: min(980px, 100%);
 }
@@ -3435,6 +3609,11 @@ button {
 .ems-package-detail-channel-state.is-whatsapp {
   color: #15803d;
   background: rgba(34, 197, 94, 0.14);
+}
+
+.ems-package-detail-channel-state.is-cellphone {
+  color: #b45309;
+  background: rgba(245, 158, 11, 0.16);
 }
 
 .ems-package-detail-channel-state.is-phone {
@@ -3722,6 +3901,11 @@ button {
   background: #ecfff3;
 }
 
+.pronts-column-card.is-cancelled.is-active {
+  border-color: rgba(239, 68, 68, 0.42);
+  background: #fff1f2;
+}
+
 .pronts-column-card-badge {
   width: 34px;
   height: 34px;
@@ -3825,6 +4009,12 @@ button {
   border-color: rgba(34, 197, 94, 0.22);
   background: #ecfdf3;
   color: #15803d;
+}
+
+.pronts-active-pill.is-cancelled {
+  border-color: rgba(239, 68, 68, 0.22);
+  background: #fff1f2;
+  color: #b91c1c;
 }
 
 .pronts-editor-head h3 {
@@ -4299,6 +4489,20 @@ tbody tr:hover {
   box-shadow: 0 0 0 4px rgba(240, 68, 56, 0.1);
 }
 
+.contact-reminder-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: rgba(245, 158, 11, 0.16);
+  color: #a16207;
+  font-size: 0.7rem;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
 .info-card strong,
 .list-card strong {
   display: block;
@@ -4573,6 +4777,104 @@ tbody tr:hover {
   border-color: rgba(180, 35, 24, 0.18);
   background: rgba(180, 35, 24, 0.08);
   color: #b42318;
+}
+
+@keyframes messageNotificationIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px) translateX(-8px) scale(0.98);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) translateX(0) scale(1);
+  }
+}
+
+.message-notification-stack {
+  position: fixed;
+  left: 20px;
+  bottom: 20px;
+  z-index: 70;
+  display: grid;
+  gap: 12px;
+  width: min(340px, calc(100vw - 32px));
+  pointer-events: none;
+}
+
+.message-notification-card {
+  pointer-events: auto;
+  display: grid;
+  gap: 8px;
+  padding: 14px 14px 13px;
+  border: 1px solid rgba(37, 111, 255, 0.14);
+  border-radius: 18px;
+  background:
+    radial-gradient(circle at top right, rgba(255, 203, 5, 0.16), transparent 30%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(241, 246, 253, 0.98));
+  box-shadow: 0 22px 48px rgba(3, 20, 38, 0.18);
+  color: var(--navy);
+  animation: messageNotificationIn 180ms ease-out;
+}
+
+.message-notification-badge {
+  display: inline-flex;
+  width: fit-content;
+  align-items: center;
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: rgba(19, 137, 94, 0.12);
+  color: var(--green);
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.message-notification-card strong {
+  font-size: 0.98rem;
+  line-height: 1.2;
+}
+
+.message-notification-card p {
+  margin: 0;
+  color: var(--text);
+  font-size: 0.92rem;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+.message-notification-card small {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.message-notification-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.message-notification-open,
+.message-notification-dismiss {
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid rgba(0, 43, 73, 0.12);
+  border-radius: 10px;
+  font-size: 0.84rem;
+  font-weight: 700;
+}
+
+.message-notification-open {
+  background: linear-gradient(180deg, #ffcc11 0%, #f2be00 100%);
+  color: var(--navy);
+}
+
+.message-notification-dismiss {
+  background: rgba(244, 247, 251, 0.98);
+  color: var(--navy);
 }
 
 .group-module-card {
@@ -5467,6 +5769,11 @@ tbody tr:hover {
   font-weight: 700;
 }
 
+.conversation-pill-reminder {
+  background: rgba(245, 158, 11, 0.16);
+  color: #a16207;
+}
+
 .conversation-add-contact-btn {
   min-height: 34px;
   padding: 0 14px;
@@ -5697,6 +6004,17 @@ tbody tr:hover {
 .conversation-detail-block strong {
   color: #ffffff;
   font-size: 0.98rem;
+}
+
+.conversation-reminder-block {
+  border-color: rgba(245, 158, 11, 0.28);
+  background: rgba(245, 158, 11, 0.08);
+}
+
+.conversation-reminder-block small {
+  color: rgba(255, 255, 255, 0.78);
+  font-size: 0.78rem;
+  line-height: 1.45;
 }
 
 .ai-toggle-block {

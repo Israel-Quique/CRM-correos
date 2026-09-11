@@ -134,7 +134,6 @@ export const renderAuthenticatedApp = (ctx: any) => {
                 <span>${escapeHtml(state.sessionUser?.role ?? 'Administradores')}</span>
               </div>
             </div>
-            <span class="topbar-profile-caret" aria-hidden="true">v</span>
           </button>
           <div class="topbar-profile-menu" role="menu" aria-label="Perfil de usuario">
             <button
@@ -151,6 +150,30 @@ export const renderAuthenticatedApp = (ctx: any) => {
       ${renderWorkspace(ctx)}
     </div>
   </div>
+  ${
+    state.messageNotifications.length > 0
+      ? `
+        <div class="message-notification-stack" aria-live="polite" aria-label="Nuevas notificaciones de mensajes">
+          ${state.messageNotifications
+            .map(
+              (notification: any) => `
+                <article class="message-notification-card">
+                  <div class="message-notification-badge">Mensaje nuevo</div>
+                  <strong>${escapeHtml(notification.contactName)}</strong>
+                  <p>${escapeHtml(notification.preview)}</p>
+                  <small>${escapeHtml(notification.timestamp || 'Sin hora registrada')}</small>
+                  <div class="message-notification-actions">
+                    <button class="message-notification-open" data-open-chat="${notification.contactId}" type="button">Ver chat</button>
+                    <button class="message-notification-dismiss" data-dismiss-message-notification="${notification.id}" type="button">Cerrar</button>
+                  </div>
+                </article>
+              `,
+            )
+            .join('')}
+        </div>
+      `
+      : ''
+  }
   ${renderCreateContactModal(ctx)}
   ${renderSendMessageModal(ctx)}
   ${state.isConversationModalOpen ? renderConversationModal(ctx) : ''}

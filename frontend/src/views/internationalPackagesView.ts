@@ -1,4 +1,4 @@
-﻿// @ts-nocheck
+// @ts-nocheck
 
 export const renderInternationalPackagesView = (ctx: any) => {
   const {
@@ -34,6 +34,10 @@ export const renderInternationalPackagesView = (ctx: any) => {
     hasWhatsAppChannel,
     isContactConnected,
     getTrackingApiPagination,
+    getTrackingApiAvailableStates,
+    getTrackingApiAvailableServices,
+    getTrackingApiAvailableCountries,
+    getTrackingApiTableHead,
     renderTrackingApiRows,
     renderTrackingApiPagination,
     getContactPackagesPagination,
@@ -65,6 +69,7 @@ export const renderInternationalPackagesView = (ctx: any) => {
     getCountryIso2FromLabel,
     getGroupPickerResultsMarkup
   } = ctx
+
   return `
   <section class="section-panel international-panel ${state.activeView === 'internacionales' ? 'is-visible' : ''}">
     <div class="international-header international-header-compact">
@@ -74,7 +79,77 @@ export const renderInternationalPackagesView = (ctx: any) => {
         <p class="international-helper">Seguimiento de paquetes consumidos desde la API externa.</p>
       </div>
       <div class="international-actions">
-        <button class="secondary-btn" type="button" data-open-package-code-lookup>Buscar código</button>
+        <label class="field-control compact-field">
+          <span>Estado</span>
+          <select id="tracking-api-state-filter">
+            <option value="all" ${state.trackingApiStateFilter === 'all' ? 'selected' : ''}>Todos los estados</option>
+            ${getTrackingApiAvailableStates()
+              .map(
+                (status) =>
+                  `<option value="${escapeHtml(status.value)}" ${state.trackingApiStateFilter === status.value ? 'selected' : ''}>${escapeHtml(status.label)} (${status.count})</option>`,
+              )
+              .join('')}
+          </select>
+        </label>
+
+        <label class="field-control compact-field">
+          <span>Servicio</span>
+          <select id="tracking-api-service-filter">
+            <option value="all" ${state.trackingApiServiceFilter === 'all' ? 'selected' : ''}>Todos los servicios</option>
+            ${getTrackingApiAvailableServices()
+              .map(
+                (service: any) =>
+                  `<option value="${escapeHtml(service.value)}" ${state.trackingApiServiceFilter === service.value ? 'selected' : ''}>${escapeHtml(service.label)} (${service.count})</option>`,
+              )
+              .join('')}
+          </select>
+        </label>
+
+        <label class="field-control compact-field">
+          <span>Origen</span>
+          <select id="tracking-api-origin-filter">
+            <option value="all" ${state.trackingApiOriginFilter === 'all' ? 'selected' : ''}>Todos los origenes</option>
+            ${getTrackingApiAvailableCountries('origen')
+              .map(
+                (country: any) =>
+                  `<option value="${escapeHtml(country.value)}" ${state.trackingApiOriginFilter === country.value ? 'selected' : ''}>${escapeHtml(country.label)} (${country.count})</option>`,
+              )
+              .join('')}
+          </select>
+        </label>
+
+        <label class="field-control compact-field">
+          <span>Destino</span>
+          <select id="tracking-api-destination-filter">
+            <option value="all" ${state.trackingApiDestinationFilter === 'all' ? 'selected' : ''}>Todos los destinos</option>
+            ${getTrackingApiAvailableCountries('destino')
+              .map(
+                (country: any) =>
+                  `<option value="${escapeHtml(country.value)}" ${state.trackingApiDestinationFilter === country.value ? 'selected' : ''}>${escapeHtml(country.label)} (${country.count})</option>`,
+              )
+              .join('')}
+          </select>
+        </label>
+
+        <form id="tracking-api-code-form" class="international-code-search">
+          <label class="field-control compact-field">
+            <span>Código</span>
+            <span>Codigo</span>
+            <input
+              id="tracking-api-code-search"
+              type="search"
+              placeholder="Ej. EE000725146BO"
+              value="${escapeHtml(state.packageCodeLookupQuery)}"
+            />
+          </label>
+          ${
+            state.packageCodeLookupQuery
+              ? '<button class="secondary-btn" id="tracking-api-code-clear" type="button">Limpiar</button>'
+              : ''
+          }
+          <button class="secondary-btn" type="submit">Buscar código</button>
+          <button class="secondary-btn" type="submit">Buscar codigo</button>
+        </form>
       </div>
     </div>
 
@@ -100,20 +175,7 @@ export const renderInternationalPackagesView = (ctx: any) => {
 
       <div class="international-table-wrap">
         <table class="international-table international-tracking-table">
-          <thead>
-            <tr>
-              <th>Código</th>
-              <th>Origen</th>
-              <th>Destino</th>
-              <th>Estado</th>
-              <th>Lugar destino</th>
-              <th>Servicio</th>
-              <th>Peso</th>
-              <th>Teléfono origen</th>
-              <th>Teléfono destino</th>
-              <th>Acciones</th>
-            </tr>
-          </thead>
+          ${getTrackingApiTableHead()}
           <tbody>${renderTrackingApiRows()}</tbody>
         </table>
       </div>
@@ -124,5 +186,3 @@ export const renderInternationalPackagesView = (ctx: any) => {
 `
 
 }
-
-

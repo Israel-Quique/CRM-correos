@@ -23,7 +23,7 @@ export const renderCustomEmsStateModal = (ctx: any) => {
           <div class="pipeline-state-modal-title">
             <p class="section-kicker">EMS</p>
             <h3>Estados de paquetes: ${escapeHtml(scopeLabel)}</h3>
-            <small>Revisa solo los estados detectados para esta columna y registralos en el pipeline EMS.</small>
+            <small>Configura esta columna para que considere solo los estados que selecciones.</small>
           </div>
           <div class="pipeline-state-modal-actions">
             <span class="pipeline-state-modal-chip">${escapeHtml(scopeLabel)}</span>
@@ -33,11 +33,11 @@ export const renderCustomEmsStateModal = (ctx: any) => {
 
         <div class="pipeline-state-modal-summary">
           <div class="pipeline-state-summary-card">
-            <span class="pipeline-state-summary-label">Estados visibles</span>
+            <span class="pipeline-state-summary-label">Estados detectados</span>
             <strong>${items.length}</strong>
           </div>
           <div class="pipeline-state-summary-card">
-            <span class="pipeline-state-summary-label">Registros detectados</span>
+            <span class="pipeline-state-summary-label">Paquetes detectados</span>
             <strong>${totalVisibleStates}</strong>
           </div>
           <div class="pipeline-state-summary-card">
@@ -80,7 +80,7 @@ export const renderCustomEmsStateModal = (ctx: any) => {
                               type="button"
                               ${item.isRegistered ? 'disabled' : ''}
                             >
-                              ${item.isRegistered ? 'Registrado' : 'Registrar'}
+                              ${item.isRegistered ? 'Incluido' : 'Incluir'}
                             </button>
                           </div>
                         </article>

@@ -16,6 +16,8 @@ export const renderContactsView = (ctx: any) => {
     getContactConnectionClass,
     formatConversationTimestamp,
     getStatusClass,
+    getContactReminderState,
+    getContactsPagination,
     getFilteredEmsContacts,
     getEmsColumnContacts,
     getEmsStatusContacts,
@@ -70,6 +72,7 @@ export const renderContactsView = (ctx: any) => {
     getGroupPickerResultsMarkup
   } = ctx
   const filtered = getFilteredContacts()
+  const contactsPagination = getContactsPagination()
   const segmentOptions = getSegmentOptions()
   const averageScore =
     filtered.length > 0
@@ -166,10 +169,12 @@ export const renderContactsView = (ctx: any) => {
             </thead>
             <tbody>
               ${
-                filtered.length > 0
-                  ? filtered
+                contactsPagination.items.length > 0
+                  ? contactsPagination.items
                       .map(
-                        (contact) => `
+                        (contact) => {
+                          const reminderState = getContactReminderState(contact)
+                          return `
                           <tr class="contact-table-row">
                             <td data-label="Seleccion">
                               <input
@@ -190,6 +195,11 @@ export const renderContactsView = (ctx: any) => {
                                       <span class="contact-connection-dot" aria-hidden="true"></span>
                                       ${escapeHtml(getContactConnectionLabel(contact))}
                                     </span>
+                                    ${
+                                      reminderState.active
+                                        ? `<span class="contact-reminder-badge">${escapeHtml(reminderState.label)}</span>`
+                                        : ''
+                                    }
                                   </div>
                                   <span>ID-${String(contact.id).padStart(3, '0')}</span>
                                   <small>${escapeHtml(getContactPreviewLine(contact))}</small>
@@ -231,7 +241,8 @@ export const renderContactsView = (ctx: any) => {
                               </div>
                             </td>
                           </tr>
-                        `,
+                        `
+                        },
                       )
                       .join('')
                   : `
@@ -245,6 +256,40 @@ export const renderContactsView = (ctx: any) => {
             </tbody>
           </table>
         </div>
+        ${
+          contactsPagination.totalItems > contactsPagination.pageSize
+            ? `
+              <div class="international-pagination contacts-pagination">
+                <div class="international-pagination-info">
+                  <strong>${contactsPagination.currentPage}</strong>
+                  <span>de ${contactsPagination.totalPages} páginas</span>
+                  <span>Mostrando ${Math.min(
+                    contactsPagination.totalItems,
+                    contactsPagination.currentPage * contactsPagination.pageSize,
+                  )} de ${contactsPagination.totalItems} contactos</span>
+                </div>
+                <div class="international-pagination-actions">
+                  <button
+                    class="secondary-btn pagination-btn"
+                    type="button"
+                    data-contacts-list-page="prev"
+                    ${contactsPagination.currentPage <= 1 ? 'disabled' : ''}
+                  >
+                    Anterior
+                  </button>
+                  <button
+                    class="secondary-btn pagination-btn"
+                    type="button"
+                    data-contacts-list-page="next"
+                    ${contactsPagination.currentPage >= contactsPagination.totalPages ? 'disabled' : ''}
+                  >
+                    Siguiente
+                  </button>
+                </div>
+              </div>
+            `
+            : ''
+        }
       </div>
     </section>
   `

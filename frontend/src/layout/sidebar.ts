@@ -63,7 +63,8 @@ export const renderSidebar = (ctx: any) => {
     getCountryLabel,
     getCountryIso2,
     getCountryIso2FromLabel,
-    getGroupPickerResultsMarkup
+    getGroupPickerResultsMarkup,
+    getViewHref
   } = ctx
   return `
   <aside class="sidebar ${state.isSidebarCollapsed ? 'is-collapsed' : ''}">
@@ -113,18 +114,33 @@ export const renderSidebar = (ctx: any) => {
                 ${group.items
                   .map(
                     (item) => `
-                      <button
+                      <a
                         class="menu-item ${item.view === state.activeView ? 'is-current' : ''}"
+                        href="${escapeHtml(getViewHref(item.view))}"
                         data-view="${item.view}"
-                        type="button"
                         title="${item.label}"
                         aria-label="${item.label}"
                       >
                         ${item.label}
-                      </button>
+                      </a>
                     `,
                   )
                   .join('')}
+                ${
+                  group.key === 'sistema'
+                    ? `
+                      <button
+                        class="menu-item menu-item-action"
+                        data-export-tracking-api-excel
+                        type="button"
+                        title="Extraer tracking Excel"
+                        aria-label="Extraer tracking Excel"
+                      >
+                        Extraer tracking Excel
+                      </button>
+                    `
+                    : ''
+                }
               </div>
 
               ${
@@ -138,16 +154,29 @@ export const renderSidebar = (ctx: any) => {
                         ${group.items
                           .map(
                             (item) => `
-                              <button
+                              <a
                                 class="menu-flyout-item ${item.view === state.activeView ? 'is-current' : ''}"
+                                href="${escapeHtml(getViewHref(item.view))}"
                                 data-view="${item.view}"
-                                type="button"
                               >
                                 ${item.label}
-                              </button>
+                              </a>
                             `,
                           )
                           .join('')}
+                        ${
+                          group.key === 'sistema'
+                            ? `
+                              <button
+                                class="menu-flyout-item menu-item-action"
+                                data-export-tracking-api-excel
+                                type="button"
+                              >
+                                Extraer tracking Excel
+                              </button>
+                            `
+                            : ''
+                        }
                       </div>
                     </div>
                   `

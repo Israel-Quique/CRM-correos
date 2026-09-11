@@ -20,8 +20,11 @@ export const renderChatView = (ctx: any) => {
     getEmsStatusContacts,
     getEmsStatusKey,
     getEmsStatusLabel,
+    getChatStatusLabel,
     getEmsStatusToneClass,
     getEmsPhaseLabel,
+    getChatPhaseLabel,
+    getChatPhaseDescription,
     getEmsPhaseDescription,
     getChatContacts,
     isAutoCreatedChatContact,
@@ -63,13 +66,14 @@ export const renderChatView = (ctx: any) => {
     getCountryLabel,
     getCountryIso2,
     getCountryIso2FromLabel,
-    getGroupPickerResultsMarkup
+    getGroupPickerResultsMarkup,
+    getChatListPagination
   } = ctx
   const conversation = state.conversationData
   const allChatContacts = getChatContacts()
-  const filteredChatContacts = getFilteredEmsContacts()
   const statusCounts = getEmsStatusContacts()
   const sortedMessages = getConversationMessagesChronological(conversation.messages)
+  const chatPagination = getChatListPagination()
   const activeContact =
     state.data?.contacts.find((contact) => contact.id === conversation.contact.id) ??
     allChatContacts.find((contact) => contact.id === conversation.contact.id) ??
@@ -77,10 +81,11 @@ export const renderChatView = (ctx: any) => {
   const activeReference = activeContact ? getWhatsAppReference(activeContact) : ''
   const shouldShowAddContact = isAutoCreatedChatContact(activeContact)
   const activeConversationCount = allChatContacts.length
-  const activePhaseLabel = activeContact ? getEmsPhaseLabel(activeContact) : 'Fase 1 (Recibido Origen)'
+  const activePhaseLabel = activeContact ? getChatPhaseLabel(activeContact) : 'Nuevo'
   const activePhaseDescription = activeContact
-    ? getEmsPhaseDescription(activeContact)
+    ? getChatPhaseDescription(activeContact)
     : 'Selecciona una conversación para ver su seguimiento.'
+  const chatPaginationVisible = chatPagination.totalItems > chatPagination.pageSize
 
   return `
     <section class="section-panel chat-module-panel ${state.activeView === 'chat' ? 'is-visible' : ''}">
@@ -159,11 +164,11 @@ export const renderChatView = (ctx: any) => {
             </label>
             <div class="ems-list-scroll">
               ${
-                filteredChatContacts.length > 0
-                  ? filteredChatContacts
+                chatPagination.items.length > 0
+                  ? chatPagination.items
                       .map((contact) => {
                         const statusKey = getEmsStatusKey(contact)
-                        const statusLabel = getEmsStatusLabel(statusKey)
+                        const statusLabel = getChatStatusLabel(contact)
                         return `
                           <button
                             class="ems-chat-card ${contact.id === conversation.contact.id ? 'is-active' : ''}"
@@ -194,6 +199,40 @@ export const renderChatView = (ctx: any) => {
                   : `<div class="empty-state">No hay conversaciones para este filtro.</div>`
               }
             </div>
+            ${
+              chatPaginationVisible
+                ? `
+                  <div class="international-pagination chat-pagination">
+                    <div class="international-pagination-info">
+                      <strong>${chatPagination.currentPage}</strong>
+                      <span>de ${chatPagination.totalPages} páginas</span>
+                      <span>Mostrando ${Math.min(
+                        chatPagination.totalItems,
+                        chatPagination.currentPage * chatPagination.pageSize,
+                      )} de ${chatPagination.totalItems} chats</span>
+                    </div>
+                    <div class="international-pagination-actions">
+                      <button
+                        class="secondary-btn pagination-btn"
+                        data-chat-list-page="prev"
+                        type="button"
+                        ${chatPagination.currentPage <= 1 ? 'disabled' : ''}
+                      >
+                        Anterior
+                      </button>
+                      <button
+                        class="secondary-btn pagination-btn"
+                        data-chat-list-page="next"
+                        type="button"
+                        ${chatPagination.currentPage >= chatPagination.totalPages ? 'disabled' : ''}
+                      >
+                        Siguiente
+                      </button>
+                    </div>
+                  </div>
+                `
+                : ''
+            }
           </aside>
 
           <section class="ems-conversation-panel">
@@ -261,7 +300,7 @@ export const renderChatView = (ctx: any) => {
                 </div>
                 <div class="ems-meta-card">
                   <span>Estado</span>
-                  <strong>${escapeHtml(activeContact?.status || 'Sin estado')}</strong>
+                  <strong>${escapeHtml(activeContact ? getChatStatusLabel(activeContact) : 'Sin estado')}</strong>
                 </div>
                 <div class="ems-meta-card">
                   <span>Canal</span>

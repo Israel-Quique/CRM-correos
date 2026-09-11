@@ -63,7 +63,8 @@ export const renderContactProfileModal = (ctx: any) => {
     getCountryLabel,
     getCountryIso2,
     getCountryIso2FromLabel,
-    getGroupPickerResultsMarkup
+    getGroupPickerResultsMarkup,
+    getContactReminderState
   } = ctx
   if (!state.isContactProfileModalOpen) {
     return ''
@@ -81,6 +82,7 @@ export const renderContactProfileModal = (ctx: any) => {
 
   const statusKey = getEmsStatusKey(activeContact)
   const activeReference = getWhatsAppReference(activeContact)
+  const reminderState = getContactReminderState(activeContact)
 
   return `
     <div class="modal-backdrop" id="contact-profile-modal-backdrop">
@@ -104,6 +106,11 @@ export const renderContactProfileModal = (ctx: any) => {
           <div class="profile-modal-copy">
             <strong>${escapeHtml(activeContact.name)}</strong>
             <span>${escapeHtml(activeReference || 'Sin referencia de WhatsApp')}</span>
+            ${
+              reminderState.active
+                ? `<small class="conversation-contact-reminder">${escapeHtml(reminderState.label)} · ${escapeHtml(reminderState.timestamp || 'Sin hora registrada')}</small>`
+                : ''
+            }
           </div>
           <span class="ems-chat-status ${getEmsStatusToneClass(statusKey)}">
             ${escapeHtml(getEmsStatusLabel(statusKey))}
@@ -131,6 +138,17 @@ export const renderContactProfileModal = (ctx: any) => {
             <span>Canal</span>
             <strong>WhatsApp Meta</strong>
           </button>
+          ${
+            reminderState.active
+              ? `
+                <div class="ems-meta-card conversation-reminder-block">
+                  <span>Recordatorio</span>
+                  <strong>${escapeHtml(reminderState.label)}</strong>
+                  <small>${escapeHtml(reminderState.note)}</small>
+                </div>
+              `
+              : ''
+          }
           <div class="ems-meta-card ems-ai-card">
             <div class="ai-toggle-header">
               <span>Atención por IA</span>

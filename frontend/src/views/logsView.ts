@@ -67,6 +67,10 @@ export const renderLogsView = (ctx: any) => {
   } = ctx
   const report = state.logsReport
   const totals = report?.totals ?? { total: 0, info: 0, warn: 0, error: 0 }
+  const monthOptions = report?.months ?? []
+  const recentPagination = report?.pagination ?? { page: 1, perPage: state.logsPageSize, totalItems: 0, totalPages: 1 }
+  const recentVisible = recentPagination.totalItems > recentPagination.perPage
+  const showRecentPager = recentPagination.totalPages > 1
 
   return `
     <section class="section-panel logs-panel ${state.activeView === 'logs' ? 'is-visible' : ''}">
@@ -80,12 +84,22 @@ export const renderLogsView = (ctx: any) => {
           <select id="logs-hours-filter" aria-label="Periodo del reporte">
             ${[1, 24, 72, 168, 720].map((hours) => `<option value="${hours}" ${state.logsHours === hours ? 'selected' : ''}>Ultimas ${hours === 1 ? '1 hora' : `${hours} horas`}</option>`).join('')}
           </select>
+          <select id="logs-month-filter" aria-label="Filtrar por mes">
+            <option value="all" ${state.logsMonthFilter === 'all' ? 'selected' : ''}>Todos los meses</option>
+            ${monthOptions
+              .map(
+                (month) =>
+                  `<option value="${escapeHtml(month.value)}" ${state.logsMonthFilter === month.value ? 'selected' : ''}>${escapeHtml(month.label)}</option>`,
+              )
+              .join('')}
+          </select>
           <select id="logs-level-filter" aria-label="Nivel del log">
             <option value="" ${state.logsLevel === '' ? 'selected' : ''}>Todos los niveles</option>
             <option value="info" ${state.logsLevel === 'info' ? 'selected' : ''}>Informacion</option>
             <option value="warn" ${state.logsLevel === 'warn' ? 'selected' : ''}>Advertencias</option>
             <option value="error" ${state.logsLevel === 'error' ? 'selected' : ''}>Errores</option>
           </select>
+          <button class="secondary-btn" id="export-logs-report" type="button">Exportar Excel</button>
           <button class="primary-btn" id="refresh-logs-report" type="button">Actualizar reporte</button>
         </div>
       </div>
@@ -198,6 +212,27 @@ export const renderLogsView = (ctx: any) => {
               </tbody>
             </table>
           </div>
+          ${
+            showRecentPager
+              ? `
+                <div class="international-pagination logs-pagination">
+                  <div class="international-pagination-info">
+                    <strong>${recentPagination.page}</strong>
+                    <span>de ${recentPagination.totalPages} páginas</span>
+                    <span>Mostrando ${Math.min(recentPagination.totalItems, recentPagination.page * recentPagination.perPage)} de ${recentPagination.totalItems} eventos</span>
+                  </div>
+                  <div class="international-pagination-actions">
+                    <button class="secondary-btn pagination-btn" type="button" data-logs-page="prev" ${recentPagination.page <= 1 ? 'disabled' : ''}>
+                      Anterior
+                    </button>
+                    <button class="secondary-btn pagination-btn" type="button" data-logs-page="next" ${recentPagination.page >= recentPagination.totalPages ? 'disabled' : ''}>
+                      Siguiente
+                    </button>
+                  </div>
+                </div>
+              `
+              : ''
+          }
         </article>
       </div>
     </section>

@@ -20,8 +20,11 @@ export const renderConversationModal = (ctx: any) => {
     getEmsStatusContacts,
     getEmsStatusKey,
     getEmsStatusLabel,
+    getChatStatusLabel,
     getEmsStatusToneClass,
     getEmsPhaseLabel,
+    getChatPhaseLabel,
+    getChatPhaseDescription,
     getEmsPhaseDescription,
     getChatContacts,
     isAutoCreatedChatContact,
@@ -63,7 +66,8 @@ export const renderConversationModal = (ctx: any) => {
     getCountryLabel,
     getCountryIso2,
     getCountryIso2FromLabel,
-    getGroupPickerResultsMarkup
+    getGroupPickerResultsMarkup,
+    getContactReminderState
   } = ctx
   if (!state.isConversationModalOpen) {
     return ''
@@ -77,6 +81,11 @@ export const renderConversationModal = (ctx: any) => {
     availableChatContacts.find((contact) => contact.id === conversation.contact.id) ??
     null
   const activeReference = activeContact ? getWhatsAppReference(activeContact) : ''
+  const reminderState = activeContact ? getContactReminderState(activeContact) : null
+  const activePhaseLabel = activeContact ? getChatPhaseLabel(activeContact) : 'Nuevo'
+  const activePhaseDescription = activeContact
+    ? getChatPhaseDescription(activeContact)
+    : 'Selecciona una conversación para ver su seguimiento.'
 
   return `
     <div class="modal-backdrop" id="conversation-modal-backdrop">
@@ -115,6 +124,11 @@ export const renderConversationModal = (ctx: any) => {
                             <div class="conversation-contact-copy">
                               <strong>${escapeHtml(contact.name)}</strong>
                               <span>${escapeHtml(getContactPreviewLine(contact))}</span>
+                              ${
+                                getContactReminderState(contact).active
+                                  ? `<small class="conversation-contact-reminder">${escapeHtml(getContactReminderState(contact).label)}</small>`
+                                  : ''
+                              }
                             </div>
                           </button>
                         `,
@@ -138,6 +152,12 @@ export const renderConversationModal = (ctx: any) => {
               </div>
               <div class="conversation-main-actions">
                 <span class="conversation-pill">${escapeHtml(activeContact?.segment || 'Sin segmento')}</span>
+                <span class="conversation-pill">${escapeHtml(activePhaseLabel)}</span>
+                ${
+                  reminderState?.active
+                    ? `<span class="conversation-pill conversation-pill-reminder">${escapeHtml(reminderState.label)}</span>`
+                    : ''
+                }
                 <button
                   class="secondary-btn"
                   data-send-whatsapp="${conversation.contact.id}"
@@ -214,12 +234,29 @@ export const renderConversationModal = (ctx: any) => {
             </div>
             <div class="conversation-detail-block">
               <span>Estado</span>
-              <strong>${escapeHtml(activeContact?.status || 'Sin estado')}</strong>
+              <strong>${escapeHtml(activeContact ? getChatStatusLabel(activeContact) : 'Sin estado')}</strong>
+            </div>
+            <div class="conversation-detail-block">
+              <span>Fase</span>
+              <strong>${escapeHtml(activePhaseLabel)}</strong>
+              <small>${escapeHtml(activePhaseDescription)}</small>
             </div>
             <div class="conversation-detail-block">
               <span>Canal</span>
               <strong>WhatsApp Meta</strong>
             </div>
+            ${
+              reminderState?.active
+                ? `
+                  <div class="conversation-detail-block conversation-reminder-block">
+                    <span>Recordatorio</span>
+                    <strong>${escapeHtml(reminderState.label)}</strong>
+                    <small>${escapeHtml(reminderState.note)}</small>
+                    <small>${escapeHtml(reminderState.timestamp || 'Sin hora registrada')}</small>
+                  </div>
+                `
+                : ''
+            }
             <div class="conversation-detail-block ai-toggle-block">
               <div class="ai-toggle-header">
                 <span>Atencion por IA</span>
