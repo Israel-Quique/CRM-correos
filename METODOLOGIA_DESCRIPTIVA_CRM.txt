@@ -1,0 +1,439 @@
+METODOLOGIA DESCRIPTIVA APLICADA AL PROYECTO
+
+Proyecto: Sistema Integral de Gestion Omnicanal Logistica y Monitoreo Operativo Movil mediante Arquitectura de APIs REST e Inteligencia Artificial en la Agencia Boliviana de Correos
+
+1. INTRODUCCION METODOLOGICA
+
+La metodologia del presente proyecto se estructura bajo un enfoque descriptivo, debido a que el objetivo principal consiste en estudiar, analizar y describir la situacion actual de los procesos de atencion, seguimiento, comunicacion y control operativo de la Agencia Boliviana de Correos. A partir de esta descripcion se plantea una solucion tecnologica integral conformada por un CRM omnicanal, un chatbot conectado a WhatsApp mediante Meta Cloud API, un motor de inteligencia artificial local mediante Ollama, una base de datos PostgreSQL y una aplicacion movil operativa denominada PackGo, la cual forma parte del resultado final esperado, aunque su aplicacion completa todavia se encuentra pendiente.
+
+La investigacion no busca alterar artificialmente el funcionamiento de la institucion para medir resultados en condiciones controladas. Por el contrario, analiza los procesos reales tal como se presentan actualmente: consultas manuales por WhatsApp, respuestas repetitivas del personal, falta de trazabilidad unificada, ausencia de automatizacion completa, registros dispersos y necesidad de controlar las operaciones de campo mediante herramientas moviles. Por esta razon, la metodologia descriptiva permite comprender el problema desde su contexto natural y convertir esa comprension en requerimientos tecnicos para el sistema.
+
+IMAGEN AQUI
+Figura sugerida: Esquema general de la metodologia del proyecto, mostrando la relacion entre investigacion descriptiva, levantamiento de requerimientos, Scrum, UML, base de datos, pruebas y aplicacion movil.
+
+2. ENFOQUE METODOLOGICO GENERAL
+
+El proyecto adopta una metodologia descriptiva con apoyo de una metodologia agil de desarrollo de sistemas. La parte descriptiva permite conocer el estado actual de los procesos institucionales, mientras que la parte agil permite organizar la construccion de la solucion en etapas, modulos y entregas progresivas.
+
+El enfoque general se considera hibrido porque combina tecnicas de investigacion, analisis de sistemas, modelado, desarrollo de software y validacion. Esta combinacion es necesaria porque el proyecto no se limita a crear una pantalla o un modulo aislado, sino que propone un ecosistema de software que integra comunicacion, automatizacion, inteligencia artificial, gestion de datos y control logistico.
+
+La metodologia se compone de los siguientes elementos:
+
+- Investigacion descriptiva: permite observar, describir y documentar los procesos actuales.
+- Recoleccion de informacion: permite obtener datos mediante observacion, entrevistas, cuestionarios y revision documental.
+- Ingenieria de requerimientos: permite transformar las necesidades detectadas en funciones del sistema.
+- Scrum: permite organizar el desarrollo en sprints o incrementos funcionales.
+- UML: permite representar graficamente actores, procesos, clases, secuencias y componentes.
+- Modelado de base de datos: permite estructurar la informacion que sera almacenada y relacionada.
+- Pruebas de software: permiten comprobar el funcionamiento de los modulos desarrollados.
+- Evaluacion de calidad: permite valorar el sistema segun criterios de funcionalidad, seguridad, usabilidad y mantenibilidad.
+- Planificacion de la aplicacion movil: permite integrar PackGo como componente operativo pendiente de aplicacion.
+
+IMAGEN AQUI
+Figura sugerida: Diagrama de enfoque hibrido de la metodologia, con bloques de Investigacion Descriptiva + Scrum + UML + Base de Datos + Pruebas.
+
+3. TIPO DE INVESTIGACION
+
+El tipo de investigacion utilizado es descriptivo. Este tipo de investigacion se caracteriza por detallar una realidad existente, identificar sus componentes principales y explicar como se relacionan entre si. En el caso del proyecto, se describe la forma en que Bolipost atiende consultas de usuarios, registra mensajes, realiza seguimiento de envios, administra informacion de clientes y gestiona sus procesos logisticos.
+
+La investigacion descriptiva es adecuada porque el problema central no surge de una hipotesis experimental, sino de una necesidad practica: mejorar la atencion omnicanal, automatizar respuestas frecuentes, reducir la dependencia de procesos manuales, centralizar la informacion y preparar un sistema movil para el control operativo de conductores.
+
+Mediante este tipo de investigacion se identifican los siguientes aspectos:
+
+- Como se reciben actualmente las consultas de los usuarios.
+- Que canales de comunicacion se utilizan, especialmente WhatsApp.
+- Que tareas realiza el personal de atencion de forma manual.
+- Que informacion se encuentra dispersa o duplicada.
+- Que procesos pueden automatizarse mediante un chatbot.
+- Que datos deben almacenarse en la base de datos.
+- Que modulos necesita el CRM para funcionar correctamente.
+- Que componentes debe tener la futura aplicacion movil PackGo.
+- Que problemas existen en el seguimiento de rutas, combustible y mantenimiento.
+
+En consecuencia, la investigacion descriptiva permite construir una base clara para el diseno del sistema, ya que primero se comprende la realidad institucional y posteriormente se plantea la solucion tecnologica.
+
+IMAGEN AQUI
+Figura sugerida: Flujo de la situacion actual de atencion manual por WhatsApp y busqueda de informacion.
+
+4. DISENO DE INVESTIGACION
+
+El diseno de investigacion es no experimental y transversal. Es no experimental porque no se manipulan variables de forma controlada, sino que se observan los procesos existentes en su funcionamiento normal. Es transversal porque la informacion se recopila en un periodo determinado del proyecto, con el fin de diagnosticar la situacion actual y proponer una mejora.
+
+En este diseno se analizan los procesos institucionales relacionados con:
+
+- Atencion al cliente por canales digitales.
+- Recepcion y envio de mensajes por WhatsApp.
+- Registro de contactos y conversaciones.
+- Consulta de estados de envio.
+- Administracion de usuarios y roles.
+- Configuracion del chatbot y prompts de IA.
+- Registro de eventos operativos.
+- Control proyectado de conductores, vehiculos, combustible y mantenimiento.
+
+La finalidad del diseno no experimental es comprender como funciona actualmente el entorno y, a partir de ello, disenar una plataforma que responda a las necesidades reales. En este sentido, el sistema propuesto no se desarrolla de manera abstracta, sino tomando como base los procesos observados y las dificultades detectadas.
+
+IMAGEN AQUI
+Figura sugerida: Diagrama del diseno de investigacion no experimental y transversal aplicado al proyecto.
+
+5. HERRAMIENTAS DE RECOLECCION DE INFORMACION
+
+Para obtener informacion relevante del proyecto se utilizan tecnicas propias de la investigacion descriptiva y de la ingenieria de requerimientos. Estas herramientas permiten conocer las necesidades de los usuarios, identificar problemas operativos y definir los modulos del sistema.
+
+5.1. Observacion
+
+La observacion consiste en analizar directamente la forma en que se desarrollan los procesos actuales. En el proyecto, esta tecnica permite revisar como se atienden los mensajes, como se registran los contactos, como se responde a las consultas y que pasos realiza el personal para ubicar informacion relacionada con un envio.
+
+La observacion tambien permite detectar tareas repetitivas que pueden automatizarse. Por ejemplo, cuando varios usuarios preguntan por el estado de sus paquetes, el sistema puede identificar la intencion de tracking, consultar la informacion disponible y responder automaticamente por WhatsApp.
+
+IMAGEN AQUI
+Figura sugerida: Captura o esquema del proceso observado de recepcion de mensaje, busqueda manual y respuesta al cliente.
+
+5.2. Entrevistas
+
+Las entrevistas se aplican al personal relacionado con administracion, atencion al cliente, logistica, seguimiento y operaciones. Su finalidad es conocer de forma directa las necesidades del usuario interno, los problemas mas frecuentes y las expectativas sobre el nuevo sistema.
+
+Mediante las entrevistas se puede obtener informacion sobre:
+
+- Dificultades para responder mensajes de forma rapida.
+- Problemas para consultar estados de envio.
+- Necesidad de centralizar el historial de clientes.
+- Requerimientos para controlar rutas y conductores.
+- Datos que deben visualizar los agentes de atencion.
+- Informacion que debe registrar la app movil.
+
+5.3. Cuestionarios
+
+Los cuestionarios permiten recopilar informacion estructurada de varios participantes. Se pueden aplicar para conocer la frecuencia de consultas por WhatsApp, los tiempos aproximados de respuesta, los problemas mas comunes, la aceptacion de una plataforma CRM y la utilidad percibida de un chatbot.
+
+Esta tecnica ayuda a respaldar cuantitativamente la necesidad del sistema, ya que permite organizar respuestas y convertirlas en indicadores para el analisis.
+
+IMAGEN AQUI
+Figura sugerida: Modelo de cuestionario aplicado o tabla resumen de resultados de encuestas.
+
+5.4. Revision documental
+
+La revision documental permite analizar documentos institucionales, formatos de control, reportes, estructuras de datos, registros de atencion y proyectos similares. Tambien se toma como referencia el documento de metodologia usado como ejemplo, donde se aplican investigacion descriptiva, Scrum, requerimientos, UML, pruebas de caja negra y evaluacion de calidad.
+
+En este proyecto, la revision documental sirve para fundamentar el capitulo metodologico y orientar la estructura del analisis y diseno del sistema.
+
+6. POBLACION Y MUESTRA
+
+La poblacion de estudio esta conformada por los actores que intervienen en los procesos de atencion, seguimiento y gestion operativa de Bolipost. Esta poblacion incluye a usuarios internos y externos que interactuan directa o indirectamente con el sistema.
+
+La poblacion considerada comprende:
+
+- Personal administrativo.
+- Agentes de atencion al cliente.
+- Responsables de seguimiento de envios.
+- Conductores y personal operativo.
+- Administradores del sistema.
+- Usuarios o clientes que realizan consultas por WhatsApp.
+- Personal encargado de logistica, combustible y mantenimiento.
+
+La muestra se selecciona de forma intencional, considerando a las personas que tienen relacion directa con los procesos que seran automatizados. Esta seleccion permite obtener informacion practica y util para el diseno del CRM, la integracion con WhatsApp, el chatbot y la futura aplicacion movil.
+
+IMAGEN AQUI
+Figura sugerida: Tabla o grafico de poblacion y muestra del proyecto.
+
+7. METODOLOGIA AGIL DE DESARROLLO: SCRUM
+
+Para el desarrollo del sistema se aplica Scrum, ya que el proyecto requiere construccion progresiva, validacion continua y adaptacion a cambios. El sistema propuesto esta compuesto por varios modulos, por lo que resulta conveniente dividir el desarrollo en entregas parciales.
+
+Scrum permite organizar el trabajo mediante un Product Backlog, Sprint Backlog, reuniones de revision y entregables funcionales. En este proyecto, primero se priorizan los modulos principales del CRM y la integracion con WhatsApp, y posteriormente se planifica la aplicacion movil PackGo.
+
+IMAGEN AQUI
+Figura sugerida: Ciclo Scrum con Product Backlog, Sprint Planning, Sprint, Daily, Sprint Review y Retrospective.
+
+7.1. Iniciacion
+
+En la fase de iniciacion se define la vision del proyecto. La vision consiste en desarrollar un ecosistema integrado que permita mejorar la atencion omnicanal, automatizar respuestas por WhatsApp, centralizar informacion de clientes y preparar el control operativo movil.
+
+Tambien se identifican los actores del sistema:
+
+- Administrador.
+- Agente de atencion.
+- Cliente o usuario de WhatsApp.
+- Chatbot con IA.
+- Servicio de WhatsApp Cloud API.
+- Base de datos PostgreSQL.
+- Motor local Ollama.
+- Conductor.
+- Aplicacion movil PackGo.
+
+El resultado de esta fase es el Product Backlog inicial, donde se listan las funcionalidades necesarias para el desarrollo del sistema.
+
+7.2. Planificacion y estimacion
+
+En esta etapa se ordenan las funcionalidades por prioridad. El desarrollo se organiza en sprints, considerando primero los modulos indispensables para el funcionamiento del CRM y luego los componentes operativos.
+
+Propuesta de sprints:
+
+- Sprint 1: Autenticacion, usuarios, roles y configuracion base.
+- Sprint 2: Gestion de contactos, clientes y estados.
+- Sprint 3: Integracion con WhatsApp Cloud API y webhooks.
+- Sprint 4: Registro de mensajes entrantes y salientes.
+- Sprint 5: Chatbot, clasificacion de intenciones y conexion con Ollama.
+- Sprint 6: Cola de respuestas automaticas, reintentos y auditoria.
+- Sprint 7: Reportes, panel de actividad y seguimiento.
+- Sprint 8: Diseno de la aplicacion movil PackGo.
+- Sprint 9: Implementacion futura de rutas, combustible, mantenimiento y GPS.
+
+IMAGEN AQUI
+Figura sugerida: Tabla de Sprint Backlog del proyecto con modulos, actividades y entregables.
+
+7.3. Implementacion
+
+Durante la implementacion se construyen los modulos definidos. El backend utiliza Node.js, Express y PostgreSQL. El frontend utiliza React/Vite. La automatizacion conversacional se conecta con WhatsApp Cloud API y con un modelo local de IA mediante Ollama.
+
+En esta etapa se implementan funciones como registro de contactos, historial de mensajes, configuraciones del chatbot, recepcion de webhooks, envio de respuestas, procesamiento de intenciones y persistencia de datos.
+
+La aplicacion movil PackGo se mantiene como modulo pendiente de aplicacion completa. Sin embargo, metodologicamente se considera dentro del diseno final porque su objetivo sera registrar rutas, geolocalizacion, combustible, bitacoras, mantenimiento y sincronizacion con el CRM.
+
+IMAGEN AQUI
+Figura sugerida: Arquitectura general del sistema con Frontend CRM, Backend API REST, PostgreSQL, WhatsApp Cloud API, Ollama y PackGo.
+
+7.4. Revision
+
+Al finalizar cada sprint se revisan los entregables. La revision permite verificar si el modulo desarrollado cumple con los requerimientos planteados. Por ejemplo, se comprueba si el webhook recibe mensajes, si el sistema guarda conversaciones, si el chatbot responde y si la informacion queda registrada en la base de datos.
+
+7.5. Retrospectiva
+
+La retrospectiva permite analizar las dificultades encontradas durante el desarrollo. En esta fase se revisan errores, retrasos, ajustes de alcance, problemas de integracion y mejoras para el siguiente sprint.
+
+7.6. Lanzamiento
+
+La fase de lanzamiento corresponde a la entrega funcional del sistema. En el estado final esperado, el CRM debe permitir administrar usuarios, contactos, conversaciones, mensajes de WhatsApp, configuraciones, respuestas automaticas, seguimiento y reportes. Posteriormente, la app movil PackGo completara el ecosistema operativo en campo.
+
+8. INGENIERIA DE REQUERIMIENTOS
+
+La ingenieria de requerimientos permite convertir las necesidades observadas en especificaciones del sistema. Esta fase es fundamental porque define que debe hacer el sistema y bajo que condiciones debe funcionar.
+
+8.1. Requerimientos funcionales principales
+
+- Registrar y administrar usuarios.
+- Gestionar roles y permisos.
+- Registrar contactos provenientes de WhatsApp.
+- Almacenar mensajes entrantes y salientes.
+- Integrar el sistema con Meta/WhatsApp Cloud API.
+- Recibir eventos mediante webhook.
+- Enviar respuestas manuales y automaticas.
+- Clasificar mensajes segun intencion: tracking, tarifas o consulta general.
+- Consultar informacion de seguimiento cuando exista un codigo de envio.
+- Generar respuestas mediante IA local.
+- Administrar prompts del chatbot.
+- Registrar estados operativos.
+- Preparar la integracion con la app movil para rutas, combustible y mantenimiento.
+
+8.2. Requerimientos no funcionales principales
+
+- Seguridad en el acceso.
+- Proteccion de tokens y credenciales.
+- Disponibilidad del backend.
+- Integridad de datos en PostgreSQL.
+- Trazabilidad de mensajes y acciones.
+- Rendimiento adecuado para multiples conversaciones.
+- Usabilidad para agentes y administradores.
+- Escalabilidad para incorporar la app movil.
+- Mantenibilidad del codigo.
+- Compatibilidad con navegadores modernos.
+
+IMAGEN AQUI
+Figura sugerida: Tabla de requerimientos funcionales y no funcionales del sistema.
+
+9. MODELADO UML
+
+El Lenguaje de Modelado Unificado UML se utiliza para representar la estructura y comportamiento del sistema. Su aplicacion permite comprender visualmente los procesos antes de implementarlos, facilitando la comunicacion entre el analisis y el desarrollo.
+
+9.1. Diagrama de casos de uso
+
+El diagrama de casos de uso permite representar los actores y las acciones principales que realizan dentro del sistema. En este proyecto se consideran actores internos, externos y automaticos.
+
+Actores sugeridos:
+
+- Administrador.
+- Agente de atencion.
+- Cliente de WhatsApp.
+- Chatbot/IA.
+- WhatsApp Cloud API.
+- Conductor.
+- Base de datos.
+
+Casos de uso principales:
+
+- Iniciar sesion.
+- Gestionar usuarios.
+- Registrar contactos.
+- Recibir mensaje.
+- Enviar respuesta.
+- Consultar tracking.
+- Configurar prompts.
+- Administrar conversaciones.
+- Registrar evento logistico.
+- Sincronizar datos moviles.
+
+IMAGEN AQUI
+Figura sugerida: Diagrama de casos de uso del CRM omnicanal y PackGo.
+
+9.2. Diagrama de clases
+
+El diagrama de clases representa las entidades principales del sistema y sus relaciones. Para el proyecto se pueden considerar clases como Usuario, Rol, Contacto, Mensaje, Conversacion, EstadoPipeline, ConfiguracionIntegracion, ColaRespuestaAutomatica, Vehiculo, Conductor, Ruta, RegistroCombustible y Mantenimiento.
+
+IMAGEN AQUI
+Figura sugerida: Diagrama de clases del sistema.
+
+9.3. Diagrama de secuencia
+
+El diagrama de secuencia permite mostrar el orden de interaccion entre componentes durante un proceso. Un caso importante es la recepcion de un mensaje de WhatsApp:
+
+1. El cliente envia un mensaje por WhatsApp.
+2. Meta Cloud API envia el evento al webhook del backend.
+3. El backend persiste el mensaje en PostgreSQL.
+4. El sistema encola la respuesta automatica.
+5. El motor de decision clasifica la intencion.
+6. Si corresponde, se consulta informacion de tracking.
+7. Ollama genera o apoya la respuesta.
+8. El backend envia la respuesta mediante WhatsApp Cloud API.
+9. El sistema registra el resultado en el historial.
+
+IMAGEN AQUI
+Figura sugerida: Diagrama de secuencia del flujo de mensaje WhatsApp, chatbot e IA.
+
+9.4. Diagrama de componentes
+
+El diagrama de componentes permite visualizar la arquitectura general del sistema. Los componentes principales son:
+
+- Frontend CRM.
+- Backend API REST.
+- Base de datos PostgreSQL.
+- WhatsApp Cloud API.
+- Motor de IA local Ollama.
+- Aplicacion movil PackGo.
+- Servicios de autenticacion y configuracion.
+
+IMAGEN AQUI
+Figura sugerida: Diagrama de componentes de la arquitectura del sistema.
+
+9.5. Diagrama entidad-relacion
+
+El diagrama entidad-relacion permite modelar la base de datos. Debe representar tablas como usuarios, roles, contactos, conversaciones, mensajes, configuraciones, estados, colas, vehiculos, conductores, rutas, combustible y mantenimiento.
+
+IMAGEN AQUI
+Figura sugerida: Diagrama entidad-relacion de PostgreSQL.
+
+10. METODOLOGIA PARA LA BASE DE DATOS
+
+El diseno de base de datos sigue un proceso ordenado en cuatro fases. Esta metodologia permite que la informacion del sistema se almacene de forma coherente, relacionada y segura.
+
+10.1. Analisis de requerimientos de datos
+
+Se identifican los datos que necesita manejar el sistema: usuarios, roles, contactos, mensajes, conversaciones, configuraciones, estados, registros de WhatsApp, respuestas automaticas, vehiculos, conductores, rutas, combustible y mantenimiento.
+
+10.2. Diseno conceptual
+
+Se elabora el modelo entidad-relacion, definiendo entidades principales, atributos y relaciones. Esta fase permite comprender como se conectan los datos antes de construir las tablas.
+
+10.3. Diseno logico
+
+El modelo conceptual se transforma en tablas relacionales compatibles con PostgreSQL. Se definen claves primarias, claves foraneas, restricciones, tipos de datos e indices.
+
+10.4. Diseno fisico e implementacion
+
+Se implementa la base de datos, considerando rendimiento, seguridad, integridad y respaldo de informacion. Tambien se agregan indices para mejorar consultas frecuentes, especialmente en mensajes, contactos, conversaciones y colas de respuesta.
+
+IMAGEN AQUI
+Figura sugerida: Fases del diseno de base de datos: analisis, conceptual, logico y fisico.
+
+11. METODOLOGIA PARA LA APLICACION MOVIL PENDIENTE
+
+La aplicacion movil PackGo forma parte del alcance final del proyecto, aunque todavia falta aplicarla completamente. Por esta razon, dentro de la metodologia se la considera como un modulo planificado que complementara al CRM.
+
+La aplicacion movil tendra como objetivo apoyar el trabajo de conductores y personal operativo. Permitira registrar rutas, ubicacion GPS, bitacoras, entregas, combustible, facturas, mantenimiento y eventos de campo. Esta informacion se sincronizara con el backend para que el CRM tenga visibilidad de lo que ocurre fuera de oficina.
+
+El desarrollo de PackGo debe seguir las siguientes etapas:
+
+- Levantamiento de requerimientos moviles.
+- Diseno de pantallas para conductor.
+- Modelado de rutas, vehiculos y eventos.
+- Implementacion de autenticacion movil.
+- Registro offline de operaciones.
+- Sincronizacion con la API REST.
+- Validacion mediante pruebas en campo.
+
+IMAGEN AQUI
+Figura sugerida: Prototipo o mockup de la aplicacion movil PackGo.
+
+IMAGEN AQUI
+Figura sugerida: Flujo de sincronizacion entre PackGo, Backend API REST, PostgreSQL y CRM.
+
+12. PRUEBAS DE SOFTWARE
+
+La validacion del sistema se realiza mediante pruebas que permiten comprobar que los modulos cumplen su funcion y que las integraciones trabajan correctamente.
+
+12.1. Pruebas funcionales
+
+Verifican que cada modulo realice la funcion esperada. Se prueban inicio de sesion, gestion de contactos, mensajes, configuracion de prompts, recepcion de webhook, envio de WhatsApp, chatbot, tracking y reportes.
+
+12.2. Pruebas de integracion
+
+Validan la comunicacion entre frontend, backend, base de datos, WhatsApp Cloud API y Ollama. Estas pruebas son importantes porque el sistema depende de varios componentes conectados entre si.
+
+12.3. Pruebas de caja negra
+
+Se prueban entradas y salidas sin revisar el codigo interno. Por ejemplo, se envia un mensaje de tracking por WhatsApp y se verifica si el sistema responde de forma correcta.
+
+12.4. Pruebas de seguridad
+
+Verifican que los accesos esten protegidos, que los usuarios tengan permisos correctos y que los tokens, claves y datos sensibles no sean expuestos.
+
+12.5. Pruebas de usabilidad
+
+Evalua si las pantallas son comprensibles para agentes y administradores. Tambien se revisa si el flujo de trabajo permite responder mensajes y consultar informacion de manera rapida.
+
+12.6. Pruebas futuras de campo
+
+Cuando la aplicacion movil sea aplicada, se realizaran pruebas con conductores para validar GPS, rutas, combustible, mantenimiento, sincronizacion offline y estabilidad en condiciones reales.
+
+IMAGEN AQUI
+Figura sugerida: Tabla de pruebas del sistema, con caso de prueba, entrada, resultado esperado y resultado obtenido.
+
+13. CALIDAD DEL SOFTWARE
+
+Para evaluar la calidad del sistema se consideran criterios de la norma ISO/IEC 25010. Esta norma permite analizar el software desde diferentes dimensiones:
+
+- Adecuacion funcional: el sistema debe cumplir los requerimientos de atencion, mensajeria, tracking e integracion.
+- Eficiencia de desempeno: debe responder en tiempos aceptables y procesar mensajes sin saturar el servidor.
+- Compatibilidad: debe integrarse con WhatsApp, PostgreSQL, frontend web, IA local y app movil.
+- Usabilidad: debe ser comprensible para administradores y agentes.
+- Fiabilidad: debe registrar correctamente mensajes, estados y respuestas.
+- Seguridad: debe proteger usuarios, tokens, credenciales y datos personales.
+- Mantenibilidad: debe permitir mejoras progresivas.
+- Portabilidad: debe poder desplegarse en distintos entornos compatibles con Node.js y PostgreSQL.
+
+IMAGEN AQUI
+Figura sugerida: Grafico o tabla de criterios ISO/IEC 25010 aplicados al sistema.
+
+14. RESULTADO ESPERADO DE LA METODOLOGIA
+
+La aplicacion de esta metodologia permitira desarrollar un sistema integral alineado con las necesidades reales de Bolipost. Primero se describe la situacion actual; luego se recolecta informacion; posteriormente se definen requerimientos; despues se modela el sistema mediante UML; seguidamente se construyen los modulos con Scrum; finalmente se validan los resultados mediante pruebas.
+
+El resultado esperado es un ecosistema compuesto por:
+
+- CRM web para administracion y atencion omnicanal.
+- Backend API REST para centralizar la logica de negocio.
+- Base de datos PostgreSQL para persistencia e integridad.
+- Integracion con WhatsApp Cloud API.
+- Chatbot con IA local mediante Ollama.
+- Cola de respuestas automaticas.
+- Reportes y trazabilidad.
+- Aplicacion movil PackGo para conductores, aun pendiente de aplicacion completa.
+
+La metodologia descriptiva permite comprender el problema real de la institucion y justificar la necesidad de la solucion. Scrum permite organizar el desarrollo por entregas. UML permite representar el sistema antes de implementarlo. El diseno de base de datos garantiza la correcta gestion de informacion. Las pruebas permiten validar el funcionamiento. Finalmente, la planificacion de la app movil asegura que el proyecto mantenga una vision integral hasta completar el ciclo logistico.
+
+IMAGEN AQUI
+Figura sugerida: Diagrama final del ecosistema completo CRM + WhatsApp + IA + PostgreSQL + PackGo.
+
+15. CONCLUSION METODOLOGICA
+
+En conclusion, la metodologia aplicada al proyecto es descriptiva, agil y orientada al desarrollo de software. Es descriptiva porque estudia la situacion actual de Bolipost y documenta sus problemas operativos. Es agil porque organiza la construccion del sistema en sprints y entregas incrementales. Es tecnica porque utiliza UML, modelado de base de datos, pruebas de software y criterios de calidad.
+
+Esta combinacion metodologica permite que el proyecto no sea solamente una propuesta teorica, sino una solucion practica que parte de una necesidad institucional concreta. El CRM y el chatbot atienden la problematica actual de comunicacion y seguimiento; la base de datos centraliza la informacion; la IA local apoya la automatizacion; y la aplicacion movil PackGo completara el sistema cuando sea aplicada en campo.

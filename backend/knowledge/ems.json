@@ -1,0 +1,21 @@
+{
+  "serviceKey": "ems",
+  "name": "EMS Nacional e Internacional",
+  "description": "Envios dentro y fuera del pais por peso.",
+  "coverage": {
+    "allowed": "Nacional, provincia, comunidades e internacional segun cobertura operativa.",
+    "notAllowed": ""
+  },
+  "pricing": {
+    "basis": "Por peso",
+    "nationalApiService": "EMS_NACIONAL",
+    "nationalApiDescription": "Servicio EMS Nacional - Envio de paqueteria"
+  },
+  "rules": [
+    "Usar EMS cuando el destino sea provincia o comunidad.",
+    "Usar EMS cuando el paquete exceda el limite de Delivery Express.",
+    "Para cotizar EMS se requiere peso, origen y destino.",
+    "La API EMS Nacional cotiza por rango de peso; origen y destino son contexto de la conversacion, no filtros de precio en esa API.",
+    "En la API EMS Nacional actualmente solo se encontro el servicio EMS_NACIONAL."
+  ]
+}

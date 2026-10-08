@@ -9,6 +9,7 @@ type ViewKey =
   | 'ems'
   | 'internacionales'
   | 'internacionales-pipeline'
+  | 'internacionales-tablero'
   | 'internacionales-paquetes'
   | 'pronts-nacional'
   | 'pronts-internacional'
@@ -17,12 +18,13 @@ type ViewKey =
   | 'agrupaciones'
   | 'usuarios'
   | 'logs'
+  | 'configuraciones'
 
 type MenuGroupKey = 'ems' | 'internacionales' | 'clientes' | 'usuarios' | 'sistema' | 'marketing'
 
-type EmsStatusFilter = 'all' | 'received' | 'transit' | 'regional' | 'courier' | 'delivered' | 'cancelled'
+type EmsStatusFilter = 'all' | 'paused' | 'received' | 'transit' | 'regional' | 'courier' | 'delivered' | 'cancelled'
 
-type BaseEmsColumnKey = Exclude<EmsStatusFilter, 'all'>
+type BaseEmsColumnKey = Exclude<EmsStatusFilter, 'all' | 'paused'>
 
 type EmsColumnKey = BaseEmsColumnKey
 
@@ -93,6 +95,11 @@ type Contact = {
   lastMessageText?: string | null
   lastMessageDirection?: string | null
   lastMessageAt?: string | null
+  autoReplyPause?: {
+    isPaused: boolean
+    pausedUntil: string | null
+    reason: string | null
+  }
 }
 
 type ChatListPagination = {
@@ -138,6 +145,7 @@ type TrackingApiPackage = {
   remitente?: {
     nombre?: string | null
     telefono?: string | null
+    direccion?: string | null
   } | null
   destinatario?: {
     nombre?: string | null
@@ -148,6 +156,9 @@ type TrackingApiPackage = {
     fecha?: string | null
     codigo_evento?: number | null
     evento_id?: number | null
+    event_code?: number | null
+    event_type_cd?: number | null
+    event_id?: number | null
     nombre?: string | null
     evento_original?: string | null
     evento_api?: string | null
@@ -160,6 +171,7 @@ type TrackingApiPackage = {
     codigo: string | null
     nombre: string | null
     telefono?: string | null
+    direccion?: string | null
   }
   | string
   destino:
@@ -227,6 +239,8 @@ type EmsPackageCard = {
   recipientName: string
   recipientReference: string
   destination: string
+  currentLocation?: string
+  department?: string
   status: string
   updatedAt: string
   sourceKind: 'tracking' | 'contact'
@@ -243,6 +257,15 @@ type EmsPipelineColumnPage = {
   error: string | null
   syncedAt: string | null
   requestSignature: string | null
+}
+
+type InternationalPipelineColumnPage = {
+  items: TrackingApiPackage[]
+  currentPage: number
+  totalPages: number
+  totalItems: number
+  state: 'idle' | 'loading' | 'error'
+  error: string | null
 }
 
 type EmsStageOverrideMap = Record<string, EmsColumnKey>
@@ -358,6 +381,7 @@ type MessageNotification = {
   preview: string
   timestamp: string
   createdAt: string
+  contactAvatar?: string;
 }
 
 type WhatsAppTestModeApiPayload = {
@@ -462,23 +486,43 @@ if (!app) {
 
 const normalizeApiBase = (value: string | undefined) => value?.trim().replace(/\/$/, '') ?? ''
 
+const isLocalhostBase = (value: string) => {
+  try {
+    const url = new URL(value)
+    return ['localhost', '127.0.0.1', '::1'].includes(url.hostname)
+  } catch {
+    return false
+  }
+}
+
+const isLocalhostPage = () => ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname)
+
+const getCurrentHostApiBase = (configuredBase: string) => {
+  try {
+    const configuredUrl = new URL(configuredBase)
+    return `${window.location.protocol}//${window.location.hostname}:${configuredUrl.port || '3001'}`
+  } catch {
+    return ''
+  }
+}
+
 const getRuntimeApiBase = () => {
   const configuredBase = normalizeApiBase(import.meta.env.VITE_API_URL)
 
-  if (configuredBase) {
+  if (typeof window === 'undefined') {
     return configuredBase
   }
 
-  if (typeof window === 'undefined') {
-    return ''
-  }
-
   if (window.location.protocol === 'file:') {
-    return 'http://localhost:3001'
+    return configuredBase || 'http://localhost:3001'
   }
 
-  if (window.location.origin.startsWith('http')) {
-    return window.location.origin.replace(/\/$/, '')
+  if (configuredBase && (!isLocalhostBase(configuredBase) || isLocalhostPage())) {
+    return configuredBase
+  }
+
+  if (configuredBase && isLocalhostBase(configuredBase)) {
+    return getCurrentHostApiBase(configuredBase)
   }
 
   return ''
@@ -492,12 +536,36 @@ type AiAgentApiPayload = {
 
 const API_BASE = getRuntimeApiBase()
 
+const getBoliviaDateInputValue = (date: Date) => {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/La_Paz',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date)
+  const part = (type: string) => parts.find((value) => value.type === type)?.value ?? ''
+  return `${part('year')}-${part('month')}-${part('day')}`
+}
+
+const getDefaultEmsPipelineDateRange = () => {
+  const end = getBoliviaDateInputValue(new Date())
+  const startDate = new Date(`${end}T00:00:00Z`)
+  startDate.setUTCDate(startDate.getUTCDate() - 29)
+  return { start: startDate.toISOString().slice(0, 10), end }
+}
+
+const initialEmsPipelineDateRange = getDefaultEmsPipelineDateRange()
+const getDefaultInternationalPipelineDateRange = () => {
+  const end = getBoliviaDateInputValue(new Date())
+  return { start: `${end.slice(0, 7)}-01`, end }
+}
+const initialInternationalPipelineDateRange = getDefaultInternationalPipelineDateRange()
+
 const STORAGE_KEYS = {
   sidebarCollapsed: 'crm-sidebar-collapsed',
   activeView: 'crm-active-view',
   prontsActiveColumn: 'crm-pronts-active-column',
   globalAiAgentEnabled: 'crm-global-ai-agent-enabled',
-  emsMonthFilter: 'crm-ems-month-filter',
   emsStageOverrides: 'crm-ems-stage-overrides',
   trackingApiServiceFilter: 'crm-tracking-api-service-filter',
   trackingApiOriginFilter: 'crm-tracking-api-origin-filter',
@@ -663,8 +731,9 @@ const menuGroups: Array<{
       label: 'Internacionales',
       shortLabel: 'IN',
       items: [
-        { view: 'internacionales', label: 'Internacionales' },
-        { view: 'internacionales-pipeline', label: 'Pipeline Internacionales' },
+        { view: 'internacionales', label: 'Paquetes internacionales' },
+        { view: 'internacionales-pipeline', label: 'Escáner internacional' },
+        { view: 'internacionales-tablero', label: 'Pipeline internacional' },
         { view: 'pronts-internacional', label: 'Pronts Internacional' },
       ],
     },
@@ -688,7 +757,10 @@ const menuGroups: Array<{
       key: 'sistema',
       label: 'Sistema',
       shortLabel: 'SI',
-      items: [{ view: 'logs', label: 'Reporte de logs' }],
+      items: [
+        { view: 'logs', label: 'Reporte de logs' },
+        { view: 'configuraciones', label: 'Configuraciones' },
+      ],
     },
   ]
 
@@ -1046,6 +1118,7 @@ const state: {
   trackingApiPackages: TrackingApiPackage[]
   trackingApiState: 'idle' | 'loading' | 'error'
   trackingApiError: string | null
+  trackingApiWarning: string | null
   trackingApiSyncedAt: string | null
   trackingApiTotalItems: number
   trackingApiPage: number
@@ -1059,6 +1132,15 @@ const state: {
   trackingApiCatalogState: 'idle' | 'loading' | 'error'
   trackingApiCatalogError: string | null
   trackingApiCatalogSyncedAt: string | null
+  internationalPipelineSearch: Record<string, string>
+  internationalPipelineDateStart: string
+  internationalPipelineDateEnd: string
+  internationalPipelineDepartment: string
+  internationalPipelineSort: 'newest' | 'oldest'
+  internationalPipelinePage: Record<string, number>
+  internationalPipelineColumns: Record<string, InternationalPipelineColumnPage>
+  internationalPipelineCatalogTotal: number
+  internationalPipelineSource: string
   emsPipelineSyncState: 'idle' | 'loading' | 'error'
   emsPipelineSyncError: string | null
   emsPipelineSyncSummary: {
@@ -1067,8 +1149,9 @@ const state: {
     updatedCount: number
     syncedAt: string | null
   } | null
-  emsMonthFilter: string
-  emsMonthOptions: Array<{ value: string; label: string; count: number }>
+  emsPipelineDateStart: string
+  emsPipelineDateEnd: string
+  emsPipelineDepartment: string
   emsStageOverrides: EmsStageOverrideMap
   packageCodeLookupQuery: string
   packageCodeLookupState: 'idle' | 'loading' | 'error'
@@ -1103,6 +1186,55 @@ const state: {
   chatListPage: number
   contactListPage: number
   globalAiAgentEnabled: boolean
+  automationConfig: {
+    automaticWelcome: boolean
+    automaticStatusUpdates: boolean
+    automaticReconciliation: boolean
+    aiAutoReply: boolean
+    welcomeResponseIntervalMs: number
+    eventChangeResponseIntervalMs: number
+    reconciliationIntervalMs: number
+  } | null
+  automationWatcherStatus: {
+    checkedAt: string
+    status: 'completed' | 'failed'
+    totalPackages: number
+    newPackages: number
+    welcomeSent: number
+    welcomeSkipped: number
+    eventSent: number
+    eventSkipped: number
+    eventSkippedByReason: Record<string, number>
+    eventReason: string | null
+    packageCountsBySource: Record<string, number>
+    packageSourceFailures: string[]
+    welcomeSkippedByReason: Record<string, number>
+  } | null
+  automationReconciliationStatus: {
+    checkedAt: string
+    status: 'completed' | 'partial' | 'failed' | 'running'
+    totalPackages: number
+    sentTotal: number
+    welcomeSent: number
+    welcomeSkipped: number
+    welcomeSkippedByReason: Record<string, number>
+    welcomeReason: string | null
+    eventSent: number
+    eventSkipped: number
+    eventSkippedByReason: Record<string, number>
+    eventReason: string | null
+    sourceFailures: string[]
+    notificationFailures: string[]
+  } | null
+  latestInboundReplyStatus: {
+    receivedAt: string | null
+    event: string | null
+    attemptedAt: string | null
+    reason: string | null
+  } | null
+  automationConfigError: string | null
+  automationConfigNotice: string | null
+  automationConfigState: 'idle' | 'saving'
   prontsActiveColumn: ProntsColumnKey
   prontsConfigs: Record<string, ProntsColumnConfig>
   prontsConfigState: 'idle' | 'submitting'
@@ -1199,15 +1331,32 @@ const state: {
   logsPage: number
   logsPageSize: number
   messageNotifications: MessageNotification[]
+  scannerQuery: string
+  scannerResult: any
+  scannerEventsState: 'idle' | 'loading' | 'error'
+  scannerEventsError: string | null
+  scannerSessionLog: any[]
+  scannerStageFilter: string
+  scannerQueryState: 'idle' | 'loading' | 'error'
+  scannerQueryError: string | null
 } = {
   isSidebarCollapsed: getStoredBoolean(STORAGE_KEYS.sidebarCollapsed, false),
-  expandedGroups: new Set(['ems', 'internacionales', 'clientes', 'usuarios', 'sistema']),
+  expandedGroups: new Set(),
   collapsedFlyoutGroup: null,
   activeView: getInitialView(),
+  scannerQuery: '',
+  scannerResult: null,
+  scannerEventsState: 'idle',
+  scannerEventsError: null,
+  scannerSessionLog: [],
+  scannerStageFilter: 'all',
+  scannerQueryState: 'idle',
+  scannerQueryError: null,
   internationalPackages: getStoredJson<InternationalPackage[]>(STORAGE_KEYS.internationalPackages, []),
   trackingApiPackages: [],
   trackingApiState: 'idle',
   trackingApiError: null,
+  trackingApiWarning: null,
   trackingApiSyncedAt: null,
   trackingApiTotalItems: 0,
   trackingApiPage: 1,
@@ -1221,11 +1370,21 @@ const state: {
   trackingApiCatalogState: 'idle',
   trackingApiCatalogError: null,
   trackingApiCatalogSyncedAt: null,
+  internationalPipelineSearch: {},
+  internationalPipelineDateStart: initialInternationalPipelineDateRange.start,
+  internationalPipelineDateEnd: initialInternationalPipelineDateRange.end,
+  internationalPipelineDepartment: 'all',
+  internationalPipelineSort: 'newest',
+  internationalPipelinePage: {},
+  internationalPipelineColumns: {},
+  internationalPipelineCatalogTotal: 0,
+  internationalPipelineSource: '',
   emsPipelineSyncState: 'idle',
   emsPipelineSyncError: null,
   emsPipelineSyncSummary: null,
-  emsMonthFilter: 'all',
-  emsMonthOptions: [],
+  emsPipelineDateStart: initialEmsPipelineDateRange.start,
+  emsPipelineDateEnd: initialEmsPipelineDateRange.end,
+  emsPipelineDepartment: 'all',
   emsStageOverrides: getStoredJson<EmsStageOverrideMap>(STORAGE_KEYS.emsStageOverrides, {}),
   packageCodeLookupQuery: '',
   packageCodeLookupState: 'idle',
@@ -1260,6 +1419,13 @@ const state: {
   chatListPage: 1,
   contactListPage: 1,
   globalAiAgentEnabled: getStoredBoolean(STORAGE_KEYS.globalAiAgentEnabled, false),
+  automationConfig: null,
+  automationWatcherStatus: null,
+  automationReconciliationStatus: null,
+  latestInboundReplyStatus: null,
+  automationConfigError: null,
+  automationConfigNotice: null,
+  automationConfigState: 'idle',
   prontsActiveColumn: 'received',
   prontsConfigs: createDefaultProntsConfigs(),
   prontsConfigState: 'idle',
@@ -1583,10 +1749,12 @@ const saveInternationalPackages = () => {
 }
 
 let trackingApiCatalogLoadRequestId = 0
+let internationalPipelineSearchTimer: ReturnType<typeof setTimeout> | null = null
 
 const loadTrackingApiPackages = async () => {
   state.trackingApiState = 'loading'
   state.trackingApiError = null
+  state.trackingApiWarning = null
   renderApp()
   const requestedPage = state.trackingApiPage
 
@@ -1601,7 +1769,7 @@ const loadTrackingApiPackages = async () => {
       state.loginError = 'Tu sesion expiro. Vuelve a iniciar sesion.'
       state.trackingApiState = 'idle'
       renderApp()
-      return
+      return false
     }
 
     if (!response.ok) {
@@ -1613,13 +1781,24 @@ const loadTrackingApiPackages = async () => {
     }
 
     const remoteData = Array.isArray(payload?.data) ? (payload.data as TrackingApiPackage[]) : []
-    const totalItems = Number(
+    const reportedTotal = Number(
       (payload?.paginacion as { total_registros?: number } | undefined)?.total_registros ??
+      (payload?.pagination as { total_registros?: number; total?: number } | undefined)?.total_registros ??
+      (payload?.pagination as { total_registros?: number; total?: number } | undefined)?.total ??
       (payload?.meta as { total?: number } | undefined)?.total ??
-      payload?.count ??
+      (payload as { total?: number } | undefined)?.total ??
+      (payload as { total_registros?: number } | undefined)?.total_registros ??
       remoteData.length ??
       0,
     )
+    const paginationData = (payload?.paginacion ?? payload?.pagination ?? payload?.meta ?? {}) as Record<string, unknown>
+    const upstreamCurrentPage = Number(
+      paginationData.pagina_actual ?? paginationData.current_page ?? paginationData.page ?? requestedPage,
+    )
+    const upstreamLastPage = Number(
+      paginationData.ultima_pagina ?? paginationData.last_page ?? paginationData.total_pages,
+    )
+    const explicitHasMore = paginationData.has_more ?? paginationData.hasMore
 
     if (remoteData.length === 0 && requestedPage > 1) {
       state.trackingApiPage = requestedPage - 1
@@ -1627,22 +1806,76 @@ const loadTrackingApiPackages = async () => {
       state.trackingApiState = 'idle'
       state.trackingApiError = null
       renderApp()
-      return
+      return false
     }
 
+    const loadedThrough = (requestedPage - 1) * state.trackingApiPageSize + remoteData.length
+    const totalItems = Number.isFinite(reportedTotal)
+      ? Math.max(reportedTotal, loadedThrough)
+      : loadedThrough
+
     state.trackingApiPackages = remoteData
-    state.trackingApiTotalItems = Number.isFinite(totalItems) ? totalItems : remoteData.length
-    state.trackingApiHasMore = remoteData.length >= state.trackingApiPageSize
-    state.trackingApiSyncedAt = new Date().toISOString()
+    state.trackingApiTotalItems = totalItems
+    state.trackingApiWarning =
+      typeof payload?.warning === 'string'
+        ? payload.warning
+        : payload?.source === 'local-db' || payload?.fallback
+          ? 'No se pudo consultar la API externa de tracking; se muestran datos locales sincronizados.'
+          : null
+    const receivedFullPage = remoteData.length >= state.trackingApiPageSize
+    state.trackingApiHasMore =
+      receivedFullPage ||
+      explicitHasMore === true ||
+      (Number.isFinite(upstreamLastPage) && upstreamLastPage > 0 && upstreamCurrentPage < upstreamLastPage) ||
+      requestedPage * state.trackingApiPageSize < totalItems
+    state.trackingApiSyncedAt =
+      typeof payload?.cachedAt === 'string' ? payload.cachedAt : new Date().toISOString()
   } catch (error) {
     state.trackingApiState = 'error'
     state.trackingApiError =
       error instanceof Error ? error.message : 'No se pudo consultar la API de tracking.'
     renderApp()
-    return
+    return false
   }
 
   state.trackingApiState = 'idle'
+  renderApp()
+  return true
+}
+
+const refreshTrackingApiPackages = async () => {
+  if (state.trackingApiState === 'loading') {
+    return
+  }
+
+  state.trackingApiPage = 1
+  const loaded = await loadTrackingApiPackages()
+
+  if (!loaded || state.trackingApiState !== 'idle' || state.trackingApiWarning) {
+    return
+  }
+
+  const latestPackages = state.trackingApiPackages
+  const latestCodes = new Set(
+    latestPackages
+      .map((item) => getTrackingPackageCode(item) || normalizeEmsPackageCode(item.mailitm_pid))
+      .filter(Boolean),
+  )
+  const catalogPackages = new Map<string, TrackingApiPackage>()
+
+  for (const item of latestPackages) {
+    const code = getTrackingPackageCode(item) || normalizeEmsPackageCode(item.mailitm_pid)
+    if (code) catalogPackages.set(code, item)
+  }
+
+  for (const item of state.trackingApiCatalogPackages) {
+    const code = getTrackingPackageCode(item) || normalizeEmsPackageCode(item.mailitm_pid)
+    if (code && !latestCodes.has(code)) {
+      catalogPackages.set(code, item)
+    }
+  }
+
+  state.trackingApiCatalogPackages = [...catalogPackages.values()]
   renderApp()
 }
 
@@ -1684,6 +1917,10 @@ const loadTrackingApiCatalogPackages = async () => {
     }
 
     state.trackingApiCatalogPackages = Array.isArray(payloadAny?.data) ? (payloadAny.data as TrackingApiPackage[]) : []
+    resetUnavailableTrackingApiFilters()
+    if (typeof payloadAny?.warning === 'string') {
+      state.trackingApiWarning = payloadAny.warning
+    }
     state.trackingApiCatalogSyncedAt = new Date().toISOString()
     state.trackingApiCatalogState = 'idle'
     renderApp()
@@ -1697,6 +1934,82 @@ const loadTrackingApiCatalogPackages = async () => {
       error instanceof Error ? error.message : 'No se pudo cargar el catalogo de estados de tracking.'
     renderApp()
   }
+}
+
+const internationalPipelineStages: EmsColumnKey[] = [
+  'received',
+  'transit',
+  'regional',
+  'courier',
+  'delivered',
+  'cancelled',
+]
+
+const loadInternationalPipelineColumn = async (stage: EmsColumnKey, page = 1) => {
+  const previous = state.internationalPipelineColumns[stage]
+  state.internationalPipelineColumns[stage] = {
+    items: previous?.items ?? [],
+    currentPage: previous?.currentPage ?? 1,
+    totalPages: previous?.totalPages ?? 1,
+    totalItems: previous?.totalItems ?? 0,
+    state: 'loading',
+    error: null,
+  }
+  renderApp()
+
+  const query = new URLSearchParams({
+    scope: stage,
+    page: String(page),
+    per_page: '6',
+    sort: state.internationalPipelineSort,
+    date_start: state.internationalPipelineDateStart,
+    date_end: state.internationalPipelineDateEnd,
+    department: state.internationalPipelineDepartment,
+  })
+  const search = String(state.internationalPipelineSearch[stage] ?? '').trim()
+  if (search) query.set('query', search)
+
+  try {
+    const response = await authFetch(`/api/internacionales/pipeline?${query.toString()}`, { timeoutMs: 15 * 60 * 1000 })
+    const payload = await parseApiPayload(response)
+    if (!response.ok) {
+      throw new Error(
+        (payload?.message as string) ||
+        (payload?.error as string) ||
+        'No se pudo cargar el pipeline internacional.',
+      )
+    }
+
+    const pagination = payload?.pagination as
+      | { page?: number; total_pages?: number; total_items?: number }
+      | undefined
+    state.internationalPipelineColumns[stage] = {
+      items: Array.isArray(payload?.data) ? (payload.data as TrackingApiPackage[]) : [],
+      currentPage: Number(pagination?.page ?? payload?.page ?? 1),
+      totalPages: Number(pagination?.total_pages ?? payload?.total_pages ?? 1),
+      totalItems: Number(pagination?.total_items ?? payload?.total ?? 0),
+      state: 'idle',
+      error: null,
+    }
+    state.internationalPipelineCatalogTotal = Number(payload?.catalog_total ?? state.internationalPipelineCatalogTotal)
+    state.internationalPipelineSource = String(payload?.source ?? state.internationalPipelineSource)
+    state.internationalPipelinePage[stage] = state.internationalPipelineColumns[stage].currentPage
+    if (typeof payload?.warning === 'string') state.trackingApiWarning = payload.warning
+  } catch (error) {
+    state.internationalPipelineColumns[stage] = {
+      items: previous?.items ?? [],
+      currentPage: previous?.currentPage ?? 1,
+      totalPages: previous?.totalPages ?? 1,
+      totalItems: previous?.totalItems ?? 0,
+      state: 'error',
+      error: error instanceof Error ? error.message : 'No se pudo cargar el pipeline internacional.',
+    }
+  }
+  renderApp()
+}
+
+const loadInternationalPipeline = async () => {
+  await Promise.all(internationalPipelineStages.map((stage) => loadInternationalPipelineColumn(stage, 1)))
 }
 
 const buildTrackingApiExportQuery = (page: number, perPage: number) => {
@@ -1731,7 +2044,11 @@ const fetchTrackingApiExportPage = async (page: number, perPage: number) => {
   const remoteData = Array.isArray(payload?.data) ? (payload.data as TrackingApiPackage[]) : []
   const totalItems = Number(
     (payload?.paginacion as { total_registros?: number } | undefined)?.total_registros ??
+    (payload?.pagination as { total_registros?: number; total?: number } | undefined)?.total_registros ??
+    (payload?.pagination as { total_registros?: number; total?: number } | undefined)?.total ??
     (payload?.meta as { total?: number } | undefined)?.total ??
+    (payload as { total?: number } | undefined)?.total ??
+    (payload as { total_registros?: number } | undefined)?.total_registros ??
     payload?.count ??
     remoteData.length ??
     0,
@@ -1754,8 +2071,8 @@ const exportTrackingApiToExcel = async () => {
   renderApp()
 
   try {
-    const pageSize = 40
-    const maxPages = 1
+    const pageSize = 200
+    const maxPages = 2000
     const exportedPackages: TrackingApiPackage[] = []
     let page = 1
     let lastPage = 1
@@ -1850,10 +2167,8 @@ const exportTrackingApiToExcel = async () => {
       'Código S10': item.codigo_s10 || '',
       Estado: getTrackingVisibleStateValue(item),
       'Estado postal': getTrackingStatusValue(item),
-      Origen: getTrackingLocationName(item.origen),
-      Destino: getTrackingLocationName(item.destino),
-      'Lugar destino': getTrackingDestinationPlaceValue(item),
-      Servicio: item.tipo_servicio || item.clase_correo || '',
+      Origen: getTrackingOriginPlaceValue(item),
+      Destino: getTrackingDestinationLocationValue(item),
       Peso: item.peso ?? '',
       'Teléfono origen': getTrackingOriginPhoneValue(item),
       'Teléfono destino': getTrackingDestinationPhoneValue(item),
@@ -1936,78 +2251,106 @@ const exportTrackingApiToExcel = async () => {
   }
 }
 
+let contactPackagesLoadPromise: Promise<void> | null = null
+let contactPackagesLastLoadKey = ''
+let contactPackagesLastLoadedAt = 0
+
 const loadContactPackages = async () => {
+  const loadKey = `${state.contactPackagesPage}:${state.contactPackagesPageSize}`
+  const now = Date.now()
+
+  if (contactPackagesLoadPromise) {
+    return contactPackagesLoadPromise
+  }
+
+  if (
+    state.contactPackages.length > 0 &&
+    contactPackagesLastLoadKey === loadKey &&
+    now - contactPackagesLastLoadedAt < 30000
+  ) {
+    return
+  }
+
   state.contactPackagesState = 'loading'
   state.contactPackagesError = null
   renderApp()
   const requestedPage = state.contactPackagesPage
 
-  try {
-    const response = await authFetch(
-      `/api/internacionales/paquetes-contactos?page=${state.contactPackagesPage}&per_page=${state.contactPackagesPageSize}`,
-    )
-    const payload = await parseApiPayload(response)
+  contactPackagesLoadPromise = (async () => {
+    try {
+      const response = await authFetch(
+        `/api/internacionales/paquetes-contactos?page=${state.contactPackagesPage}&per_page=${state.contactPackagesPageSize}`,
+        { timeoutMs: 30000 },
+      )
+      const payload = await parseApiPayload(response)
 
-    if (response.status === 401) {
+      if (response.status === 401) {
+        state.contactPackagesState = 'error'
+        state.contactPackagesError =
+          (payload?.message as string) ||
+          'La API de paquetes de contactos rechazo la consulta. Tu sesion sigue activa.'
+        renderApp()
+        return
+      }
+
+      if (!response.ok) {
+        throw new Error(
+          (payload?.error as string) ||
+          (payload?.message as string) ||
+          'No se pudo cargar la informacion de paquetes de contactos.',
+        )
+      }
+
+      const remoteData = Array.isArray(payload?.data) ? (payload.data as ContactPackagesApiItem[]) : []
+      const paginationData = (payload?.paginacion as {
+        total_registros?: number
+        ultima_pagina?: number
+        pagina_actual?: number
+        por_pagina?: number
+        desde?: number
+        hasta?: number
+      } | undefined) ?? null
+      const totalItems = Number(
+        paginationData?.total_registros ??
+        (payload?.meta as { total?: number } | undefined)?.total ??
+        payload?.count ??
+        remoteData.length ??
+        0,
+      )
+
+      if (remoteData.length === 0 && requestedPage > 1) {
+        state.contactPackagesPage = requestedPage - 1
+        state.contactPackagesHasMore = false
+        state.contactPackagesState = 'idle'
+        state.contactPackagesError = null
+        renderApp()
+        return
+      }
+
+      state.contactPackages = remoteData
+      state.contactPackagesTotalItems = Number.isFinite(totalItems) ? totalItems : remoteData.length
+      state.contactPackagesHasMore =
+        typeof paginationData?.ultima_pagina === 'number'
+          ? state.contactPackagesPage < paginationData.ultima_pagina
+          : remoteData.length >= state.contactPackagesPageSize
+      state.contactPackagesSyncedAt = new Date().toISOString()
+      contactPackagesLastLoadKey = loadKey
+      contactPackagesLastLoadedAt = Date.now()
+    } catch (error) {
       state.contactPackagesState = 'error'
       state.contactPackagesError =
-        (payload?.message as string) ||
-        'La API de paquetes de contactos rechazo la consulta. Tu sesion sigue activa.'
+        error instanceof Error ? error.message : 'No se pudo consultar la API de paquetes de contactos.'
       renderApp()
       return
     }
 
-    if (!response.ok) {
-      throw new Error(
-        (payload?.error as string) ||
-        (payload?.message as string) ||
-        'No se pudo cargar la informacion de paquetes de contactos.',
-      )
-    }
-
-    const remoteData = Array.isArray(payload?.data) ? (payload.data as ContactPackagesApiItem[]) : []
-    const paginationData = (payload?.paginacion as {
-      total_registros?: number
-      ultima_pagina?: number
-      pagina_actual?: number
-      por_pagina?: number
-      desde?: number
-      hasta?: number
-    } | undefined) ?? null
-    const totalItems = Number(
-      paginationData?.total_registros ??
-      (payload?.meta as { total?: number } | undefined)?.total ??
-      payload?.count ??
-      remoteData.length ??
-      0,
-    )
-
-    if (remoteData.length === 0 && requestedPage > 1) {
-      state.contactPackagesPage = requestedPage - 1
-      state.contactPackagesHasMore = false
-      state.contactPackagesState = 'idle'
-      state.contactPackagesError = null
-      renderApp()
-      return
-    }
-
-    state.contactPackages = remoteData
-    state.contactPackagesTotalItems = Number.isFinite(totalItems) ? totalItems : remoteData.length
-    state.contactPackagesHasMore =
-      typeof paginationData?.ultima_pagina === 'number'
-        ? state.contactPackagesPage < paginationData.ultima_pagina
-        : remoteData.length >= state.contactPackagesPageSize
-    state.contactPackagesSyncedAt = new Date().toISOString()
-  } catch (error) {
-    state.contactPackagesState = 'error'
-    state.contactPackagesError =
-      error instanceof Error ? error.message : 'No se pudo consultar la API de paquetes de contactos.'
+    state.contactPackagesState = 'idle'
     renderApp()
-    return
-  }
+  })().finally(() => {
+    contactPackagesLoadPromise = null
+  })
 
-  state.contactPackagesState = 'idle'
-  renderApp()
+  return contactPackagesLoadPromise
 }
 
 const refreshEmsPipelineFromApis = async () => {
@@ -2049,7 +2392,6 @@ const refreshEmsPipelineFromApis = async () => {
       )
     }
 
-    await loadEmsMonthOptions()
     const scopeKeys = [
       'received',
       'transit',
@@ -2075,7 +2417,6 @@ const refreshEmsPipelineFromApis = async () => {
     state.emsPipelineSyncError =
       error instanceof Error ? error.message : 'No se pudo sincronizar el pipeline EMS.'
     await ensureApiPipelineStateSourcesLoaded()
-    await loadEmsMonthOptions()
     await reloadEmsPipelinePages()
     state.emsPipelineSyncSummary = null
     state.emsPipelineSyncState = 'idle'
@@ -2105,7 +2446,6 @@ const reloadEmsPipelinePages = async () => {
 }
 
 const bootstrapEmsPipelineView = () => {
-  void loadEmsMonthOptions()
   void ensureApiPipelineStateSourcesLoaded()
   void reloadEmsPipelinePages()
 }
@@ -2150,6 +2490,160 @@ const lookupPackageCode = async () => {
     state.packageCodeLookupState = 'error'
     state.packageCodeLookupError =
       error instanceof Error ? error.message : 'No se pudo consultar el codigo en las APIs.'
+  }
+
+  renderApp()
+}
+
+const performScannerSearch = async (rawCode: string) => {
+  const code = (rawCode || '').trim().toUpperCase()
+  if (!code) return
+
+  state.scannerQuery = code
+  state.scannerResult = null
+  state.scannerEventsState = 'idle'
+  state.scannerEventsError = null
+  state.scannerQueryState = 'loading'
+  state.scannerQueryError = null
+  renderApp()
+
+  try {
+    const sourcePackages = state.trackingApiCatalogPackages.length > 0
+      ? state.trackingApiCatalogPackages
+      : state.trackingApiPackages
+
+    let matched: any = sourcePackages.find((pkg) => {
+      const c = String(pkg.codigo_s10 || pkg.codigo || '').toUpperCase()
+      const pid = String(pkg.mailitm_pid || '').toUpperCase()
+      return c === code || pid === code
+    })
+
+    let searchWarning: string | null = null
+    if (!matched) {
+      const response = await authFetch(`/api/tracking/paquetes?q=${encodeURIComponent(code)}&page=1&per_page=20`)
+      const payload = await parseApiPayload(response)
+
+      if (response.status === 401) {
+        clearSession()
+        state.loginError = 'Tu sesion expiro. Vuelve a iniciar sesion.'
+        state.scannerQueryState = 'idle'
+        renderApp()
+        return
+      }
+
+      if (!response.ok) {
+        throw new Error(
+          (payload?.error as string) ||
+          (payload?.message as string) ||
+          'No se pudo consultar el código en tracking.',
+        )
+      }
+
+      searchWarning = typeof payload?.warning === 'string' ? payload.warning : null
+      const items = Array.isArray(payload?.data) ? payload.data : []
+      matched = items.find((pkg: any) => {
+        const packageCode = String(pkg.codigo_s10 || pkg.codigo || '').toUpperCase()
+        const packageId = String(pkg.mailitm_pid || '').toUpperCase()
+        return packageCode === code || packageId === code
+      })
+    }
+
+    if (!matched) {
+      throw new Error(
+        searchWarning
+          ? `No se encontró ${code} en los datos sincronizados. ${searchWarning}`
+          : `No se encontró el paquete ${code} en tracking.`,
+      )
+    }
+
+    const trackingCode = String(matched.codigo_s10 || matched.codigo || code).trim().toUpperCase()
+    const calculatedStage = getTrackingPipelineStage(matched)
+    matched.stage = calculatedStage
+
+    state.scannerEventsState = 'loading'
+    state.scannerResult = matched
+    renderApp()
+
+    try {
+      const eventsResponse = await authFetch(`/api/tracking/paquetes/${encodeURIComponent(trackingCode)}/eventos`)
+      const eventsPayload = await parseApiPayload(eventsResponse)
+      if (eventsResponse.status === 401) {
+        clearSession()
+        state.loginError = 'Tu sesion expiro. Vuelve a iniciar sesion.'
+        state.scannerQueryState = 'idle'
+        state.scannerEventsState = 'idle'
+        renderApp()
+        return
+      }
+      if (!eventsResponse.ok) {
+        throw new Error(
+          (eventsPayload?.message as string) ||
+          (eventsPayload?.warning as string) ||
+          'No se pudo cargar el historial de movimientos.',
+        )
+      }
+
+      const eventItems = Array.isArray(eventsPayload?.data) ? eventsPayload.data : []
+      if (eventItems.length > 0) {
+        matched.eventos = eventItems.map((entry: any) => {
+          const event = entry?.evento && typeof entry.evento === 'object'
+            ? { ...entry, ...entry.evento }
+            : entry?.event && typeof entry.event === 'object'
+              ? { ...entry, ...entry.event }
+              : entry
+          return {
+            ...event,
+            fecha: event?.event_gmt_dt || event?.event_date || event?.fecha_evento || event?.fecha || '',
+            codigo_evento: event?.codigo_evento ?? event?.event_code ?? event?.event_type_cd ?? event?.event_id,
+            evento_api: event?.evento_api || event?.nombre || event?.event_name || event?.evento_original || '',
+            evento_original: event?.evento_original || event?.event_name || event?.nombre || '',
+            oficina: event?.oficina || event?.office_name || event?.off_name || event?.ubicacion || '',
+            detalle: event?.detalle || event?.description || event?.observacion || '',
+            movimiento_bolivia: event?.movimiento_bolivia || '',
+          }
+        }).sort((first: any, second: any) => {
+          const firstDate = Date.parse(first.fecha)
+          const secondDate = Date.parse(second.fecha)
+          if (!Number.isFinite(firstDate) || !Number.isFinite(secondDate)) return 0
+          return firstDate - secondDate
+        })
+      }
+      state.scannerEventsState = 'idle'
+      state.scannerEventsError = null
+    } catch (error) {
+      state.scannerEventsState = 'error'
+      state.scannerEventsError =
+        error instanceof Error ? error.message : 'No se pudieron cargar los movimientos del paquete.'
+    }
+
+    const now = new Date()
+    const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
+    const lastEv = Array.isArray(matched.eventos) && matched.eventos.length > 0 ? matched.eventos[matched.eventos.length - 1] : null
+    const eventDesc = lastEv
+      ? `Evento ${lastEv.codigo_evento || ''} ${lastEv.evento_api || lastEv.evento_original || 'Movimiento registrado'}`.trim()
+      : 'Sin movimientos registrados'
+    const stageIndex = internationalPipelineStages.indexOf(calculatedStage)
+
+    const existingLogIdx = state.scannerSessionLog.findIndex((l: any) => l.codigo === trackingCode)
+    const logItem = {
+      codigo: trackingCode,
+      stage: calculatedStage,
+      stageLabel: internationalPipelineStages[stageIndex] ? `Etapa ${stageIndex + 1}` : 'Sin etapa',
+      lastEvent: eventDesc,
+      time: timeStr,
+      pkg: matched,
+    }
+
+    if (existingLogIdx >= 0) {
+      state.scannerSessionLog.splice(existingLogIdx, 1)
+    }
+    state.scannerSessionLog.unshift(logItem)
+    state.scannerQueryState = 'idle'
+  } catch (err) {
+    state.scannerQueryState = 'error'
+    state.scannerQueryError = err instanceof Error ? err.message : 'Error al consultar código.'
+    state.scannerEventsState = 'idle'
+    state.scannerEventsError = null
   }
 
   renderApp()
@@ -2223,6 +2717,32 @@ const clearPackageCodeLookupFilter = () => {
   renderApp()
 }
 
+const hasTrackingApiFilters = () =>
+  state.trackingApiStateFilter !== 'all' ||
+  state.trackingApiServiceFilter !== 'all' ||
+  state.trackingApiOriginFilter !== 'all' ||
+  state.trackingApiDestinationFilter !== 'all' ||
+  Boolean(state.packageCodeLookupResult?.found)
+
+const resetUnavailableTrackingApiFilters = () => {
+  const availableServices = new Set(getTrackingApiAvailableServices().map((item) => item.value))
+  const availableOrigins = new Set(getTrackingApiAvailableCountries('origen').map((item) => item.value))
+  const availableDestinations = new Set(getTrackingApiAvailableCountries('destino').map((item) => item.value))
+
+  if (state.trackingApiServiceFilter !== 'all' && !availableServices.has(state.trackingApiServiceFilter)) {
+    state.trackingApiServiceFilter = 'all'
+    localStorage.setItem(STORAGE_KEYS.trackingApiServiceFilter, 'all')
+  }
+  if (state.trackingApiOriginFilter !== 'all' && !availableOrigins.has(state.trackingApiOriginFilter)) {
+    state.trackingApiOriginFilter = 'all'
+    localStorage.setItem(STORAGE_KEYS.trackingApiOriginFilter, 'all')
+  }
+  if (state.trackingApiDestinationFilter !== 'all' && !availableDestinations.has(state.trackingApiDestinationFilter)) {
+    state.trackingApiDestinationFilter = 'all'
+    localStorage.setItem(STORAGE_KEYS.trackingApiDestinationFilter, 'all')
+  }
+}
+
 const getTrackingApiPagination = () => {
   const lookupPackage = getTrackingApiLookupPackage()
 
@@ -2240,11 +2760,7 @@ const getTrackingApiPagination = () => {
   }
 
   const filteredPackages = getFilteredTrackingApiPackages()
-  const isListFiltered =
-    state.trackingApiStateFilter !== 'all' ||
-    state.trackingApiServiceFilter !== 'all' ||
-    state.trackingApiOriginFilter !== 'all' ||
-    state.trackingApiDestinationFilter !== 'all'
+  const isListFiltered = hasTrackingApiFilters()
 
   if (!isListFiltered) {
     const totalItems = state.trackingApiTotalItems || state.trackingApiPackages.length
@@ -2287,10 +2803,8 @@ const getTrackingApiTableHead = () => {
       <tr>
         <th>Código</th>
         <th>Origen</th>
-        <th>Destino</th>
         <th>Estado</th>
-        <th>Lugar destino</th>
-        <th>Servicio</th>
+        <th>Destino</th>
         <th>Peso</th>
         <th>Teléfono origen</th>
         <th>Teléfono destino</th>
@@ -2520,7 +3034,7 @@ const renderTrackingApiRows = () => {
   if (items.length === 0) {
     return `
       <tr>
-        <td class="international-empty" colspan="9">
+        <td class="international-empty" colspan="8">
           ${state.trackingApiState === 'loading' || isLoadingTrackingStates
         ? 'Cargando paquetes desde la API de tracking...'
         : state.packageCodeLookupQuery.trim()
@@ -2539,11 +3053,9 @@ const renderTrackingApiRows = () => {
       (item) => `
         <tr>
           <td><strong>${escapeHtml(item.codigo_s10 || item.codigo || 'Sin código')}</strong></td>
-          <td>${escapeHtml(getTrackingLocationName(item.origen))}</td>
-          <td>${escapeHtml(getTrackingLocationName(item.destino))}</td>
+          <td>${escapeHtml(getTrackingOriginPlaceValue(item))}</td>
           <td>${escapeHtml(getTrackingVisibleStateValue(item))}</td>
-          <td>${escapeHtml(getTrackingDestinationPlaceValue(item))}</td>
-          <td>${escapeHtml(item.tipo_servicio || item.clase_correo || 'Sin servicio')}</td>
+          <td>${escapeHtml(getTrackingDestinationLocationValue(item))}</td>
           <td>${escapeHtml(item.peso == null ? '—' : `${item.peso} Kg`)}</td>
           <td>${escapeHtml(getTrackingOriginPhoneValue(item))}</td>
           <td>${escapeHtml(getTrackingDestinationPhoneValue(item))}</td>
@@ -2615,6 +3127,7 @@ const renderTrackingApiPagination = () => {
   const selectedStateOption = getTrackingApiSelectedStateOption()
   const rangeStart = pagination.totalItems === 0 ? 0 : (pagination.currentPage - 1) * pagination.pageSize + 1
   const rangeEnd = Math.min(pagination.currentPage * pagination.pageSize, pagination.totalItems)
+  const remoteTotalIsStillUnknown = pagination.mode === 'remote' && hasMorePages
 
   return `
     <div class="international-pagination">
@@ -2622,8 +3135,10 @@ const renderTrackingApiPagination = () => {
         <span>${isLookupTrackingResult
       ? 'Mostrando 1 resultado encontrado por el buscador'
       : pagination.totalItems > 0
-        ? hasSelectedState
-          ? `Mostrando ${rangeStart}-${rangeEnd} de ${pagination.totalItems} registros con estado ${selectedStateOption?.label ?? state.trackingApiStateFilter}`
+        ? remoteTotalIsStillUnknown
+          ? `Mostrando ${rangeStart}-${rangeEnd} registros; hay mas paquetes en la API`
+          : hasSelectedState
+            ? `Mostrando ${rangeStart}-${rangeEnd} de ${pagination.totalItems} registros con estado ${selectedStateOption?.label ?? state.trackingApiStateFilter}`
           : `Mostrando ${rangeStart}-${rangeEnd} de ${pagination.totalItems} registros`
         : hasSelectedState
           ? 'Sin registros para mostrar con ese estado'
@@ -2923,6 +3438,24 @@ const getTrackingVisibleStateValue = (item: TrackingApiPackage) => {
 const getTrackingDestinationPlaceValue = (item: TrackingApiPackage) =>
   normalizeText(item.destinatario?.direccion) || getTrackingLocationName(item.destino)
 
+const getTrackingOriginPlaceValue = (item: TrackingApiPackage) => {
+  const origin = item.origen
+  if (typeof origin === 'string') {
+    const originName = normalizeText(origin)
+    return originName && originName.toLowerCase() !== 'tracking api' ? originName : 'Sin dato'
+  }
+
+  const originName = normalizeText(origin?.nombre)
+  if (originName && originName.toLowerCase() !== 'tracking api') {
+    return originName
+  }
+
+  return normalizeText(origin?.codigo) || 'Sin dato'
+}
+
+const getTrackingDestinationLocationValue = (item: TrackingApiPackage) =>
+  getTrackingLocationName(item.destino)
+
 const getTrackingOriginPhoneValue = (item: TrackingApiPackage) =>
   normalizeText(item.telefonos?.remitente ?? null) ||
   normalizeText(item.remitente?.telefono ?? null) ||
@@ -2937,15 +3470,35 @@ const getTrackingDestinationPhoneValue = (item: TrackingApiPackage) =>
 
 const getTrackingLatestEvent = (item: TrackingApiPackage) => {
   const events = Array.isArray(item.eventos) ? item.eventos.filter(Boolean) : []
-  return events[0] ?? null
+  return [...events].sort((first, second) => {
+    const firstTimestamp = Date.parse(normalizeText(first?.fecha))
+    const secondTimestamp = Date.parse(normalizeText(second?.fecha))
+    const firstValue = Number.isFinite(firstTimestamp) ? firstTimestamp : 0
+    const secondValue = Number.isFinite(secondTimestamp) ? secondTimestamp : 0
+    return secondValue - firstValue
+  })[0] ?? null
+}
+
+const getInternationalIpsStage = (event?: TrackingApiEvent | null): EmsColumnKey | null => {
+  if (!event) return null
+
+  const eventId = Number(event.evento_id ?? event.codigo_evento ?? event.event_code ?? event.event_type_cd ?? event.event_id)
+  if (eventId === 37) return 'delivered'
+  if (eventId === 76) return 'cancelled'
+  if ([32, 36, 39, 73, 74, 75].includes(eventId)) return 'courier'
+  if ([13, 14, 35, 71, 72].includes(eventId)) return 'regional'
+  if ([31, 34, 38].includes(eventId)) return 'transit'
+  if ([1, 2, 3, 8, 12, 30].includes(eventId)) return 'received'
+
+  return null
 }
 
 const getPackageEventStage = (event?: TrackingApiEvent | null): EmsColumnKey | null => {
   if (!event) return null
 
   const eventId = Number(event.evento_id ?? event.codigo_evento)
-  if ([318, 295, 2239, 2240, 240, 2241, 297, 2242].includes(eventId)) return 'received'
-  if ([168, 296].includes(eventId)) return 'transit'
+  if ([318, 295, 2239, 2240, 2241, 297, 2242].includes(eventId)) return 'received'
+  if ([168, 240, 296].includes(eventId)) return 'transit'
   if ([310, 312, 183, 4410, 2103, 4405, 4404, 3345, 4400].includes(eventId)) return 'regional'
   if ([4409, 315].includes(eventId)) return 'courier'
   if (eventId === 316) return 'delivered'
@@ -2965,7 +3518,8 @@ const getPackageEventStage = (event?: TrackingApiEvent | null): EmsColumnKey | n
     eventText.includes('regional') ||
     eventText.includes('destino') ||
     eventText.includes('listo para entregar') ||
-    eventText.includes('oficina de entrega')
+    eventText.includes('oficina de entrega') ||
+    eventText.includes('ventanilla')
   ) {
     return 'regional'
   }
@@ -2977,8 +3531,45 @@ const getPackageEventStage = (event?: TrackingApiEvent | null): EmsColumnKey | n
 
 const getPackageStageFromEvents = (item: { eventos?: TrackingApiPackage['eventos'] | null }) => {
   const events = Array.isArray(item.eventos) ? item.eventos.filter(Boolean) : []
-  return getPackageEventStage(events[0])
+  const latestEvent = getTrackingLatestEvent({ eventos: events } as TrackingApiPackage)
+  const latestEventId = Number(latestEvent?.evento_id ?? latestEvent?.codigo_evento)
+  const hasPreviousTransit = events.some((event) => getPackageEventStage(event) === 'transit')
+
+  if (latestEventId === 297 && hasPreviousTransit) {
+    return 'regional'
+  }
+
+  return getPackageEventStage(latestEvent)
 }
+
+const getPackageStageRank = (stage: EmsColumnKey | null | undefined) => {
+  if (stage === 'received') return 0
+  if (stage === 'transit') return 1
+  if (stage === 'regional') return 2
+  if (stage === 'courier') return 3
+  if (stage === 'delivered') return 4
+  if (stage === 'cancelled') return 5
+  return -1
+}
+
+const getMostAdvancedPackageStage = (...stages: Array<EmsColumnKey | null | undefined>) =>
+  stages
+    .filter((stage): stage is EmsColumnKey => Boolean(stage))
+    .sort((stageA, stageB) => getPackageStageRank(stageB) - getPackageStageRank(stageA))[0] ?? null
+
+const hasPackageTransfer = (item: Record<string, unknown>) =>
+  [
+    item.traspaso,
+    item.fecha_traspaso,
+    item.fechaTraspaso,
+    item.transferencia,
+    item.fecha_transferencia,
+    item.cod_especial,
+    item.codigo_especial,
+    item.codigoEspecial,
+    item.codigo_relacionado,
+    item.numero_despacho,
+  ].some((value) => normalizeText(String(value ?? '')).length > 0)
 
 const getTrackingApiLookupPackage = () => {
   const lookupResult = state.packageCodeLookupResult as Record<string, any> | null
@@ -3131,7 +3722,6 @@ const getFilteredTrackingApiPackages = () => {
     const matchesState =
       state.trackingApiStateFilter === 'all' ||
       getTrackingApiPackageStateLabels(item).includes(state.trackingApiStateFilter)
-    return matchesState
     const matchesService =
       state.trackingApiServiceFilter === 'all' ||
       getTrackingApiServiceValue(item) === state.trackingApiServiceFilter
@@ -3205,13 +3795,11 @@ const getContactPackagePipelineStage = (item: ContactPackagesApiItem): EmsColumn
   const status = normalizeCountryKey(getContactPackageEstado(item))
   const eventStage = getPackageStageFromEvents(item)
   const configuredStage = findConfiguredPipelineStageForState(getContactPackageEstado(item))
+  const transferStage = hasPackageTransfer(item as Record<string, unknown>) ? 'transit' : null
+  const advancedMovementStage = getMostAdvancedPackageStage(configuredStage, eventStage, transferStage)
 
-  if (configuredStage) {
-    return configuredStage
-  }
-
-  if (eventStage) {
-    return eventStage
+  if (advancedMovementStage && advancedMovementStage !== 'received') {
+    return advancedMovementStage
   }
 
   if (
@@ -3235,7 +3823,8 @@ const getContactPackagePipelineStage = (item: ContactPackagesApiItem): EmsColumn
     status.includes('recibido destino') ||
     status.includes('recibido regional') ||
     status.includes('sucursal de destino') ||
-    status.includes('pasar a recoger')
+    status.includes('pasar a recoger') ||
+    status.includes('ventanilla')
   ) {
     return 'regional'
   }
@@ -3272,6 +3861,10 @@ const getContactPackagePipelineStage = (item: ContactPackagesApiItem): EmsColumn
     status.includes('admis')
   ) {
     return 'received'
+  }
+
+  if (advancedMovementStage) {
+    return advancedMovementStage
   }
 
   return 'received'
@@ -3413,6 +4006,8 @@ const buildEmsPackageCardFromTracking = (
     recipientName,
     recipientReference,
     destination,
+    currentLocation: getEmsPipelineEventLocation(item),
+    department: getBolivianDepartmentKey(getEmsPipelineEventLocation(item)),
     status,
     updatedAt: getEmsApiContactTimestamp(latestEvent?.fecha || item?.fecha_registro),
     sourceKind: 'tracking',
@@ -3447,6 +4042,8 @@ const buildEmsPackageCardFromContact = (
     recipientName,
     recipientReference,
     destination,
+    currentLocation: getEmsPipelineEventLocation(item),
+    department: getBolivianDepartmentKey(getEmsPipelineEventLocation(item)),
     status,
     updatedAt: getEmsApiContactTimestamp(latestEvent?.fecha || item?.fecha_registro),
     sourceKind: 'contact',
@@ -3465,23 +4062,10 @@ const getEmsApiStatusPackages = (): {
 } => {
   const trackingItems = getTrackingApiSourcePackages().filter(isNationalTrackingPackage)
   const contactItems = getEffectiveContactPackages().filter(isNationalContactPackage)
-  const selectedMonth = state.emsMonthFilter.trim() || 'all'
-  const matchesSelectedMonth = (value: unknown) => {
-    if (selectedMonth === 'all') {
-      return true
-    }
-
-    return getEmsMonthKeyFromValue(value) === selectedMonth
-  }
-
-  const filteredTrackingItems = trackingItems.filter((item) =>
-    matchesSelectedMonth(item?.fecha_registro || item?.eventos?.[0]?.fecha),
-  )
-  const filteredContactItems = contactItems.filter((item) => matchesSelectedMonth(item?.fecha_registro))
   const allCards = [
-    ...filteredTrackingItems.map((item, index) => buildEmsPackageCardFromTracking(item, index, getTrackingPipelineStage(item))),
-    ...filteredContactItems.map((item, index) => buildEmsPackageCardFromContact(item, index, getContactPackagePipelineStage(item))),
-  ]
+    ...trackingItems.map((item, index) => buildEmsPackageCardFromTracking(item, index, getTrackingPipelineStage(item))),
+    ...contactItems.map((item, index) => buildEmsPackageCardFromContact(item, index, getContactPackagePipelineStage(item))),
+  ].filter((card) => matchesEmsPipelineFilters(card.updatedAt, card.currentLocation))
   const buckets = createEmsStageBuckets(allCards)
 
   return {
@@ -3737,6 +4321,9 @@ const ensureWhatsAppTestModeSourcesLoaded = async () => {
 const getTrackingPipelineStage = (item: TrackingApiPackage): EmsColumnKey => {
   const postalState = normalizeCountryKey(item.estado_postal)
   const latestEvent = getTrackingLatestEvent(item)
+  const ipsStage = getInternationalIpsStage(latestEvent)
+  if (ipsStage) return ipsStage
+
   const eventStage = getPackageStageFromEvents(item)
   const latestEventText = normalizeCountryKey(
     [latestEvent?.nombre, latestEvent?.evento_api, latestEvent?.evento_original, latestEvent?.movimiento_bolivia, latestEvent?.detalle]
@@ -3756,13 +4343,11 @@ const getTrackingPipelineStage = (item: TrackingApiPackage): EmsColumnKey => {
     findConfiguredPipelineStageForState(latestEventLabel) ??
     findConfiguredPipelineStageForState(getTrackingApiStateLabel(item)) ??
     findConfiguredPipelineStageForState(item.estado_postal)
+  const transferStage = hasPackageTransfer(item as Record<string, unknown>) ? 'transit' : null
+  const advancedMovementStage = getMostAdvancedPackageStage(configuredStage, eventStage, transferStage)
 
-  if (configuredStage) {
-    return configuredStage
-  }
-
-  if (eventStage) {
-    return eventStage
+  if (advancedMovementStage && advancedMovementStage !== 'received') {
+    return advancedMovementStage
   }
 
   if (
@@ -3813,8 +4398,10 @@ const getTrackingPipelineStage = (item: TrackingApiPackage): EmsColumnKey => {
   if (
     postalState.includes('regional') ||
     postalState.includes('destino') ||
+    postalState.includes('ventanilla') ||
     latestEventText.includes('regional') ||
     latestEventText.includes('destino') ||
+    latestEventText.includes('ventanilla') ||
     latestEventText.includes('sucursal de destino') ||
     latestEventText.includes('recibido destino') ||
     latestEventText.includes('recibido regional') ||
@@ -3824,11 +4411,9 @@ const getTrackingPipelineStage = (item: TrackingApiPackage): EmsColumnKey => {
   }
 
   if (
-    postalState.includes('ventanilla') ||
     postalState.includes('almacen') ||
     postalState.includes('almacen origen') ||
     postalState.includes('origen') ||
-    latestEventText.includes('ventanilla') ||
     latestEventText.includes('almacen') ||
     latestEventText.includes('almacen origen') ||
     latestEventText.includes('origen') ||
@@ -3837,6 +4422,10 @@ const getTrackingPipelineStage = (item: TrackingApiPackage): EmsColumnKey => {
     latestEventText.includes('recibido')
   ) {
     return 'received'
+  }
+
+  if (advancedMovementStage) {
+    return advancedMovementStage
   }
 
   return 'received'
@@ -3926,18 +4515,15 @@ const getTrackingApiStateLabel = (item: TrackingApiPackage) => {
 const getApiPipelineStateOptions = (scope: EmsColumnKey | null = null): ApiPipelineStateOption[] => {
   const trackingPackages = getTrackingApiSourcePackages().filter(isNationalTrackingPackage)
   const contactPackages = getEffectiveContactPackages().filter(isNationalContactPackage)
-  const selectedMonth = state.emsMonthFilter.trim() || 'all'
-  const matchesSelectedMonth = (value: unknown) => {
-    if (selectedMonth === 'all') {
-      return true
-    }
-
-    return getEmsMonthKeyFromValue(value) === selectedMonth
-  }
   const filteredTrackingPackages = trackingPackages.filter((item) =>
-    matchesSelectedMonth(item?.fecha_registro || getTrackingLatestEvent(item)?.fecha),
+    matchesEmsPipelineFilters(
+      getTrackingLatestEvent(item)?.fecha || item?.fecha_registro,
+      getEmsPipelineEventLocation(item),
+    ),
   )
-  const filteredContactPackages = contactPackages.filter((item) => matchesSelectedMonth(item?.fecha_registro))
+  const filteredContactPackages = contactPackages.filter((item) =>
+    matchesEmsPipelineFilters(item?.fecha_registro, getEmsPipelineEventLocation(item)),
+  )
   const stateMap = new Map<
     string,
     {
@@ -4359,7 +4945,6 @@ const persistUiState = () => {
   try {
     localStorage.setItem(STORAGE_KEYS.sidebarCollapsed, String(state.isSidebarCollapsed))
     localStorage.setItem(STORAGE_KEYS.globalAiAgentEnabled, String(state.globalAiAgentEnabled))
-    localStorage.setItem(STORAGE_KEYS.emsMonthFilter, state.emsMonthFilter)
     saveStoredJson(STORAGE_KEYS.emsStageOverrides, state.emsStageOverrides)
     localStorage.setItem(STORAGE_KEYS.trackingApiServiceFilter, state.trackingApiServiceFilter)
     localStorage.setItem(STORAGE_KEYS.trackingApiOriginFilter, state.trackingApiOriginFilter)
@@ -4461,6 +5046,77 @@ const authFetch = async (
 
 const getApiUrl = (path: string) => `${API_BASE}${path}`
 
+let automationConfigLoaded = false
+let automationConfigLoading = false
+
+const loadAutomationConfig = async ({ force = false } = {}) => {
+  if ((!force && automationConfigLoaded) || automationConfigLoading || !state.authToken) return
+  automationConfigLoading = true
+  try {
+    const response = await authFetch('/api/settings/automation')
+    const payload = await parseApiPayload(response)
+  const data = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {}
+  if (!response.ok) throw new Error(typeof data.message === 'string' ? data.message : 'No se pudo cargar la configuracion.')
+  const returnedConfig = data.config
+  if (!returnedConfig || typeof returnedConfig !== 'object') throw new Error('La configuracion recibida no es valida.')
+  state.automationConfig = returnedConfig as typeof state.automationConfig
+    state.automationWatcherStatus =
+      data.watcher && typeof data.watcher === 'object'
+        ? data.watcher as typeof state.automationWatcherStatus
+        : null
+    state.latestInboundReplyStatus =
+      data.inboundReply && typeof data.inboundReply === 'object'
+        ? data.inboundReply as typeof state.latestInboundReplyStatus
+        : null
+    state.automationReconciliationStatus =
+      data.reconciliation && typeof data.reconciliation === 'object'
+        ? data.reconciliation as typeof state.automationReconciliationStatus
+        : null
+    automationConfigLoaded = true
+    renderApp()
+  } catch (error) {
+    state.automationConfigError = error instanceof Error ? error.message : 'No se pudo cargar la configuracion.'
+  } finally {
+    automationConfigLoading = false
+  }
+}
+
+const saveAutomationSettings = async (config: {
+  automaticWelcome: boolean
+  automaticStatusUpdates: boolean
+  aiAutoReply: boolean
+  welcomeResponseIntervalMs: number
+  eventChangeResponseIntervalMs: number
+  automaticReconciliation: boolean
+  reconciliationIntervalMs: number
+}) => {
+  if (state.automationConfigState === 'saving') return
+  state.automationConfigError = null
+  state.automationConfigNotice = null
+  state.automationConfigState = 'saving'
+  renderApp()
+  try {
+    const response = await authFetch('/api/settings/automation', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config),
+    })
+    const payload = await parseApiPayload(response)
+    const data = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {}
+    if (!response.ok) throw new Error(typeof data.message === 'string' ? data.message : 'No se pudo guardar la configuracion.')
+    const returnedConfig = data.config
+    if (!returnedConfig || typeof returnedConfig !== 'object') throw new Error('La configuracion recibida no es valida.')
+    state.automationConfig = returnedConfig as typeof state.automationConfig
+    state.automationConfigState = 'idle'
+    state.automationConfigNotice = 'Configuracion guardada correctamente.'
+    renderApp()
+  } catch (error) {
+    state.automationConfigState = 'idle'
+    state.automationConfigError = error instanceof Error ? error.message : 'No se pudo guardar la configuracion.'
+    renderApp()
+  }
+}
+
 const parseApiPayload = async (response: Response) => {
   const contentType = response.headers.get('content-type') ?? ''
   const raw = await response.text()
@@ -4493,7 +5149,7 @@ const getStatusClass = (status: string) => {
   return 'badge'
 }
 
-const getEmsStatusKey = (contact: Contact): Exclude<EmsStatusFilter, 'all'> => {
+const getEmsStatusKey = (contact: Contact): BaseEmsColumnKey => {
   const latestMessage = String(contact.lastMessageText ?? '').trim().toLowerCase()
   const normalizedContactStatus = String(contact.status ?? '').trim().toLowerCase()
 
@@ -4652,6 +5308,32 @@ const getWhatsAppReference = (contact: Contact) =>
 
 const hasWhatsAppChannel = (contact: Contact) =>
   contact.socialProfiles?.some((profile) => profile.channel === 'WhatsApp') ?? false
+
+const isAutoReplyPausedContact = (contact: Contact | null | undefined) => {
+  const pausedUntil = contact?.autoReplyPause?.pausedUntil
+  if (!contact?.autoReplyPause?.isPaused || !pausedUntil) return false
+
+  const pausedUntilTime = new Date(pausedUntil).getTime()
+  return Number.isFinite(pausedUntilTime) && pausedUntilTime > Date.now()
+}
+
+const getAutoReplyPausedContacts = () => getChatContacts().filter(isAutoReplyPausedContact)
+
+const formatAutoReplyPauseRemaining = (contact: Contact | null | undefined) => {
+  const pausedUntil = contact?.autoReplyPause?.pausedUntil
+  if (!pausedUntil) return ''
+
+  const remainingMs = new Date(pausedUntil).getTime() - Date.now()
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) return ''
+
+  const totalMinutes = Math.ceil(remainingMs / 60000)
+  const hours = Math.floor(totalMinutes / 60)
+  const minutes = totalMinutes % 60
+
+  if (hours <= 0) return `${minutes} min`
+  if (minutes <= 0) return `${hours} h`
+  return `${hours} h ${minutes} min`
+}
 
 const getWhatsAppNumberCandidates = (value: unknown) => {
   const digits = normalizePhoneDigits(value)
@@ -5161,29 +5843,50 @@ const showBrowserMessageNotification = (notification: MessageNotification) => {
     return
   }
 
-  try {
-    const browserNotification = new Notification(notification.contactName, {
-      body: notification.preview,
-      icon: notification.contactAvatar || '/default-avatar.png', // Muestra la foto de Quique o una por defecto
-      tag: `crm-message-${notification.contactId}`,
-      renotify: true, // Reemplaza la notificación previa del mismo contacto sin acumular estáticas
-      silent: true,
-      data: {
-        url: `/chat/${notification.contactId}` // Guarda la ruta para redirigir al hacer clic
-      }
-    });
+  // 1. Verificar soporte y permisos
+  if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+    try {
+      // Acceso directo con optional chaining para no romper los tipos del objeto
+      const contactName = notification?.contactName || 'Nuevo mensaje';
+      const preview = notification?.preview || '';
+      const contactAvatar = notification?.contactAvatar || '/default-avatar.png';
+      const contactId = notification?.contactId || '';
 
-    browserNotification.onclick = () => {
-      window.focus()
-      openConversationModal(notification.contactId)
-      browserNotification.close()
+      // Cast seguro (as any) en las opciones para evitar que TypeScript reclame por 'renotify'
+      const notificationOptions = {
+        body: preview,
+        icon: contactAvatar,
+        tag: `crm-message-${contactId}`,
+        renotify: true,
+        silent: true,
+        data: {
+          url: `/chat/${contactId}`
+        }
+      };
+
+      const browserNotification = new Notification(contactName, notificationOptions);
+
+      const autoCloseTimer = setTimeout(() => {
+        browserNotification.close();
+      }, MESSAGE_NOTIFICATION_DURATION_MS);
+
+      browserNotification.onclick = () => {
+        clearTimeout(autoCloseTimer);
+
+        if (typeof window.focus === 'function') {
+          window.focus();
+        }
+
+        if (contactId) {
+          openConversationModal(contactId);
+        }
+
+        browserNotification.close();
+      };
+
+    } catch (error) {
+      console.debug('Error al instanciar la notificación:', error);
     }
-
-    window.setTimeout(() => {
-      browserNotification.close()
-    }, MESSAGE_NOTIFICATION_DURATION_MS)
-  } catch {
-    // Si el navegador no permite notificaciones nativas, el toast interno sigue visible.
   }
 }
 
@@ -5286,6 +5989,7 @@ const getEmsStatusContacts = () => {
   )
   return {
     all: contacts,
+    paused: contacts.filter(isAutoReplyPausedContact),
     received: buckets.received,
     regional: buckets.regional,
     transit: buckets.transit,
@@ -5301,70 +6005,63 @@ const getEmsApiContactTimestamp = (value: unknown) => {
   return Number.isFinite(parsed) ? new Date(parsed).toISOString() : new Date().toISOString()
 }
 
-const getEffectiveTrackingApiPackages = () =>
-  state.trackingApiCatalogPackages.length > 0 ? state.trackingApiCatalogPackages : state.trackingApiPackages
-
 const getEffectiveContactPackages = () =>
   state.contactPackagesCatalog.length > 0 ? state.contactPackagesCatalog : state.contactPackages
 
-const getEmsMonthKeyFromValue = (value: unknown) => {
-  const normalized = normalizeReference(value)
-  if (!normalized) return ''
-
-  const parsed = Date.parse(normalized)
-  if (!Number.isFinite(parsed)) return ''
-
-  const date = new Date(parsed)
-  const year = date.getUTCFullYear()
-  const month = String(date.getUTCMonth() + 1).padStart(2, '0')
-  return `${year}-${month}`
+const getEmsPipelineDateKey = (value: unknown) => {
+  const parsed = Date.parse(normalizeReference(value))
+  return Number.isFinite(parsed) ? getBoliviaDateInputValue(new Date(parsed)) : ''
 }
 
-const formatEmsMonthLabel = (monthKey: string) => {
-  if (!monthKey || monthKey === 'all') {
-    return 'Todos los meses'
-  }
+const getEmsPipelineEventLocation = (item: TrackingApiPackage | ContactPackagesApiItem | null | undefined) => {
+  const latestEvent = item && 'eventos' in item ? getTrackingLatestEvent(item as TrackingApiPackage) : null
+  const locationEvent = latestEvent as
+    | (TrackingApiEvent & {
+        ubicacion?: string | null
+        lugar?: string | null
+        regional?: string | null
+        departamento?: string | null
+        ciudad?: string | null
+      })
+    | null
+  const eventLocation = [
+    locationEvent?.oficina,
+    locationEvent?.ubicacion,
+    locationEvent?.lugar,
+    locationEvent?.regional,
+    locationEvent?.departamento,
+    locationEvent?.ciudad,
+    locationEvent?.detalle,
+  ].map(normalizeText).find(Boolean)
 
-  const [yearPart, monthPart] = monthKey.split('-')
-  const year = Number(yearPart)
-  const month = Number(monthPart)
-
-  if (!Number.isFinite(year) || !Number.isFinite(month) || month < 1 || month > 12) {
-    return monthKey
-  }
-
-  const date = new Date(Date.UTC(year, month - 1, 1))
-  return new Intl.DateTimeFormat('es-BO', {
-    month: 'long',
-    year: 'numeric',
-    timeZone: 'America/La_Paz',
-  }).format(date)
+  return eventLocation || normalizeText((item as Record<string, any> | undefined)?.ubicacion) || ''
 }
 
-const getEmsMonthOptions = () => {
-  if (state.emsMonthOptions.length > 0) {
-    return state.emsMonthOptions
-  }
+const getBolivianDepartmentKey = (value: unknown) => {
+  const normalized = normalizeText(String(value ?? ''))
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+  const departments: Array<[string, string[]]> = [
+    ['la-paz', ['la paz', 'el alto', 'viacha', 'achocalla', 'lpz']],
+    ['cochabamba', ['cochabamba', 'cbba', 'sacaba', 'quillacollo']],
+    ['santa-cruz', ['santa cruz', 'scz', 'montero', 'warnes']],
+    ['oruro', ['oruro']],
+    ['potosi', ['potosi']],
+    ['tarija', ['tarija']],
+    ['chuquisaca', ['chuquisaca', 'sucre']],
+    ['beni', ['beni', 'trinidad', 'riberalta']],
+    ['pando', ['pando', 'cobija']],
+  ]
 
-  const trackingItems = getEffectiveTrackingApiPackages().filter(isNationalTrackingPackage)
-  const contactItems = getEffectiveContactPackages().filter(isNationalContactPackage)
-  const monthMap = new Map<string, number>()
+  return departments.find(([, aliases]) => aliases.some((alias) => normalized.includes(alias)))?.[0] ?? ''
+}
 
-  const registerMonth = (value: unknown) => {
-    const key = getEmsMonthKeyFromValue(value)
-    if (!key) return
-    monthMap.set(key, (monthMap.get(key) ?? 0) + 1)
-  }
-
-  trackingItems.forEach((item) => registerMonth(item?.fecha_registro || item?.eventos?.[0]?.fecha))
-  contactItems.forEach((item) => registerMonth(item?.fecha_registro))
-
-  return [...monthMap.entries()]
-    .sort((first, second) => second[0].localeCompare(first[0]))
-    .map(([value, count]) => ({
-      value,
-      label: `${formatEmsMonthLabel(value)} (${count})`,
-    }))
+const matchesEmsPipelineFilters = (dateValue: unknown, departmentValue: unknown) => {
+  const dateKey = getEmsPipelineDateKey(dateValue)
+  if (!dateKey || dateKey < state.emsPipelineDateStart || dateKey > state.emsPipelineDateEnd) return false
+  if (state.emsPipelineDepartment === 'all') return true
+  return getBolivianDepartmentKey(departmentValue) === state.emsPipelineDepartment
 }
 
 const buildEmsApiContact = (
@@ -5770,13 +6467,10 @@ const getLocalEmsPipelineScopePage = async (
   await ensureApiPipelineStateSourcesLoaded()
 
   const normalizedQuery = query.trim().toLowerCase()
-  const selectedMonth = state.emsMonthFilter.trim() || 'all'
   const sourceCards = getLocalEmsPipelineScopeCards(scope)
 
   const filteredCards = sourceCards.filter((card) => {
-    if (selectedMonth !== 'all' && getEmsMonthKeyFromValue(card.updatedAt) !== selectedMonth) {
-      return false
-    }
+    if (!matchesEmsPipelineFilters(card.updatedAt, card.currentLocation ?? card.destination)) return false
 
     if (!normalizedQuery) {
       return true
@@ -5828,7 +6522,15 @@ const getLocalEmsPipelineScopePage = async (
 }
 
 const getEmsPipelineScopeSignature = (scope: string, page: number, pageSize: number, query: string) =>
-  [scope, state.emsMonthFilter || 'all', page, pageSize, query.trim().toLowerCase()].join('|')
+  [
+    scope,
+    state.emsPipelineDateStart,
+    state.emsPipelineDateEnd,
+    state.emsPipelineDepartment,
+    page,
+    pageSize,
+    query.trim().toLowerCase(),
+  ].join('|')
 
 void getLocalEmsPipelineScopePage
 
@@ -5885,8 +6587,10 @@ const loadEmsPipelineScopePage = async (
 
   try {
     const response = await authFetch(
-      `/api/ems/pipeline?scope=${encodeURIComponent(scope)}&page=${page}&per_page=${pageSize}&month=${encodeURIComponent(
-        state.emsMonthFilter || 'all',
+      `/api/ems/pipeline?scope=${encodeURIComponent(scope)}&page=${page}&per_page=${pageSize}&date_start=${encodeURIComponent(
+        state.emsPipelineDateStart,
+      )}&date_end=${encodeURIComponent(state.emsPipelineDateEnd)}&department=${encodeURIComponent(
+        state.emsPipelineDepartment,
       )}&query=${encodeURIComponent(query)}`,
       {
         timeoutMs,
@@ -5974,28 +6678,6 @@ const loadEmsPipelineScopePage = async (
     if (emsPipelineScopeLoadTokens.get(scope) === requestToken) {
       renderApp()
     }
-  }
-}
-
-const loadEmsMonthOptions = async () => {
-  try {
-    const response = await authFetch('/api/ems/month-options', { timeoutMs: 45000 })
-    const payload = await parseApiPayload(response)
-
-    if (response.status === 401) {
-      clearSession()
-      state.loginError = 'Tu sesion expiro. Vuelve a iniciar sesion.'
-      renderApp()
-      return
-    }
-
-    if (!response.ok) {
-      throw new Error((payload?.message as string) || (payload?.error as string) || 'No se pudieron cargar los meses del pipeline EMS.')
-    }
-
-    state.emsMonthOptions = Array.isArray(payload?.data) ? (payload.data as Array<{ value: string; label: string; count: number }>) : []
-  } catch {
-    state.emsMonthOptions = []
   }
 }
 
@@ -6628,7 +7310,9 @@ const buildProntsSimulationResponse = (column: ProntsColumnKey, contact: Contact
 const getFilteredEmsContacts = () => {
   const contacts = getChatContacts().filter((contact) => {
     const matchesFilter =
-      state.emsStatusFilter === 'all' || getEmsStatusKey(contact) === state.emsStatusFilter
+      state.emsStatusFilter === 'all' ||
+      (state.emsStatusFilter === 'paused' && isAutoReplyPausedContact(contact)) ||
+      getEmsStatusKey(contact) === state.emsStatusFilter
     const query = state.searchQuery.trim().toLowerCase()
     const matchesQuery =
       query.length === 0 ||
@@ -7358,19 +8042,21 @@ const setActiveView = (view: ViewKey) => {
       return
     }
   }
-  if (
-    (view === 'internacionales' || view === 'internacionales-pipeline') &&
-    state.trackingApiPackages.length === 0 &&
-    state.trackingApiState !== 'loading'
-  ) {
+  if (view === 'internacionales' && state.trackingApiPackages.length === 0 && state.trackingApiState !== 'loading') {
     void loadTrackingApiPackages()
   }
-  if (
-    (view === 'internacionales' || view === 'internacionales-pipeline') &&
-    state.trackingApiCatalogPackages.length === 0 &&
-    state.trackingApiCatalogState !== 'loading'
-  ) {
+  if (view === 'internacionales' && state.trackingApiState !== 'loading' && state.trackingApiPackages.length > 0) {
+    state.trackingApiPage = 1
+    void loadTrackingApiPackages()
+  }
+  if (view === 'internacionales' && state.trackingApiCatalogPackages.length === 0 && state.trackingApiCatalogState !== 'loading') {
     void loadTrackingApiCatalogPackages()
+  }
+  if (
+    view === 'internacionales-tablero' &&
+    !Object.values(state.internationalPipelineColumns).some((column) => column.state === 'loading')
+  ) {
+    void loadInternationalPipeline()
   }
   if (view === 'internacionales-paquetes' && state.contactPackages.length === 0 && state.contactPackagesState !== 'loading') {
     void loadContactPackages()
@@ -8044,6 +8730,18 @@ const loadConversation = async (contactId: number, options: { silent?: boolean }
       ...state.conversationData.contact,
       status: latestContactStatus || state.conversationData.contact.status,
     }
+    const activeContact = state.conversationData.contact as Contact
+    const currentComposerMessage =
+      state.sendMessageForm.contactId === activeContact.id ? state.sendMessageForm.message : ''
+    state.sendMessageForm = {
+      contactId: activeContact.id,
+      contactName: activeContact.name,
+      targetReference: getWhatsAppReference(activeContact),
+      message: currentComposerMessage,
+      attachment: state.sendMessageForm.contactId === activeContact.id ? state.sendMessageForm.attachment : null,
+      attachmentName: state.sendMessageForm.contactId === activeContact.id ? state.sendMessageForm.attachmentName : '',
+      attachmentType: state.sendMessageForm.contactId === activeContact.id ? state.sendMessageForm.attachmentType : '',
+    }
     if (state.data) {
       state.data = {
         ...state.data,
@@ -8088,6 +8786,58 @@ const loadConversation = async (contactId: number, options: { silent?: boolean }
     state.conversationState = 'idle'
     state.conversationError =
       error instanceof Error ? error.message : 'No se pudo cargar la conversacion del contacto.'
+    renderApp()
+  }
+}
+
+const unpauseAutoReplyForContact = async (contactId: number) => {
+  try {
+    state.notice = 'Desactivando baneo de IA...'
+    renderApp()
+
+    const response = await authFetch(`/api/contacts/${contactId}/auto-reply-unpause`, {
+      method: 'POST',
+    })
+    const payload = await parseApiPayload(response)
+
+    if (response.status === 401) {
+      clearSession()
+      state.loginError = 'Tu sesion expiro. Inicia sesion nuevamente.'
+      renderApp()
+      return
+    }
+
+    if (!response.ok) {
+      throw new Error(
+        (payload?.error as string) ||
+        (payload?.message as string) ||
+        'No se pudo desactivar el baneo de IA.',
+      )
+    }
+
+    if (state.data) {
+      state.data = {
+        ...state.data,
+        contacts: state.data.contacts.map((contact) =>
+          contact.id === contactId
+            ? {
+                ...contact,
+                autoReplyPause: {
+                  isPaused: false,
+                  pausedUntil: null,
+                  reason: null,
+                },
+              }
+            : contact,
+        ),
+      }
+    }
+
+    state.notice = 'Baneo de IA desactivado. El agente puede responder nuevamente.'
+    await loadConversation(contactId, { silent: true })
+    void loadDashboard({ silent: true })
+  } catch (error) {
+    state.notice = error instanceof Error ? error.message : 'No se pudo desactivar el baneo de IA.'
     renderApp()
   }
 }
@@ -8233,9 +8983,14 @@ const closeContactProfileModal = () => {
 }
 
 const openTrackingInfoModal = (trackingId: string | number) => {
+  const pipelinePackages = Object.values(state.internationalPipelineColumns)
+    .flatMap((column) => column.items)
+  const packages = [...state.trackingApiPackages, ...pipelinePackages]
   const selectedPackage =
-    state.trackingApiPackages.find(
-      (item) => String(item.mailitm_pid) === String(trackingId) || item.codigo_s10 === String(trackingId),
+    packages.find(
+      (item) =>
+        String(item.mailitm_pid ?? '') === String(trackingId) ||
+        String(item.codigo_s10 ?? item.codigo ?? '') === String(trackingId),
     ) ?? null
 
   if (!selectedPackage) {
@@ -8557,7 +9312,6 @@ const createRenderContext = () => ({
   getEmsStatusContacts,
   getEmsApiStatusContacts,
   getEmsApiStatusPackages,
-  getEmsMonthOptions,
   getEmsApiCustomColumnContacts,
   getEmsApiCustomColumnPackages,
   getEmsReferenceChannelState,
@@ -8573,6 +9327,8 @@ const createRenderContext = () => ({
   getChatPhaseDescription,
   getEmsPhaseDescription,
   getChatContacts,
+  getAutoReplyPausedContacts,
+  formatAutoReplyPauseRemaining,
   isAutoCreatedChatContact,
   getConversationMessagesChronological,
   renderConversationMessageMedia,
@@ -8712,6 +9468,32 @@ const renderAppNow = () => {
     return
   }
 
+  void loadAutomationConfig()
+  document.querySelector<HTMLButtonElement>('[data-refresh-automation-status]')?.addEventListener('click', () => {
+    void loadAutomationConfig({ force: true })
+  })
+  document.querySelector<HTMLButtonElement>('[data-save-automation-settings]')?.addEventListener('click', () => {
+    const getSetting = (key: string) =>
+      document.querySelector<HTMLInputElement>(`[data-automation-setting="${key}"]`)?.checked ?? false
+    const getIntervalMs = (key: string, fallbackMs: number) => {
+      const value = Number(document.querySelector<HTMLInputElement>(`[data-automation-interval-value="${key}"]`)?.value)
+      const unit = document.querySelector<HTMLSelectElement>(`[data-automation-interval-unit="${key}"]`)?.value
+      const multiplier = unit === 'hours' ? 60 * 60 * 1000 : 60 * 1000
+      if (!Number.isFinite(value) || value <= 0) return fallbackMs
+      return Math.round(value * multiplier)
+    }
+
+    void saveAutomationSettings({
+      automaticWelcome: getSetting('automaticWelcome'),
+      automaticStatusUpdates: getSetting('automaticStatusUpdates'),
+      aiAutoReply: getSetting('aiAutoReply'),
+      automaticReconciliation: getSetting('automaticReconciliation'),
+      welcomeResponseIntervalMs: getIntervalMs('welcomeResponseIntervalMs', state.automationConfig?.welcomeResponseIntervalMs ?? 5 * 60 * 1000),
+      eventChangeResponseIntervalMs: getIntervalMs('eventChangeResponseIntervalMs', state.automationConfig?.eventChangeResponseIntervalMs ?? 15 * 60 * 1000),
+      reconciliationIntervalMs: getIntervalMs('reconciliationIntervalMs', state.automationConfig?.reconciliationIntervalMs ?? 30 * 60 * 1000),
+    })
+  })
+
   if (!topbarProfileGlobalListenersInstalled) {
     document.addEventListener(
       'click',
@@ -8784,6 +9566,12 @@ const renderAppNow = () => {
   document
     .querySelector<HTMLButtonElement>('#header-ai-agent-toggle')
     ?.addEventListener('click', toggleGlobalAiAgent)
+  document
+    .querySelector<HTMLButtonElement>('[data-settings-action="toggle-test-mode"]')
+    ?.addEventListener('click', () => void toggleWhatsAppTestMode())
+  document
+    .querySelector<HTMLButtonElement>('[data-settings-action="toggle-ai-agent"]')
+    ?.addEventListener('click', () => void toggleGlobalAiAgent())
   document
     .querySelector<HTMLButtonElement>('#profile-toggle')
     ?.addEventListener('click', () => {
@@ -9200,9 +9988,38 @@ const renderAppNow = () => {
     })
   })
 
-  document.querySelector<HTMLSelectElement>('[data-ems-month-filter]')?.addEventListener('change', (event) => {
-    state.emsMonthFilter = (event.currentTarget as HTMLSelectElement).value || 'all'
-    persistUiState()
+  const updateEmsPipelineDateRange = (changedField: 'start' | 'end', value: string) => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return
+
+    const today = getBoliviaDateInputValue(new Date())
+    let start = changedField === 'start' ? (value > today ? today : value) : state.emsPipelineDateStart
+    let end = changedField === 'end' ? (value > today ? today : value) : state.emsPipelineDateEnd
+    const startTime = Date.parse(`${start}T00:00:00Z`)
+    const endTime = Date.parse(`${end}T00:00:00Z`)
+
+    if (changedField === 'start' && (endTime < startTime || endTime - startTime > 29 * 86400000)) {
+      const adjustedEnd = new Date(startTime + 29 * 86400000).toISOString().slice(0, 10)
+      end = adjustedEnd > today ? today : adjustedEnd
+    } else if (changedField === 'end' && (endTime < startTime || endTime - startTime > 29 * 86400000)) {
+      start = new Date(endTime - 29 * 86400000).toISOString().slice(0, 10)
+    }
+
+    state.emsPipelineDateStart = start
+    state.emsPipelineDateEnd = end
+    renderApp()
+    void reloadEmsPipelinePages()
+  }
+
+  document.querySelector<HTMLInputElement>('[data-ems-pipeline-date-start]')?.addEventListener('change', (event) => {
+    updateEmsPipelineDateRange('start', (event.currentTarget as HTMLInputElement).value)
+  })
+
+  document.querySelector<HTMLInputElement>('[data-ems-pipeline-date-end]')?.addEventListener('change', (event) => {
+    updateEmsPipelineDateRange('end', (event.currentTarget as HTMLInputElement).value)
+  })
+
+  document.querySelector<HTMLSelectElement>('[data-ems-pipeline-department]')?.addEventListener('change', (event) => {
+    state.emsPipelineDepartment = (event.currentTarget as HTMLSelectElement).value || 'all'
     renderApp()
     void reloadEmsPipelinePages()
   })
@@ -9290,8 +10107,91 @@ const renderAppNow = () => {
     })
   })
 
-  document.querySelector<HTMLButtonElement>('#refresh-tracking-packages')?.addEventListener('click', () => {
-    void loadTrackingApiPackages()
+  document.querySelector<HTMLSelectElement>('#international-pipeline-sort')?.addEventListener('change', (event) => {
+    state.internationalPipelineSort = (event.currentTarget as HTMLSelectElement).value === 'oldest' ? 'oldest' : 'newest'
+    state.internationalPipelinePage = {}
+    void loadInternationalPipeline()
+  })
+
+  const updateInternationalPipelineDateRange = (changedField: 'start' | 'end', value: string) => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return
+
+    const today = getBoliviaDateInputValue(new Date())
+    let start = changedField === 'start' ? (value > today ? today : value) : state.internationalPipelineDateStart
+    let end = changedField === 'end' ? (value > today ? today : value) : state.internationalPipelineDateEnd
+    const startTime = Date.parse(`${start}T00:00:00Z`)
+    const endTime = Date.parse(`${end}T00:00:00Z`)
+
+    if (changedField === 'start' && (endTime < startTime || endTime - startTime > 30 * 86400000)) {
+      const adjustedEnd = new Date(startTime + 30 * 86400000).toISOString().slice(0, 10)
+      end = adjustedEnd > today ? today : adjustedEnd
+    } else if (changedField === 'end' && (endTime < startTime || endTime - startTime > 30 * 86400000)) {
+      start = new Date(endTime - 30 * 86400000).toISOString().slice(0, 10)
+    }
+
+    state.internationalPipelineDateStart = start
+    state.internationalPipelineDateEnd = end
+    state.internationalPipelinePage = {}
+    renderApp()
+    void loadInternationalPipeline()
+  }
+
+  document
+    .querySelector<HTMLInputElement>('[data-international-pipeline-date-start]')
+    ?.addEventListener('change', (event) => {
+      updateInternationalPipelineDateRange('start', (event.currentTarget as HTMLInputElement).value)
+    })
+
+  document
+    .querySelector<HTMLInputElement>('[data-international-pipeline-date-end]')
+    ?.addEventListener('change', (event) => {
+      updateInternationalPipelineDateRange('end', (event.currentTarget as HTMLInputElement).value)
+    })
+
+  document
+    .querySelector<HTMLSelectElement>('[data-international-pipeline-department]')
+    ?.addEventListener('change', (event) => {
+      state.internationalPipelineDepartment = (event.currentTarget as HTMLSelectElement).value || 'all'
+      state.internationalPipelinePage = {}
+      renderApp()
+      void loadInternationalPipeline()
+  })
+
+  document.querySelectorAll<HTMLInputElement>('[data-international-pipeline-search]').forEach((input) => {
+    input.addEventListener('input', (event) => {
+      const stage = input.dataset.internationalPipelineSearch
+      if (!stage) return
+
+      state.internationalPipelineSearch[stage] = (event.currentTarget as HTMLInputElement).value
+      state.internationalPipelinePage[stage] = 1
+      if (internationalPipelineSearchTimer) clearTimeout(internationalPipelineSearchTimer)
+      internationalPipelineSearchTimer = setTimeout(() => {
+        void loadInternationalPipelineColumn(stage as EmsColumnKey, 1)
+      }, 350)
+    })
+  })
+
+  document.querySelectorAll<HTMLButtonElement>('[data-international-pipeline-page]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const [stage, direction] = String(button.dataset.internationalPipelinePage ?? '').split(':')
+      if (!stage || !direction) return
+
+      const currentPage = Number(state.internationalPipelinePage[stage] ?? 1)
+      const nextPage = direction === 'prev' ? Math.max(1, currentPage - 1) : currentPage + 1
+      state.internationalPipelinePage[stage] = nextPage
+      void loadInternationalPipelineColumn(stage as EmsColumnKey, nextPage)
+    })
+  })
+
+  document.querySelectorAll<HTMLButtonElement>('[data-international-pipeline-show-all]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const stage = button.dataset.internationalPipelineShowAll
+      if (!stage) return
+
+      state.internationalPipelineSearch[stage] = ''
+      state.internationalPipelinePage[stage] = 1
+      void loadInternationalPipelineColumn(stage as EmsColumnKey, 1)
+    })
   })
 
   document
@@ -9391,11 +10291,15 @@ const renderAppNow = () => {
     .querySelector<HTMLButtonElement>('#clear-package-code-lookup-filter')
     ?.addEventListener('click', clearPackageCodeLookupFilter)
 
+  document.querySelector<HTMLButtonElement>('#tracking-api-refresh')?.addEventListener('click', () => {
+    void refreshTrackingApiPackages()
+  })
+
   document.querySelector<HTMLButtonElement>('#tracking-page-prev')?.addEventListener('click', () => {
     if (state.trackingApiState === 'loading') return
     if (state.trackingApiPage <= 1) return
     state.trackingApiPage -= 1
-    const isFiltered = state.trackingApiStateFilter !== 'all' || Boolean(state.packageCodeLookupResult?.found)
+    const isFiltered = hasTrackingApiFilters()
 
     if (!isFiltered) {
       void loadTrackingApiPackages()
@@ -9408,7 +10312,7 @@ const renderAppNow = () => {
   document.querySelector<HTMLButtonElement>('#tracking-page-next')?.addEventListener('click', () => {
     if (state.trackingApiState === 'loading') return
     const pagination = getTrackingApiPagination()
-    const isFiltered = state.trackingApiStateFilter !== 'all' || Boolean(state.packageCodeLookupResult?.found)
+    const isFiltered = hasTrackingApiFilters()
 
     if (!isFiltered) {
       if (!state.trackingApiHasMore) return
@@ -9467,6 +10371,72 @@ const renderAppNow = () => {
     state.trackingApiPage = 1
     state.packageCodeLookupResult = null
     renderApp()
+  })
+
+  // Eventos de Terminal Escáner Internacional
+  document.querySelectorAll<HTMLFormElement>('[data-scanner-form]').forEach((form) => {
+    form.addEventListener('submit', (event) => {
+      event.preventDefault()
+      const input = form.querySelector<HTMLInputElement>('[data-scanner-input]')
+      const code = input?.value?.trim() || ''
+      if (code) {
+        void performScannerSearch(code)
+      }
+    })
+  })
+
+  document.querySelectorAll<HTMLInputElement>('[data-scanner-input]').forEach((input) => {
+    input.addEventListener('input', (event) => {
+      state.scannerQuery = (event.currentTarget as HTMLInputElement).value
+    })
+  })
+
+  document.querySelectorAll<HTMLButtonElement>('[data-scanner-quick-code]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const code = btn.dataset.scannerQuickCode
+      if (code) {
+        state.scannerQuery = code
+        void performScannerSearch(code)
+      }
+    })
+  })
+
+  document.querySelectorAll<HTMLButtonElement>('[data-scanner-page]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      if (state.trackingApiState === 'loading') return
+      if (btn.dataset.scannerPage === 'prev' && state.trackingApiPage > 1) {
+        state.trackingApiPage -= 1
+        void loadTrackingApiPackages()
+      }
+      if (btn.dataset.scannerPage === 'next' && state.trackingApiHasMore) {
+        state.trackingApiPage += 1
+        void loadTrackingApiPackages()
+      }
+    })
+  })
+
+  document.querySelectorAll<HTMLDivElement>('[data-scanner-select-log]').forEach((item) => {
+    item.addEventListener('click', () => {
+      const code = item.dataset.scannerSelectLog
+      if (code) {
+        const found = state.scannerSessionLog.find((l: any) => l.codigo === code)
+        if (found?.pkg) {
+          state.scannerResult = found.pkg
+          state.scannerQuery = code
+          renderApp()
+        } else {
+          void performScannerSearch(code)
+        }
+      }
+    })
+  })
+
+  document.querySelectorAll<HTMLButtonElement>('[data-scanner-stage-filter]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const filterKey = btn.dataset.scannerStageFilter || 'all'
+      state.scannerStageFilter = state.scannerStageFilter === filterKey ? 'all' : filterKey
+      renderApp()
+    })
   })
 
   document.querySelector<HTMLButtonElement>('#contact-packages-page-prev')?.addEventListener('click', () => {
@@ -9647,6 +10617,16 @@ const renderAppNow = () => {
       void suggestConversationReply()
     })
 
+  document.querySelectorAll<HTMLButtonElement>('[data-auto-reply-unpause]').forEach((button) => {
+    button.addEventListener('click', (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      const contactId = Number(button.dataset.autoReplyUnpause)
+      if (!Number.isFinite(contactId)) return
+      void unpauseAutoReplyForContact(contactId)
+    })
+  })
+
   document
     .querySelector<HTMLDivElement>('#message-modal-backdrop')
     ?.addEventListener('click', (event) => {
@@ -9755,7 +10735,7 @@ const renderAppNow = () => {
     .querySelector<HTMLFormElement>('#send-message-form')
     ?.addEventListener('submit', (event) => {
       event.preventDefault()
-      void submitSendWhatsAppMessage()
+      void submitSendWhatsAppMessage({ useAiSuggestion: false })
     })
 
   document
@@ -9770,7 +10750,14 @@ const renderAppNow = () => {
     .querySelector<HTMLFormElement>('#chat-composer-form')
     ?.addEventListener('submit', (event) => {
       event.preventDefault()
-      void submitSendWhatsAppMessage()
+      void submitChatComposerMessage()
+    })
+
+  document
+    .querySelector<HTMLButtonElement>('#chat-composer-send')
+    ?.addEventListener('click', (event) => {
+      event.preventDefault()
+      void submitChatComposerMessage()
     })
 
   document.querySelectorAll<HTMLButtonElement>('[data-send-whatsapp]').forEach((button) => {
@@ -10196,6 +11183,12 @@ const loadDashboard = async (options: { silent?: boolean } = {}) => {
     if (state.activeView === 'internacionales' && state.trackingApiState !== 'loading') {
       void loadTrackingApiPackages()
     }
+    if (
+      state.activeView === 'internacionales-tablero' &&
+      Object.keys(state.internationalPipelineColumns).length === 0
+    ) {
+      void loadInternationalPipeline()
+    }
     if (state.activeView === 'internacionales-paquetes' && state.contactPackagesState !== 'loading') {
       void loadContactPackages()
     }
@@ -10453,14 +11446,14 @@ const submitWhatsAppTestMessage = async () => {
   }
 }
 
-const submitSendWhatsAppMessage = async () => {
+const submitSendWhatsAppMessage = async ({ useAiSuggestion = false } = {}) => {
   state.sendMessageState = 'submitting'
   state.sendMessageError = null
   renderApp()
 
   try {
     const targetContactId = state.sendMessageForm.contactId
-    const aiEnabled = targetContactId !== null && isAiAssistedConversation(targetContactId)
+    const aiEnabled = useAiSuggestion && targetContactId !== null && isAiAssistedConversation(targetContactId)
     const attachment = state.sendMessageForm.attachment
     const hasAttachment = Boolean(attachment)
     const attachmentType = attachment?.type ?? ''
@@ -10487,23 +11480,6 @@ const submitSendWhatsAppMessage = async () => {
 
     if (hasAttachment && attachmentType.startsWith('audio/') && finalMessage) {
       throw new Error('Los audios no admiten texto adicional. Envia solo el archivo de audio.')
-    }
-
-    const normalizedTarget = normalizePhoneDigits(state.sendMessageForm.targetReference)
-
-    if (state.whatsappTestModeEnabled) {
-      await ensureWhatsAppTestModeSourcesLoaded()
-
-      const normalizedTargetNumber = normalizeBoliviaTestPhoneDigits(normalizedTarget)
-      if (!state.whatsappTestModeNumbers.includes(normalizedTargetNumber)) {
-        throw new Error('El modo prueba esta activo. Solo puedes enviar a los numeros de prueba autorizados.')
-      }
-
-      if (!isWhatsAppTestNumberAvailableInLoadedApis(normalizedTargetNumber)) {
-        throw new Error(
-          'El modo prueba esta activo, pero ese numero no aparece en los datos cargados de Internacionales o Paquetes.',
-        )
-      }
     }
 
     const requestBody = hasAttachment ? new FormData() : null
@@ -10567,6 +11543,28 @@ const submitSendWhatsAppMessage = async () => {
       error instanceof Error ? error.message : 'No se pudo enviar el mensaje por WhatsApp.'
     renderApp()
   }
+}
+
+const submitChatComposerMessage = async () => {
+  const activeContact = state.conversationData.contact as Contact
+  const textarea = document.querySelector<HTMLTextAreaElement>('#chat-composer-input')
+  const message = textarea?.value ?? state.sendMessageForm.message
+
+  if (!activeContact?.id) {
+    state.sendMessageError = 'Selecciona un chat antes de enviar.'
+    renderApp()
+    return
+  }
+
+  state.sendMessageForm = {
+    ...state.sendMessageForm,
+    contactId: activeContact.id,
+    contactName: activeContact.name,
+    targetReference: getWhatsAppReference(activeContact),
+    message,
+  }
+
+  await submitSendWhatsAppMessage({ useAiSuggestion: false })
 }
 
 const logout = async (expiredBySchedule = false) => {

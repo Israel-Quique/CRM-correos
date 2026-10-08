@@ -108,18 +108,6 @@ export default function registerMessagesRoutes(app, deps) {
         return
       }
 
-      const availableTestNumber = (
-        await Promise.all(
-          testModeNumbers.map(async (number) => ((await isTestModeNumberListedInApis(number)) ? number : null)),
-        )
-      ).find(Boolean)
-
-      if (!availableTestNumber) {
-        response.status(403).json({
-          message: 'El modo prueba esta activo, pero ninguno de los numeros autorizados aparece en las APIs de Internacionales o Paquetes.',
-        })
-        return
-      }
     }
 
     const storedAttachment = attachment
@@ -187,19 +175,6 @@ export default function registerMessagesRoutes(app, deps) {
 
     await syncContactEmsStatus({
       contactId: targetContactId,
-    })
-
-    await maybeSendTestModeStageUpdate(request).catch(async (error) => {
-      await writeSystemLog({
-        level: 'error',
-        event: 'whatsapp_test_mode_stage_update_failed',
-        request,
-        statusCode: 500,
-        details: {
-          trigger: 'manual-whatsapp-send',
-          error: error instanceof Error ? error.message : 'Error desconocido.',
-        },
-      }).catch(() => {})
     })
 
     response.json({

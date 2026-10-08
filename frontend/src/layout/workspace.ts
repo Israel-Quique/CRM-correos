@@ -1,4 +1,4 @@
-﻿// @ts-nocheck
+// @ts-nocheck
 
 import {
   renderChatView,
@@ -8,9 +8,11 @@ import {
   renderInternationalContactPackagesView,
   renderInternationalPackagesView,
   renderInternationalPipelineView,
+  renderInternationalScannerView,
   renderLogsView,
   renderProntsView,
   renderUsersView,
+  renderSettingsView,
 } from '../views'
 export const renderWorkspace = (ctx: any) => {
   const {
@@ -104,13 +106,15 @@ export const renderWorkspace = (ctx: any) => {
     if (state.activeView === 'pronts-nacional' || state.activeView === 'pronts-internacional') return renderProntsView(ctx)
     if (state.activeView === 'ems') return renderEmsView(ctx)
     if (state.activeView === 'internacionales') return renderInternationalPackagesView(ctx)
+    if (state.activeView === 'internacionales-pipeline') return renderInternationalScannerView(ctx)
     if (state.activeView === 'internacionales-paquetes') return renderInternationalContactPackagesView(ctx)
-    if (state.activeView === 'internacionales-pipeline') return renderInternationalPipelineView(ctx)
+    if (state.activeView === 'internacionales-tablero') return renderInternationalPipelineView(ctx)
     if (state.activeView === 'chat') return renderChatView(ctx)
     if (state.activeView === 'contactos') return renderContactsView(ctx)
     if (state.activeView === 'agrupaciones') return renderGroupsView(ctx)
     if (state.activeView === 'usuarios') return renderUsersView(ctx)
     if (state.activeView === 'logs') return renderLogsView(ctx)
+    if (state.activeView === 'configuraciones') return renderSettingsView(ctx)
 
     return '<section class="section-panel is-visible"></section>'
   }
@@ -121,6 +125,4 @@ export const renderWorkspace = (ctx: any) => {
     </main>
   `
 }
-
-
 

@@ -1,4 +1,4 @@
-﻿// @ts-nocheck
+// @ts-nocheck
 
 export const renderSidebar = (ctx: any) => {
   const {
@@ -24,6 +24,7 @@ export const renderSidebar = (ctx: any) => {
     getEmsPhaseLabel,
     getEmsPhaseDescription,
     getChatContacts,
+    getAutoReplyPausedContacts,
     isAutoCreatedChatContact,
     getConversationMessagesChronological,
     renderConversationMessageMedia,
@@ -78,11 +79,12 @@ export const renderSidebar = (ctx: any) => {
           title="${state.isSidebarCollapsed ? 'Desplegar sidebar' : 'Replegar sidebar'}"
         >
           ${getBrandIcon()}
+          CRM
         </button>
         <div class="brand-copy">
           <p>CRM Omnicanal</p>
           <strong>Conversa OS</strong>
-        </div>
+        </div>En
       </div>
     </div>
 
@@ -113,7 +115,9 @@ export const renderSidebar = (ctx: any) => {
               <div class="menu-items">
                 ${group.items
                   .map(
-                    (item) => `
+                    (item) => {
+                      const pausedCount = item.view === 'chat' ? getAutoReplyPausedContacts().length : 0
+                      return `
                       <a
                         class="menu-item ${item.view === state.activeView ? 'is-current' : ''}"
                         href="${escapeHtml(getViewHref(item.view))}"
@@ -122,8 +126,10 @@ export const renderSidebar = (ctx: any) => {
                         aria-label="${item.label}"
                       >
                         ${item.label}
+                        ${pausedCount > 0 ? `<span class="menu-item-badge">${pausedCount}</span>` : ''}
                       </a>
-                    `,
+                    `
+                    },
                   )
                   .join('')}
                 ${
@@ -153,15 +159,19 @@ export const renderSidebar = (ctx: any) => {
                       <div class="menu-flyout-items">
                         ${group.items
                           .map(
-                            (item) => `
+                            (item) => {
+                              const pausedCount = item.view === 'chat' ? getAutoReplyPausedContacts().length : 0
+                              return `
                               <a
                                 class="menu-flyout-item ${item.view === state.activeView ? 'is-current' : ''}"
                                 href="${escapeHtml(getViewHref(item.view))}"
                                 data-view="${item.view}"
                               >
                                 ${item.label}
+                                ${pausedCount > 0 ? `<span class="menu-item-badge">${pausedCount}</span>` : ''}
                               </a>
-                            `,
+                            `
+                            },
                           )
                           .join('')}
                         ${

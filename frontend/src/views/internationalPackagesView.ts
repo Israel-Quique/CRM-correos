@@ -79,6 +79,13 @@ export const renderInternationalPackagesView = (ctx: any) => {
         <p class="international-helper">Seguimiento de paquetes consumidos desde la API externa.</p>
       </div>
       <div class="international-actions">
+        <button
+          class="secondary-btn"
+          id="tracking-api-refresh"
+          type="button"
+          ${state.trackingApiState === 'loading' ? 'disabled' : ''}
+        >${state.trackingApiState === 'loading' ? 'Actualizando...' : 'Actualizar paquetes'}</button>
+
         <label class="field-control compact-field">
           <span>Estado</span>
           <select id="tracking-api-state-filter">
@@ -133,7 +140,6 @@ export const renderInternationalPackagesView = (ctx: any) => {
 
         <form id="tracking-api-code-form" class="international-code-search">
           <label class="field-control compact-field">
-            <span>Código</span>
             <span>Codigo</span>
             <input
               id="tracking-api-code-search"
@@ -147,7 +153,6 @@ export const renderInternationalPackagesView = (ctx: any) => {
               ? '<button class="secondary-btn" id="tracking-api-code-clear" type="button">Limpiar</button>'
               : ''
           }
-          <button class="secondary-btn" type="submit">Buscar código</button>
           <button class="secondary-btn" type="submit">Buscar codigo</button>
         </form>
       </div>
@@ -156,6 +161,11 @@ export const renderInternationalPackagesView = (ctx: any) => {
     ${
       state.trackingApiError
         ? `<div class="notice-banner notice-banner-error">${escapeHtml(state.trackingApiError)}</div>`
+        : ''
+    }
+    ${
+      state.trackingApiWarning
+        ? `<div class="notice-banner">${escapeHtml(state.trackingApiWarning)}</div>`
         : ''
     }
 
@@ -167,7 +177,7 @@ export const renderInternationalPackagesView = (ctx: any) => {
             ${
               state.trackingApiState === 'loading'
                 ? 'Cargando datos en tiempo real...'
-                : `${state.trackingApiTotalItems || state.trackingApiPackages.length} registros sincronizados${state.trackingApiSyncedAt ? ` · ${formatConversationTimestamp(state.trackingApiSyncedAt)}` : ''}`
+                : `${state.trackingApiTotalItems || state.trackingApiPackages.length} registros ${state.trackingApiWarning ? 'en respaldo local' : 'sincronizados desde SITRA'}${state.trackingApiSyncedAt ? ` · ${formatConversationTimestamp(state.trackingApiSyncedAt)}` : ''}`
             }
           </small>
         </div>

@@ -8,17 +8,19 @@ export default function registerDashboardRoutes(app, deps) {
   app.get('/api/dashboard', authMiddleware, async (request, response) => {
   try {
     await ensureDatabaseReady()
-    await maybeStartTestModeConversation(request).catch(async (error) => {
-      await writeSystemLog({
-        level: 'error',
-        event: 'whatsapp_test_mode_auto_start_failed',
-        request,
-        statusCode: 500,
-        details: {
-          error: error instanceof Error ? error.message : 'Error desconocido.',
-        },
-      }).catch(() => {})
-    })
+    if (process.env.WHATSAPP_AUTO_START_ON_DASHBOARD === 'true') {
+      await maybeStartTestModeConversation(request).catch(async (error) => {
+        await writeSystemLog({
+          level: 'error',
+          event: 'whatsapp_test_mode_auto_start_failed',
+          request,
+          statusCode: 500,
+          details: {
+            error: error instanceof Error ? error.message : 'Error desconocido.',
+          },
+        }).catch(() => {})
+      })
+    }
 
     const [
       contactsResult,

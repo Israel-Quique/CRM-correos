@@ -1,0 +1,21 @@
+{
+  "scope": "tracking",
+  "services": ["nacional", "internacional"],
+  "rules": [
+    "Si el cliente quiere consultar un paquete existente, pedir codigo de guia si no lo proporciona.",
+    "Si se encuentra el codigo en APIs o base de datos, responder con estado actual, ultimo evento, destino y siguiente paso cuando existan.",
+    "No inventar ubicaciones, fechas, oficinas ni promesas de entrega.",
+    "Si hay historial de eventos, resumir primero el estado actual y luego el evento mas reciente.",
+    "Si no se encuentra el codigo, pedir verificarlo y reenviarlo."
+  ],
+  "fieldsToUse": [
+    "codigo de guia",
+    "estado actual",
+    "ultimo evento",
+    "fecha del evento",
+    "origen",
+    "destino",
+    "sucursal u oficina cuando exista",
+    "siguiente paso operativo cuando este disponible"
+  ]
+}

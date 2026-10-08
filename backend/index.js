@@ -1,6 +1,7 @@
 import crypto from 'node:crypto'
-import { existsSync } from 'node:fs'
-import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { existsSync, readFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { appendFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import cors from 'cors'
@@ -9,16 +10,57 @@ import express from 'express'
 import multer from 'multer'
 import { parsePhoneNumberFromString } from 'libphonenumber-js'
 import pg from 'pg'
+import {
+  calculateEmsTariff,
+  buildEmsWeightSpecificationsPrompt,
+  extractEmsPackageDimensions,
+  extractEmsWeightKg as extractTariffWeightKg,
+  getEmsCalculatorEndpoint,
+  getEmsInternationalZone,
+  inferEmsCalculatorCategory,
+  inferEmsCategoryFromPendingPrompt,
+  inferEmsCalculatorDestinationCode,
+  inferEmsInternationalDestination,
+  inferEmsQuoteCategory,
+  isFreshEmsRouteQuoteRequest,
+  isEmsInternationalShipmentRequest,
+  isEmsWeightReply,
+  isEmsWeightReplyMissingUnit,
+  shouldForceEmsForWeightLimit,
+} from './services/ems-calculator.js'
+import { isPackageTrackingRequest, selectLatestPackageEntry } from './services/whatsapp-intent.js'
+import {
+  buildPackageEventSignature,
+  buildPackageReturnToOriginMessage,
+  getPackageAutomationNextDelayMs,
+  getWhatsAppTrackingRetrySchedule,
+  getNewPackageWelcomePhoneCandidates,
+  getTrackingPackageRecipientPhoneCandidates,
+  isEligibleNewPackageWelcomeEntry,
+  isPackageEventNotificationEligible,
+  isPackageReturnToOriginEvent,
+  isPackagePageOutsideRecentWindow,
+  migrateWelcomeIntervalSetting,
+  parsePackageTimestamp,
+  resolveAutomationBooleanSetting,
+  resolveContactPackageStage,
+  runAndReschedule,
+  selectPackageNotificationRecipients,
+  WHATSAPP_TRACKING_RETRY_INTERVAL_MS,
+  WHATSAPP_TRACKING_RETRY_POLL_INTERVAL_MS,
+} from './services/whatsapp-package-automation.js'
 
 const { Pool } = pg
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
-dotenv.config({ path: path.join(__dirname, '..', '.env') })
+dotenv.config({ path: path.join(__dirname, '..', '.env'), quiet: true })
 const app = express()
 const port = Number(process.env.PORT || 3001)
 const connectionString = process.env.DATABASE_URL
 const mediaStorageDir = path.join(__dirname, 'media')
 const logsStorageDir = path.join(__dirname, 'logs')
+const knowledgeDir = path.join(__dirname, 'knowledge')
+const ipsImportDir = path.join(__dirname, 'imports')
 const clientDistDir = path.join(__dirname, '..', 'frontend', 'dist')
 const clientIndexPath = path.join(clientDistDir, 'index.html')
 const upload = multer({
@@ -27,6 +69,104 @@ const upload = multer({
     fileSize: 16 * 1024 * 1024,
   },
 })
+const ipsImportUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_request, _file, callback) => {
+      mkdir(ipsImportDir, { recursive: true })
+        .then(() => callback(null, ipsImportDir))
+        .catch((error) => callback(error, ipsImportDir))
+    },
+    filename: (_request, file, callback) => {
+      const extension = path.extname(file.originalname).toLowerCase()
+      callback(null, `ips-${Date.now()}-${crypto.randomBytes(6).toString('hex')}${extension}`)
+    },
+  }),
+  limits: { fileSize: 512 * 1024 * 1024 },
+  fileFilter: (_request, file, callback) => {
+    const extension = path.extname(file.originalname).toLowerCase()
+    callback(extension === '.json' || extension === '.ndjson' ? null : new Error('Solo se admite JSON o NDJSON.'), true)
+  },
+})
+
+let ipsImportStatus = {
+  state: 'idle',
+  filename: '',
+  total: 0,
+  message: '',
+  startedAt: null,
+  completedAt: null,
+}
+
+const readKnowledgeJson = (filename, fallback = {}) => {
+  try {
+    const filePath = path.join(knowledgeDir, filename)
+    if (!existsSync(filePath)) return fallback
+    return {
+      ...fallback,
+      ...JSON.parse(readFileSync(filePath, 'utf8')),
+    }
+  } catch (error) {
+    console.warn(`No se pudo cargar knowledge/${filename}:`, error?.message ?? error)
+    return fallback
+  }
+}
+
+const botKnowledge = {
+  deliveryExpress: readKnowledgeJson('delivery-express.json', {
+    serviceKey: 'delivery_express',
+    name: 'Delivery Express',
+    limits: { maxWeightKg: 5 },
+    coverage: { provinceKeywords: ['provincia', 'comunidad', 'municipio'] },
+    modes: {
+      puerta_a_puerta: { label: 'puerta a puerta' },
+      puerta_a_ventanilla: { label: 'puerta a ventanilla' },
+      ventanilla_a_ventanilla: { label: 'ventanilla a ventanilla' },
+    },
+  }),
+  ems: readKnowledgeJson('ems.json', {
+    serviceKey: 'ems',
+    name: 'EMS Nacional e Internacional',
+  }),
+  tracking: readKnowledgeJson('tracking.json', {}),
+  responses: readKnowledgeJson('agent-responses.json', {}),
+}
+
+const defaultCorsOrigins = ['http://localhost:5173', process.env.VITE_API_URL || 'http://localhost:3001']
+const allowedCorsOrigins = (process.env.CORS_ORIGIN || defaultCorsOrigins.join(','))
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean)
+const allowedFrontendPorts = (process.env.CORS_FRONTEND_PORTS || '5173,5174')
+  .split(',')
+  .map((port) => port.trim())
+  .filter(Boolean)
+const isAllowedCorsOrigin = (origin) => {
+  if (!origin || allowedCorsOrigins.includes(origin)) {
+    return true
+  }
+
+  try {
+    const { protocol, port } = new URL(origin)
+    return ['http:', 'https:'].includes(protocol) && allowedFrontendPorts.includes(port)
+  } catch {
+    return false
+  }
+}
+
+// These parsers must run before any route so JSON request bodies are available.
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (isAllowedCorsOrigin(origin)) {
+        callback(null, true)
+        return
+      }
+
+      callback(new Error('Origen no permitido por CORS.'))
+    },
+  }),
+)
+app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || '1mb' }))
 
 // API responses are dynamic and session-aware, so we must avoid browser revalidation
 // turning JSON endpoints into 304 responses without a body.
@@ -72,62 +212,62 @@ const defaultProntsConfig = {
   received: {
     presetKey: 'received',
     systemPrompt:
-      'Eres un agente aduanero senior e IA oficial de logística internacional EMS Conversa OS. Tu misión es auditar declaraciones juradas CN22/CN23, verificar valores declarados, detectar posibles retenciones aduaneras por monto superior a $150 USD y validar que el destinatario tenga teléfono completo.',
+      'Eres un agente aduanero senior e IA oficial de logÃ­stica internacional EMS Conversa OS. Tu misiÃ³n es auditar declaraciones juradas CN22/CN23, verificar valores declarados, detectar posibles retenciones aduaneras por monto superior a $150 USD y validar que el destinatario tenga telÃ©fono completo.',
     userTemplate:
       'Audita el siguiente paquete ingresado:\n- Cliente: {cliente}\n- Tracking: {tracking}\n- Destino: {destino}\n- Peso: {peso}\n- Valor declarado: {valor}\n- Estado: {estado}\n- Grupo: {grupoNombre}',
     temperature: 0.2,
     action: 'Asignar Etiqueta IA y Notificar WhatsApp',
     sampleContactId: null,
     response:
-      '// Presiona "Ejecutar Simulación de Prompt" para probar el comportamiento de esta columna en tiempo real.',
+      '// Presiona "Ejecutar SimulaciÃ³n de Prompt" para probar el comportamiento de esta columna en tiempo real.',
   },
   regional: {
     presetKey: 'regional',
     systemPrompt:
-      'Eres un coordinador logístico EMS en regional. Confirmas que el paquete ya fue recibido en la regional, explicas el estado actual sin inventar tiempos y preparas al cliente para el siguiente movimiento operativo.',
+      'Eres un coordinador logÃ­stico EMS en regional. Confirmas que el paquete ya fue recibido en la regional, explicas el estado actual sin inventar tiempos y preparas al cliente para el siguiente movimiento operativo.',
     userTemplate:
-      'Genera una actualización para el paquete recibido en regional:\n- Cliente: {cliente}\n- Tracking: {tracking}\n- Destino: {destino}\n- Peso: {peso}\n- Valor declarado: {valor}\n- Estado: {estado}\n- Grupo: {grupoNombre}',
+      'Genera una actualizaciÃ³n para el paquete recibido en regional:\n- Cliente: {cliente}\n- Tracking: {tracking}\n- Destino: {destino}\n- Peso: {peso}\n- Valor declarado: {valor}\n- Estado: {estado}\n- Grupo: {grupoNombre}',
     temperature: 0.3,
     action: 'Asignar Etiqueta IA y Notificar WhatsApp',
     sampleContactId: null,
     response:
-      '// Presiona "Ejecutar Simulación de Prompt" para probar el comportamiento de esta columna en tiempo real.',
+      '// Presiona "Ejecutar SimulaciÃ³n de Prompt" para probar el comportamiento de esta columna en tiempo real.',
   },
   transit: {
     presetKey: 'transit',
     systemPrompt:
-      'Eres un asistente inteligente de seguimiento aéreo internacional. Analizas rutas de despacho, congestiones en aeropuertos hub y notificas estimaciones de llegada ETA al cliente.',
+      'Eres un asistente inteligente de seguimiento aÃ©reo internacional. Analizas rutas de despacho, congestiones en aeropuertos hub y notificas estimaciones de llegada ETA al cliente.',
     userTemplate:
-      'Calcula la predicción de tránsito para el paquete en tránsito:\n- Guía EMS: {tracking}\n- Destinatario: {cliente}\n- Destino Final: {destino}\n- Grupo: {grupoNombre}',
+      'Calcula la predicciÃ³n de trÃ¡nsito para el paquete en trÃ¡nsito:\n- GuÃ­a EMS: {tracking}\n- Destinatario: {cliente}\n- Destino Final: {destino}\n- Grupo: {grupoNombre}',
     temperature: 0.4,
     action: 'Asignar Etiqueta IA y Notificar WhatsApp',
     sampleContactId: null,
     response:
-      '// Presiona "Ejecutar Simulación de Prompt" para probar el comportamiento de esta columna en tiempo real.',
+      '// Presiona "Ejecutar SimulaciÃ³n de Prompt" para probar el comportamiento de esta columna en tiempo real.',
   },
   courier: {
     presetKey: 'courier',
     systemPrompt:
-      'Eres un coordinador de reparto EMS. Comunicas que el paquete fue asignado al cartero y acompañas al cliente hasta la entrega, sin prometer horarios exactos.',
+      'Eres un coordinador de reparto EMS. Comunicas que el paquete fue asignado al cartero y acompaÃ±as al cliente hasta la entrega, sin prometer horarios exactos.',
     userTemplate:
-      'Genera una actualización para un paquete asignado a cartero:\n- Cliente: {cliente}\n- Tracking: {tracking}\n- Destino: {destino}\n- Estado: {estado}\n- Grupo: {grupoNombre}',
+      'Genera una actualizaciÃ³n para un paquete asignado a cartero:\n- Cliente: {cliente}\n- Tracking: {tracking}\n- Destino: {destino}\n- Estado: {estado}\n- Grupo: {grupoNombre}',
     temperature: 0.3,
-    action: 'Notificar salida a reparto y preparar confirmación',
+    action: 'Notificar salida a reparto y preparar confirmaciÃ³n',
     sampleContactId: null,
     response:
-      '// Presiona "Ejecutar Simulación de Prompt" para probar el comportamiento de esta columna en tiempo real.',
+      '// Presiona "Ejecutar SimulaciÃ³n de Prompt" para probar el comportamiento de esta columna en tiempo real.',
   },
   delivered: {
     presetKey: 'delivered',
     systemPrompt:
-      'Eres el encargado de calidad y satisfacción al cliente de Conversa OS. Verificas acuses de recibo digital, solicitas valoración de 1 a 5 estrellas y registras la entrega con éxito.',
+      'Eres el encargado de calidad y satisfacciÃ³n al cliente de Conversa OS. Verificas acuses de recibo digital, solicitas valoraciÃ³n de 1 a 5 estrellas y registras la entrega con Ã©xito.',
     userTemplate:
-      'Procesa la confirmación de entrega para:\n- Cliente: {cliente}\n- Guía EMS: {tracking}\n- Destino: {destino}\n- Valor: {valor}\n- Estado: {estado}\n\nGenera un mensaje de cierre amable para WhatsApp.',
+      'Procesa la confirmaciÃ³n de entrega para:\n- Cliente: {cliente}\n- GuÃ­a EMS: {tracking}\n- Destino: {destino}\n- Valor: {valor}\n- Estado: {estado}\n\nGenera un mensaje de cierre amable para WhatsApp.',
     temperature: 0.5,
-    action: 'Mover Automáticamente a Siguiente Estado',
+    action: 'Mover AutomÃ¡ticamente a Siguiente Estado',
     sampleContactId: null,
     response:
-      '// Presiona "Ejecutar Simulación de Prompt" para probar el comportamiento de esta columna en tiempo real.',
+      '// Presiona "Ejecutar SimulaciÃ³n de Prompt" para probar el comportamiento de esta columna en tiempo real.',
   },
   cancelled: {
     presetKey: 'cancelled',
@@ -147,11 +287,11 @@ const defaultPipelineConfig = {
   columns: {
     received: {
       title: 'Recibido Origen',
-      helper: 'Ingresados o en recepción inicial',
+      helper: 'Ingresados o en recepciÃ³n inicial',
     },
     transit: {
       title: 'En Camino',
-      helper: 'En tránsito hacia el destino final',
+      helper: 'En trÃ¡nsito hacia el destino final',
     },
     regional: {
       title: 'Recibido Destino',
@@ -175,15 +315,15 @@ const defaultPipelineConfig = {
 
 const whatsappDefaults = {
   accessToken: process.env.WHATSAPP_META_ACCESS_TOKEN?.trim() ?? '',
-  phoneNumberId: process.env.WHATSAPP_META_PHONE_NUMBER_ID?.trim() ?? '1208373325701350',
+  phoneNumberId: process.env.WHATSAPP_META_PHONE_NUMBER_ID?.trim() ?? '',
   businessAccountId: process.env.WHATSAPP_META_BUSINESS_ACCOUNT_ID?.trim() ?? '',
   apiVersion: process.env.WHATSAPP_META_API_VERSION?.trim() ?? 'v23.0',
-  senderNumber: process.env.WHATSAPP_META_SENDER_NUMBER?.trim() ?? '+59169670289',
+  senderNumber: process.env.WHATSAPP_META_SENDER_NUMBER?.trim() ?? '',
   testModeEnabled:
-    process.env.WHATSAPP_TEST_MODE == null ? true : process.env.WHATSAPP_TEST_MODE === 'true',
-  testModeNumber: process.env.WHATSAPP_TEST_MODE_NUMBER?.trim() ?? '+59164229403',
+    process.env.WHATSAPP_TEST_MODE == null ? false : process.env.WHATSAPP_TEST_MODE === 'true',
+  testModeNumber: process.env.WHATSAPP_TEST_MODE_NUMBER?.trim() ?? '',
   webhookVerifyToken:
-    process.env.WHATSAPP_META_WEBHOOK_VERIFY_TOKEN?.trim() ?? crypto.randomBytes(12).toString('hex'),
+    process.env.WHATSAPP_META_WEBHOOK_VERIFY_TOKEN?.trim() ?? '',
 }
 
 const aiDefaults = {
@@ -231,10 +371,11 @@ const aiDefaults = {
 
 const getTrackingApiDefaults = () => ({
   baseUrl: process.env.TRACKING_API_URL?.trim() ?? 'http://172.65.10.55:8103',
+  fallbackBaseUrl: process.env.TRACKING_API_FALLBACK_URL?.trim() ?? 'http://172.65.10.55:8103',
   token:
     process.env.TRACKING_SQLSERVER_TOKEN?.trim() ??
     process.env.TRACKING_API_TOKEN?.trim() ??
-    '2|FDN7orInEH6N2OprbvS0m0Xy6TkK3yvIhYjm1uwJ4e44bd99',
+    '',
 })
 
 const cloneJson = (value) => JSON.parse(JSON.stringify(value))
@@ -247,7 +388,7 @@ const getContactPackagesApiDefaults = () => ({
     process.env.PAQUETES_CONTACTOS_API_TOKEN?.trim() ??
     process.env.TRACKING_SQLSERVER_TOKEN?.trim() ??
     process.env.TRACKING_API_TOKEN?.trim() ??
-    'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwOlwvXC9kZXYuY29ycmVvcy5nb2IuYm86MTgxMDAiLCJhdWQiOiJib2xpcG9zdC1kaXJlY2Npb25lcy1kZXN0aW5vIiwic3ViIjoiMiIsImp0aSI6IjhiMmM1YzM0YzFkZDkxODU3MTQ5Y2Q1YmVlYTM4M2MzYmMwMjMxOGJkYWI1NzRiZmFmNDgzYjAyMGRmN2Y1MmQiLCJuYW1lIjoiUG9zdG1hbiBwYXF1ZXRlcyBjb250YWN0b3MiLCJpYXQiOjE3ODczMzMxOTR9._6br-DyMNSkMen2NN2qBUouWjRlwk6A6KlUaYN1xcEQ',
+    '',
 })
 
 const getStoredContactPackageCode = (row) => {
@@ -258,7 +399,7 @@ const getStoredContactPackageCode = (row) => {
 
 const mapStoredContactToContactPackage = (row) => {
   const code = getStoredContactPackageCode(row)
-  const destination = normalizeReference(row?.company).replace(/^Paquetes-Contactos API\s*·\s*/i, '')
+  const destination = normalizeReference(row?.company).replace(/^Paquetes-Contactos API\s*Â·\s*/i, '')
   const whatsappProfile = (Array.isArray(row?.social_profiles) ? row.social_profiles : []).find(
     (profile) => normalizeReference(profile?.channel).toLowerCase() === 'whatsapp',
   )
@@ -293,7 +434,7 @@ const mapStoredContactToContactPackage = (row) => {
 
 const mapStoredContactToTrackingPackage = (row) => {
   const code = getStoredContactPackageCode(row)
-  const destination = normalizeReference(row?.company).replace(/^Tracking API\s*·\s*/i, '')
+  const destination = normalizeReference(row?.company).replace(/^Tracking API\s*Â·\s*/i, '')
   const whatsappProfile = (Array.isArray(row?.social_profiles) ? row.social_profiles : []).find(
     (profile) => normalizeReference(profile?.channel).toLowerCase() === 'whatsapp',
   )
@@ -341,6 +482,39 @@ const fetchStoredTrackingPackagesPage = async ({ page = 1, perPage = 10 } = {}) 
   const safePerPage = Math.min(Math.max(1, Number.parseInt(String(perPage), 10) || 10), 200)
   const offset = (safePage - 1) * safePerPage
 
+  const [trackingItemsResult, trackingStatsResult] = await Promise.all([
+    pool.query(
+      `
+        select payload
+        from international_tracking_packages
+        order by updated_at desc, package_code
+        limit $1 offset $2;
+      `,
+      [safePerPage, offset],
+    ),
+    pool.query(`
+      select count(*)::integer as total, max(updated_at) as cached_at
+      from international_tracking_packages;
+    `),
+  ])
+  const trackingTotal = Number(trackingStatsResult.rows[0]?.total ?? 0)
+  if (trackingTotal > 0) {
+    const totalPages = Math.max(1, Math.ceil(trackingTotal / safePerPage))
+    return {
+      data: trackingItemsResult.rows.map((row) => row.payload),
+      paginacion: {
+        total_registros: trackingTotal,
+        pagina_actual: safePage,
+        por_pagina: safePerPage,
+        ultima_pagina: totalPages,
+        desde: offset + 1,
+        hasta: Math.min(offset + safePerPage, trackingTotal),
+      },
+      source: 'local-db',
+      cachedAt: trackingStatsResult.rows[0]?.cached_at ?? null,
+    }
+  }
+
   const [itemsResult, countResult] = await Promise.all([
     pool.query(
       `
@@ -358,6 +532,10 @@ const fetchStoredTrackingPackagesPage = async ({ page = 1, perPage = 10 } = {}) 
       where segment ilike '%Tracking API%';
     `),
   ])
+  const latestContactUpdate = itemsResult.rows.reduce((latest, row) => {
+    const updatedAt = row?.updated_at ? new Date(row.updated_at).getTime() : 0
+    return updatedAt > latest ? updatedAt : latest
+  }, 0)
 
   const total = Number(countResult.rows[0]?.total ?? 0)
   const totalPages = Math.max(1, Math.ceil(total / safePerPage))
@@ -373,6 +551,100 @@ const fetchStoredTrackingPackagesPage = async ({ page = 1, perPage = 10 } = {}) 
       hasta: Math.min(offset + safePerPage, total),
     },
     source: 'local-db',
+    cachedAt: latestContactUpdate ? new Date(latestContactUpdate).toISOString() : null,
+  }
+}
+
+const fetchStoredTrackingPackagesCatalog = async () => {
+  await ensureDatabaseReady()
+  const result = await pool.query(
+    `
+      select payload, max(updated_at) over () as cached_at
+      from international_tracking_packages
+      order by updated_at desc, package_code;
+    `,
+  )
+  if (result.rows.length > 0) {
+    return {
+      data: result.rows.map((row) => row.payload),
+      total: result.rows.length,
+      cachedAt: result.rows[0]?.cached_at ?? null,
+      source: 'local-db',
+    }
+  }
+
+  const fallback = await fetchStoredTrackingPackagesPage({ page: 1, perPage: 200 })
+  return {
+    data: fallback.data,
+    total: fallback.paginacion.total_registros,
+    cachedAt: fallback.cachedAt,
+    source: fallback.source,
+  }
+}
+
+const fetchStoredInternationalTrackingPackageByCode = async (packageCode) => {
+  const normalizedCode = normalizeReference(packageCode).toUpperCase()
+  if (!normalizedCode) return null
+
+  await ensureDatabaseReady()
+  const result = await pool.query(
+    `
+      select payload
+      from international_tracking_packages
+      where upper(package_code) = $1
+      order by updated_at desc
+      limit 1;
+    `,
+    [normalizedCode],
+  )
+
+  return result.rows[0]?.payload ?? null
+}
+
+const fetchExactTrackingPackageMatch = async ({ url, headers, code }) => {
+  let successfulLookup = false
+  let lastErrorStatus = null
+  let successfulUrl = null
+  const lookupUrls = [url]
+  const fallbackUrl = new URL('/api/tracking/paquetes', getTrackingApiDefaults().fallbackBaseUrl)
+  if (!lookupUrls.some((candidate) => candidate.origin === fallbackUrl.origin && candidate.pathname === fallbackUrl.pathname)) {
+    lookupUrls.push(fallbackUrl)
+  }
+
+  for (const lookupUrl of lookupUrls) {
+    for (const queryParam of ['query', 'q', 'codigo_s10']) {
+      const result = await fetchExactPackageCodeMatches({
+        url: lookupUrl,
+        headers,
+        queryParam,
+        code,
+        timeoutMs: 8000,
+      })
+      if (!result.ok) {
+        lastErrorStatus = result.statusCode
+        if ([401, 403, 404].includes(result.statusCode)) break
+        continue
+      }
+
+      successfulLookup = true
+      successfulUrl = lookupUrl.toString()
+      const exactMatch = result.items.find((item) => getPackageCodeValuesForLookup(item).includes(code))
+      if (exactMatch) {
+        return {
+          item: exactMatch,
+          unavailable: false,
+          statusCode: result.statusCode,
+          url: successfulUrl,
+        }
+      }
+    }
+  }
+
+  return {
+    item: null,
+    unavailable: !successfulLookup,
+    statusCode: lastErrorStatus,
+    url: successfulUrl ?? lookupUrls.at(-1)?.toString() ?? url.toString(),
   }
 }
 
@@ -423,14 +695,24 @@ const getPackageEventsApiDefaults = () => ({
     'http://dev.correos.gob.bo:18100/api/paquetes-eventos',
   token:
     process.env.PAQUETES_EVENTOS_API_TOKEN?.trim() ??
-    'eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwOlwvXC9kZXYuY29ycmVvcy5nb2IuYm86MTgxMDAiLCJhdWQiOiJib2xpcG9zdC1kaXJlY2Npb25lcy1kZXN0aW5vIiwic3ViIjoiMTAsImp0aSI6IjU0NDE1OTNkYjM2MmExMjRlOThkYTQyZjNkMjgwNWE3NjZmZmZlZTk3ZTY2NzE1OWU3M2U1Y2FmNDYwN2Q4ZmUiLCJuYW1lIjoiRVZFTlRPUyBTSU9QIiwiaWF0IjoxNzg3NzU2ODQ5fQ.EKabodylKElq04t3EhXRwN7pxtAiWp5RuRvldZcFKq4',
+    process.env.PAQUETES_CONTACTOS_API_TOKEN?.trim() ??
+    process.env.TRACKING_SQLSERVER_TOKEN?.trim() ??
+    process.env.TRACKING_API_TOKEN?.trim() ??
+    '',
 })
+
+const hasDedicatedPackageEventsApiConfig = () =>
+  Boolean(
+    process.env.PAQUETES_EVENTOS_API_URL?.trim() &&
+      process.env.PAQUETES_EVENTOS_API_TOKEN?.trim(),
+  )
 
 const reloadLocalEnv = () => {
   try {
     dotenv.config({
       path: path.join(__dirname, '..', '.env'),
       override: true,
+      quiet: true,
     })
   } catch {
     // ignore env reload errors
@@ -444,6 +726,11 @@ const aiModelCache = new Map()
 const aiHealthCache = new Map()
 const contactPackagesCatalogCache = new Map()
 const packagePipelineSyncCache = new Map()
+let packageEventsRateLimitedUntil = 0
+let lastNewPackageWelcomeCheckAt = 0
+let lastRecentPackageEventCheckAt = 0
+let lastPackageEventChangeSyncAt = 0
+let lastPackageReconciliationCheckAt = Date.now()
 let initializationError = null
 const PACKAGE_CONTEXT_TTL_MS = 20_000
 const AI_MODEL_TTL_MS = 60_000
@@ -510,18 +797,86 @@ const writeSystemLog = async ({
   }
 }
 
-const hashPassword = (password) =>
-  crypto.scryptSync(password, 'crm-integrador-salt', 64).toString('hex')
+const hashPassword = (password) => {
+  const salt = crypto.randomBytes(16).toString('hex')
+  const hash = crypto.scryptSync(String(password), salt, 64).toString('hex')
+  return `scrypt$${salt}$${hash}`
+}
+
+const hashLegacyPassword = (password) =>
+  crypto.scryptSync(String(password), 'crm-integrador-salt', 64).toString('hex')
+
+const verifyPassword = (password, storedHash) => {
+  const hashValue = normalizeReference(storedHash)
+  const [, salt, hash] = hashValue.split('$')
+
+  if (hashValue.startsWith('scrypt$') && salt && hash) {
+    const candidate = crypto.scryptSync(String(password), salt, 64)
+    const expected = Buffer.from(hash, 'hex')
+    return expected.length === candidate.length && crypto.timingSafeEqual(expected, candidate)
+  }
+
+  return hashValue === hashLegacyPassword(password)
+}
+
+const sessionSecret = process.env.SESSION_SECRET || process.env.DATABASE_URL || 'crm-integrador-session-secret'
+const sessionMaxAgeMs = Number(process.env.SESSION_MAX_AGE_MS || 24 * 60 * 60 * 1000)
+
+const encodeSessionPart = (value) => Buffer.from(JSON.stringify(value)).toString('base64url')
+
+const signSessionPayload = (payload) =>
+  crypto
+    .createHmac('sha256', sessionSecret)
+    .update(payload)
+    .digest('base64url')
+
+const createSignedSessionToken = (session) => {
+  const payload = encodeSessionPart({
+    ...session,
+    expiresAt: new Date(Date.now() + sessionMaxAgeMs).toISOString(),
+  })
+  return `${payload}.${signSessionPayload(payload)}`
+}
+
+const readSignedSessionToken = (token) => {
+  const [payload, signature] = String(token ?? '').split('.')
+  if (!payload || !signature) return null
+
+  const expectedSignature = signSessionPayload(payload)
+  const signatureBuffer = Buffer.from(signature)
+  const expectedBuffer = Buffer.from(expectedSignature)
+
+  if (
+    signatureBuffer.length !== expectedBuffer.length ||
+    !crypto.timingSafeEqual(signatureBuffer, expectedBuffer)
+  ) {
+    return null
+  }
+
+  try {
+    const session = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'))
+    const expiresAt = new Date(session.expiresAt).getTime()
+
+    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+      return null
+    }
+
+    return session
+  } catch {
+    return null
+  }
+}
 
 const createSession = (user) => {
-  const token = crypto.randomBytes(24).toString('hex')
-  sessions.set(token, {
+  const session = {
     id: user.id,
     fullName: user.full_name,
     email: user.email,
     role: user.role_name,
     createdAt: new Date().toISOString(),
-  })
+  }
+  const token = createSignedSessionToken(session)
+  sessions.set(token, session)
   return token
 }
 
@@ -548,13 +903,15 @@ const getBearerToken = (request) => {
 
 const authMiddleware = (request, response, next) => {
   const token = getBearerToken(request)
+  const session = token ? sessions.get(token) ?? readSignedSessionToken(token) : null
 
-  if (!token || !sessions.has(token)) {
+  if (!token || !session) {
     response.status(401).json({ message: 'Sesion no valida. Inicia sesion nuevamente.' })
     return
   }
 
-  request.session = sessions.get(token)
+  sessions.set(token, session)
+  request.session = session
   request.sessionToken = token
   next()
 }
@@ -623,12 +980,12 @@ app.get('/api/tracking/paquetes', cors(), authMiddleware, async (request, respon
           forceRefresh: String(request.query.fresh ?? '').trim() === '1',
         })
       } catch (error) {
-        const fallbackPayload = await fetchStoredTrackingPackagesPage({ page: 1, perPage: 200 })
+        const fallbackPayload = await fetchStoredTrackingPackagesCatalog()
         payload = {
           data: fallbackPayload.data,
-          total: fallbackPayload.paginacion.total_registros,
-          cachedAt: new Date().toISOString(),
-          source: 'local-db',
+          total: fallbackPayload.total,
+          cachedAt: fallbackPayload.cachedAt,
+          source: fallbackPayload.source,
           warning: 'No se pudo consultar la API externa de tracking; se muestran datos locales sincronizados.',
           upstreamError: error instanceof Error ? error.message : 'Error desconocido.',
         }
@@ -671,7 +1028,45 @@ app.get('/api/tracking/paquetes', cors(), authMiddleware, async (request, respon
       payload = { raw: rawBody }
     }
 
-    response.status(upstreamResponse.status).json(payload)
+    if (!upstreamResponse.ok) {
+      const fallbackPayload = await fetchStoredTrackingPackagesPage({
+        page: request.query.page,
+        perPage: request.query.per_page,
+      })
+
+      response.json({
+        ...fallbackPayload,
+        warning:
+          upstreamResponse.status === 429
+            ? 'La API externa de tracking limito las consultas; se muestran datos locales sincronizados.'
+            : 'No se pudo consultar la API externa de tracking; se muestran datos locales sincronizados.',
+        upstreamStatus: upstreamResponse.status,
+        upstreamError:
+          payload?.message ||
+          payload?.error ||
+          `La API externa respondio con estado ${upstreamResponse.status}.`,
+      })
+      return
+    }
+
+    const payloadItems = getPaginatedPayloadItems(payload)
+    const requestedPage = Math.max(1, Number.parseInt(String(request.query.page), 10) || 1)
+    const requestedPerPage = Math.max(1, Number.parseInt(String(request.query.per_page), 10) || 100)
+    const effectivePerPage = Math.max(
+      1,
+      Number.parseInt(String(payload?.meta?.per_page ?? payload?.per_page ?? requestedPerPage), 10) || requestedPerPage,
+    )
+
+    response.status(upstreamResponse.status).json({
+      ...payload,
+      pagination: {
+        ...(payload?.pagination && typeof payload.pagination === 'object' ? payload.pagination : {}),
+        page: Number(payload?.meta?.page ?? requestedPage),
+        per_page: effectivePerPage,
+        has_more: payloadItems.length >= effectivePerPage,
+      },
+      source: 'tracking-api',
+    })
   } catch (error) {
     const fallbackPayload = await fetchStoredTrackingPackagesPage({
       page: request.query.page,
@@ -682,6 +1077,41 @@ app.get('/api/tracking/paquetes', cors(), authMiddleware, async (request, respon
       ...fallbackPayload,
       warning: 'No se pudo consultar la API externa de tracking; se muestran datos locales sincronizados.',
       upstreamError: error instanceof Error ? error.message : 'Error desconocido.',
+    })
+  }
+})
+
+app.get('/api/tracking/paquetes/:packageCode/eventos', cors(), authMiddleware, async (request, response) => {
+  const packageCode = normalizePackageCodeForLookup(request.params.packageCode)
+  if (!packageCode) {
+    response.status(400).json({ message: 'El codigo de seguimiento no es valido.' })
+    return
+  }
+
+  try {
+    const result = await fetchPackageEventsForCode(packageCode)
+    const data = Array.isArray(result?.data) ? result.data : []
+    const source = result?.source || (result?.statusCode >= 200 && result?.statusCode < 300 ? 'tracking-api' : '')
+
+    if (data.length === 0 && result?.error) {
+      response.status(502).json({
+        message: 'No se pudieron cargar los movimientos del paquete.',
+        warning: result.error,
+      })
+      return
+    }
+
+    response.json({
+      data,
+      total: data.length,
+      code: packageCode,
+      source: source || 'tracking-api',
+      warning: result?.error || null,
+    })
+  } catch (error) {
+    response.status(502).json({
+      message: 'No se pudieron cargar los movimientos del paquete.',
+      error: error instanceof Error ? error.message : 'Error desconocido.',
     })
   }
 })
@@ -708,12 +1138,16 @@ app.get('/api/internacionales/paquetes-contactos', cors(), authMiddleware, async
 
     upstreamUrl.search = searchParams.toString()
 
-    const upstreamResponse = await fetchJsonWithTimeout(upstreamUrl, {
-      headers: {
-        Authorization: `Bearer ${contactPackagesApiDefaults.token}`,
-        Accept: 'application/json',
+    const upstreamResponse = await fetchJsonWithTimeout(
+      upstreamUrl,
+      {
+        headers: {
+          Authorization: `Bearer ${contactPackagesApiDefaults.token}`,
+          Accept: 'application/json',
+        },
       },
-    })
+      Number.parseInt(process.env.CONTACT_PACKAGES_PAGE_TIMEOUT_MS || '8000', 10),
+    )
 
     const rawBody = await upstreamResponse.text()
     let payload = null
@@ -766,7 +1200,7 @@ const fetchAllContactPackagesCatalog = async ({ forceRefresh = false } = {}) => 
       Accept: 'application/json',
     },
     perPage: 200,
-    maxPages: 500,
+    maxPages: 2000,
     timeoutMs,
   })
     .then((items) =>
@@ -789,6 +1223,89 @@ const fetchAllContactPackagesCatalog = async ({ forceRefresh = false } = {}) => 
   return catalogPromise
 }
 
+const fetchRecentContactPackagesCatalog = async ({ lookbackMs } = {}) => {
+  reloadLocalEnv()
+  const contactPackagesApiDefaults = getContactPackagesApiDefaults()
+  const timeoutMs = Number.parseInt(process.env.CONTACT_PACKAGES_PAGE_TIMEOUT_MS || '8000', 10)
+  const maxPages = Math.max(
+    1,
+    Number.parseInt(process.env.PACKAGE_NEW_PACKAGE_WELCOME_MAX_PAGES || '5', 10) || 5,
+  )
+  const welcomeRecentWindowMs = Number.isFinite(WHATSAPP_NEW_PACKAGE_WELCOME_RECENT_MS)
+    ? Math.max(WHATSAPP_NEW_PACKAGE_WELCOME_RECENT_MS, 60 * 1000)
+    : 24 * 60 * 60 * 1000
+  const effectiveLookbackMs = Number.isFinite(lookbackMs)
+    ? Math.max(lookbackMs, welcomeRecentWindowMs)
+    : Math.max(PACKAGE_NEW_PACKAGE_WELCOME_LOOKBACK_MS, welcomeRecentWindowMs)
+  const cutoffMs = Date.now() - Math.max(effectiveLookbackMs, 60 * 1000)
+  const upstreamUrl = new URL(contactPackagesApiDefaults.endpoint)
+  upstreamUrl.searchParams.set('ordering', '-fecha_registro')
+
+  const items = await fetchAllPaginatedItems({
+    url: upstreamUrl,
+    headers: {
+      Authorization: `Bearer ${contactPackagesApiDefaults.token}`,
+      Accept: 'application/json',
+    },
+    perPage: 100,
+    maxPages,
+    timeoutMs,
+    throwOnFirstPageError: true,
+    stopWhen: (pageItems) => isPackagePageOutsideRecentWindow(
+      pageItems,
+      cutoffMs,
+      (item) => getPackageContextDateValue(item?.fecha_registro || item?.created_at || item?.fechaCreacion),
+    ),
+  })
+
+  return items.filter((item) => {
+    const itemTime = getPackageContextDateValue(item?.fecha_registro || item?.created_at || item?.fechaCreacion)
+    return Number.isFinite(itemTime) && itemTime > 0 && itemTime >= cutoffMs
+  })
+}
+
+const fetchRecentTrackingPackagesCatalog = async () => {
+  reloadLocalEnv()
+  const trackingApiDefaults = getTrackingApiDefaults()
+  const timeoutMs = Number.parseInt(process.env.TRACKING_PACKAGES_PAGE_TIMEOUT_MS || '8000', 10)
+  const maxPages = Math.max(
+    1,
+    Number.parseInt(process.env.PACKAGE_NEW_PACKAGE_WELCOME_MAX_PAGES || '5', 10) || 5,
+  )
+  const welcomeRecentWindowMs = Number.isFinite(WHATSAPP_NEW_PACKAGE_WELCOME_RECENT_MS)
+    ? Math.max(WHATSAPP_NEW_PACKAGE_WELCOME_RECENT_MS, 60 * 1000)
+    : 24 * 60 * 60 * 1000
+  const cutoffMs = Date.now() - Math.max(
+    PACKAGE_NEW_PACKAGE_WELCOME_LOOKBACK_MS,
+    welcomeRecentWindowMs,
+    60 * 1000,
+  )
+  const upstreamUrl = new URL('/api/tracking/paquetes', trackingApiDefaults.baseUrl)
+  upstreamUrl.searchParams.set('ordering', '-fecha_registro')
+
+  const items = await fetchAllPaginatedItems({
+    url: upstreamUrl,
+    headers: {
+      Authorization: `Bearer ${trackingApiDefaults.token}`,
+      Accept: 'application/json',
+    },
+    perPage: 100,
+    maxPages,
+    timeoutMs,
+    throwOnFirstPageError: true,
+    stopWhen: (pageItems) => isPackagePageOutsideRecentWindow(
+      pageItems,
+      cutoffMs,
+      (item) => getPackageContextDateValue(item?.fecha_registro || item?.created_at || item?.fechaCreacion),
+    ),
+  })
+
+  return items.filter((item) => {
+    const itemTime = getPackageContextDateValue(item?.fecha_registro || item?.created_at || item?.fechaCreacion)
+    return Number.isFinite(itemTime) && itemTime > 0 && itemTime >= cutoffMs
+  })
+}
+
 app.get('/api/internacionales/paquetes-contactos/catalog', cors(), authMiddleware, async (_request, response) => {
   try {
     const catalog = await fetchAllContactPackagesCatalog()
@@ -806,18 +1323,111 @@ app.get('/api/internacionales/paquetes-contactos/catalog', cors(), authMiddlewar
   }
 })
 
-const fetchPackageEventsForCode = async (packageCode) => {
+const getTariffApiProfiles = () => [
+  {
+    serviceKey: 'delivery_express',
+    serviceName: 'TARIFARIO DELIVERY EXPRESS',
+    endpoint: process.env.DELIVERY_EXPRESS_TARIFF_API_URL?.trim() ?? '',
+    token: process.env.DELIVERY_EXPRESS_TARIFF_API_TOKEN?.trim() ?? '',
+  },
+  {
+    serviceKey: 'ems',
+    serviceName: 'TARIFARIO EMS NACIONAL',
+    endpoint: process.env.EMS_NATIONAL_TARIFF_API_URL?.trim() ?? '',
+    token: process.env.EMS_NATIONAL_TARIFF_API_TOKEN?.trim() ?? '',
+  },
+]
+
+const fetchStoredPackageEventsForCode = async (packageCode) => {
+  const normalizedCode = normalizePackageCodeForLookup(packageCode)
+  if (!normalizedCode) return []
+
+  await ensureDatabaseReady()
+
+  const result = await pool.query(
+    `
+      select details, created_at
+      from system_logs
+      where event in (
+          'package_event_observed',
+          'whatsapp_package_event_update_skipped',
+          'whatsapp_package_event_update_sent',
+          'whatsapp_new_package_welcome_sent'
+        )
+        and upper(coalesce(details->>'packageCode', '')) = $1
+      order by
+        coalesce(nullif(details->>'eventDate', '')::timestamptz, created_at) asc,
+        id asc;
+    `,
+    [normalizedCode],
+  )
+
+  const seen = new Set()
+
+  return result.rows
+    .map((row) => {
+      const details = row.details ?? {}
+      const signatureParts = normalizeReference(details.eventSignature).split('|')
+      const signatureLabel = signatureParts[2] || ''
+      const signatureDate = signatureParts.find((part) => /^\d{4}-\d{2}-\d{2}T/.test(part)) || ''
+      const signatureLocation = signatureParts[4] || ''
+      const eventDate = normalizeReference(details.eventDate) || signatureDate || row.created_at
+      const eventLabel = normalizeReference(details.eventLabel) || signatureLabel || 'Nuevo movimiento'
+      const eventLocation = normalizeReference(details.eventLocation) || signatureLocation || ''
+      const eventSignature =
+        normalizeReference(details.eventSignature) ||
+        `${eventLabel}|${eventLocation}|${eventDate}`
+
+      return {
+        codigo: normalizedCode,
+        codigo_s10: normalizedCode,
+        evento_api: eventLabel,
+        evento_original: eventLabel,
+        oficina: eventLocation,
+        ubicacion: eventLocation,
+        fecha: eventDate,
+        source: 'system_logs',
+        eventSignature,
+      }
+    })
+    .filter((event) => {
+      const key = normalizeReference(event.eventSignature)
+      if (!key || seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+}
+
+const fetchPackageEventsForCode = async (
+  packageCode,
+  { allowPagination = true, timeoutMs: requestedTimeoutMs } = {},
+) => {
   const normalizedCode = normalizePackageCodeForLookup(packageCode)
   const cacheKey = normalizedCode || 'all'
   const cachedEvents = getCachedValue(packageEventsCache, cacheKey)
   if (cachedEvents) {
     return cachedEvents
   }
+  if (Date.now() < packageEventsRateLimitedUntil) {
+    const storedEvents = await fetchStoredPackageEventsForCode(normalizedCode)
+    return {
+      data: storedEvents,
+      total: storedEvents.length,
+      cachedAt: new Date().toISOString(),
+      statusCode: 429,
+      error: 'La API de eventos esta temporalmente limitada; se reintentara en el siguiente ciclo.',
+      code: normalizedCode,
+      source: storedEvents.length > 0 ? 'system_logs' : 'remote-rate-limited',
+    }
+  }
 
   reloadLocalEnv()
 
   const packageEventsApiDefaults = getPackageEventsApiDefaults()
-  const timeoutMs = Number.parseInt(process.env.PACKAGE_EVENTS_CATALOG_TIMEOUT_MS || '30000', 10)
+  const timeoutMs =
+    Number.isFinite(requestedTimeoutMs) && requestedTimeoutMs > 0
+      ? requestedTimeoutMs
+      : Number.parseInt(process.env.PACKAGE_EVENTS_CATALOG_TIMEOUT_MS || '30000', 10)
   const baseUrl = new URL(packageEventsApiDefaults.endpoint)
   const headers = {
     Authorization: `Bearer ${packageEventsApiDefaults.token}`,
@@ -848,6 +1458,10 @@ const fetchPackageEventsForCode = async (packageCode) => {
     if (!response?.ok) {
       statusCode = response?.status ?? 502
       errorMessage = response ? `La API respondio con estado ${response.status}.` : 'No se obtuvo respuesta de la API de eventos.'
+      if (response?.status === 429) {
+        packageEventsRateLimitedUntil = Date.now() + 5 * 60 * 1000
+        break
+      }
       continue
     }
 
@@ -865,7 +1479,7 @@ const fetchPackageEventsForCode = async (packageCode) => {
     }
   }
 
-  if (!matchedItems.length && normalizedCode) {
+  if (!matchedItems.length && normalizedCode && allowPagination) {
     const paginatedItems = await fetchAllPaginatedItems({
       url: baseUrl,
       headers,
@@ -877,6 +1491,10 @@ const fetchPackageEventsForCode = async (packageCode) => {
     })
 
     matchedItems = paginatedItems.filter((item) => getPackageEventCodeValuesForLookup(item).includes(normalizedCode))
+  }
+
+  if (!matchedItems.length && normalizedCode) {
+    matchedItems = await fetchStoredPackageEventsForCode(normalizedCode)
   }
 
   const result = {
@@ -891,7 +1509,154 @@ const fetchPackageEventsForCode = async (packageCode) => {
   return setCachedValue(packageEventsCache, cacheKey, result, CONTACT_PACKAGES_CATALOG_TTL_MS)
 }
 
+const fetchRecentPackageEventCodes = async () => {
+  const result = await pool.query(`
+    select details->>'packageCode' as package_code, max(created_at) as last_activity_at
+    from system_logs
+    where event in (
+        'whatsapp_new_package_welcome_sent',
+        'whatsapp_package_event_update_sent',
+        'package_event_observed'
+      )
+      and created_at >= now() - interval '7 days'
+      and nullif(details->>'packageCode', '') is not null
+    group by details->>'packageCode'
+    order by last_activity_at desc
+    limit 200;
+  `)
+
+  return result.rows
+    .map((row) => normalizePackageCodeForLookup(row.package_code))
+    .filter(Boolean)
+    .slice(0, Number.parseInt(process.env.PACKAGE_RECENT_EVENT_CODE_LIMIT || '25', 10) || 25)
+}
+
+const fetchRecentContactPackageEventsByCode = async () => {
+  const codes = await fetchRecentPackageEventCodes()
+  if (codes.length === 0) {
+    return []
+  }
+
+  const contactPackagesApiDefaults = getContactPackagesApiDefaults()
+  const contactUrl = new URL(contactPackagesApiDefaults.endpoint)
+  const headers = {
+    Authorization: 'Bearer ' + contactPackagesApiDefaults.token,
+    Accept: 'application/json',
+  }
+  const timeoutMs = Number.parseInt(process.env.CONTACT_PACKAGES_PAGE_TIMEOUT_MS || '8000', 10)
+  const concurrency = Math.max(
+    1,
+    Math.min(Number.parseInt(process.env.PACKAGE_EVENTS_LOOKUP_CONCURRENCY || '3', 10) || 1, 3),
+  )
+  const events = []
+  let failedLookups = 0
+
+  for (let index = 0; index < codes.length; index += concurrency) {
+    const batch = codes.slice(index, index + concurrency)
+    const results = await Promise.all(
+      batch.map((code) =>
+        fetchExactPackageCodeMatches({
+          url: contactUrl,
+          headers,
+          queryParam: 'codigo',
+          code,
+          perPage: 20,
+          timeoutMs,
+        }).catch(() => ({ items: [] })),
+      ),
+    )
+
+    for (const result of results) {
+      if (!result?.ok) {
+        failedLookups += 1
+        continue
+      }
+      for (const item of result.items ?? []) {
+        const itemCodes = getPackageCodeValuesForLookup(item)
+        const itemEvents = Array.isArray(item?.eventos) ? item.eventos : []
+        events.push(
+          ...itemEvents.map((event) => ({
+            ...event,
+            codigo: event?.codigo ?? itemCodes[0],
+            codigo_s10: event?.codigo_s10 ?? itemCodes[0],
+          })),
+        )
+      }
+    }
+  }
+
+  if (failedLookups > 0) {
+    console.warn(
+      `Watcher WhatsApp: ${failedLookups} consulta(s) de paquetes-contactos no respondieron; ` +
+        'no se puede confirmar si existe un evento nuevo.',
+    )
+    await writeSystemLog({
+      event: 'whatsapp_package_event_source_unavailable',
+      statusCode: 502,
+      details: {
+        source: 'paquetes-contactos',
+        failedLookups,
+        requestedCodes: codes.length,
+      },
+    }).catch(() => {})
+  }
+
+  return events
+}
+
+const fetchRecentPackageEventsByCode = async () => {
+  if (!hasDedicatedPackageEventsApiConfig()) {
+    return { events: [], failures: [] }
+  }
+
+  const codes = await fetchRecentPackageEventCodes()
+  const timeoutMs = Number.parseInt(process.env.PACKAGE_EVENTS_PAGE_TIMEOUT_MS || '8000', 10)
+  const concurrency = Math.max(
+    1,
+    Math.min(Number.parseInt(process.env.PACKAGE_EVENTS_LOOKUP_CONCURRENCY || '3', 10) || 1, 3),
+  )
+  const events = []
+  const failures = []
+
+  for (let index = 0; index < codes.length; index += concurrency) {
+    const batch = codes.slice(index, index + concurrency)
+    const results = await Promise.all(
+      batch.map((code) =>
+        fetchPackageEventsForCode(code, { allowPagination: false, timeoutMs }).catch(() => ({
+          data: [],
+          code,
+        })),
+      ),
+    )
+    results.forEach((result) => {
+    if (result?.statusCode >= 400) {
+      failures.push({
+        code: result.code,
+        statusCode: result.statusCode,
+        error: result.error,
+      })
+    }
+    if (Array.isArray(result?.data)) {
+      events.push(...result.data)
+    }
+    })
+  }
+
+  return { events, failures }
+}
+
 const fetchAllPackageEventsCatalog = async ({ forceRefresh = false } = {}) => {
+  reloadLocalEnv()
+  if (!hasDedicatedPackageEventsApiConfig()) {
+    return {
+      data: [],
+      total: 0,
+      cachedAt: new Date().toISOString(),
+      skipped: true,
+      reason: 'dedicated-package-events-api-not-configured',
+    }
+  }
+
   const cacheKey = 'all'
   const cachedEvents = getCachedValue(packageEventsCache, cacheKey)
   if (!forceRefresh && cachedEvents) {
@@ -903,8 +1668,6 @@ const fetchAllPackageEventsCatalog = async ({ forceRefresh = false } = {}) => {
   if (!forceRefresh && pendingEvents) {
     return pendingEvents
   }
-
-  reloadLocalEnv()
 
   const packageEventsApiDefaults = getPackageEventsApiDefaults()
   const timeoutMs = Number.parseInt(process.env.PACKAGE_EVENTS_CATALOG_TIMEOUT_MS || '30000', 10)
@@ -918,7 +1681,7 @@ const fetchAllPackageEventsCatalog = async ({ forceRefresh = false } = {}) => {
     url: baseUrl,
     headers,
     perPage: 200,
-    maxPages: 500,
+    maxPages: 2000,
     timeoutMs,
   })
     .then((data) =>
@@ -939,6 +1702,73 @@ const fetchAllPackageEventsCatalog = async ({ forceRefresh = false } = {}) => {
 
   setCachedValue(packageEventsCache, inFlightCacheKey, catalogPromise, CONTACT_PACKAGES_CATALOG_TTL_MS)
   return catalogPromise
+}
+
+const fetchRecentPackageEventsCatalog = async ({ lookbackMs = PACKAGE_NEW_PACKAGE_WELCOME_LOOKBACK_MS } = {}) => {
+  reloadLocalEnv()
+
+  const contactItems = await fetchRecentContactPackageEventsByCode()
+  if (!hasDedicatedPackageEventsApiConfig()) {
+    return contactItems
+  }
+
+  const packageEventsApiDefaults = getPackageEventsApiDefaults()
+  const timeoutMs = Number.parseInt(process.env.PACKAGE_EVENTS_PAGE_TIMEOUT_MS || '8000', 10)
+  const maxPages = Math.max(
+    1,
+    Number.parseInt(process.env.PACKAGE_RECENT_EVENTS_MAX_PAGES || '10', 10) || 10,
+  )
+  const cutoffMs = Date.now() - (Number.isFinite(lookbackMs) ? Math.max(lookbackMs, 60 * 1000) : 60 * 60 * 1000)
+  const baseUrl = new URL(packageEventsApiDefaults.endpoint)
+  baseUrl.searchParams.set('ordering', '-fecha')
+
+  const headers = {
+    Authorization: `Bearer ${packageEventsApiDefaults.token}`,
+    Accept: 'application/json',
+  }
+
+  const items = await fetchAllPaginatedItems({
+    url: baseUrl,
+    headers,
+    perPage: 200,
+    maxPages,
+    timeoutMs,
+    stopWhen: (pageItems) =>
+      pageItems.some((item) => {
+        const eventTime = getPackageEventTimestampValue(item)
+        return Number.isFinite(eventTime) && eventTime > 0 && eventTime < cutoffMs
+      }),
+  }).catch(() => [])
+
+  const recentItems = items.filter((item) => {
+    const eventTime = getPackageEventTimestampValue(item)
+    return Number.isFinite(eventTime) && eventTime > 0 && eventTime >= cutoffMs
+  })
+
+  // The catalog can lag or become congested. Direct lookups keep recent
+  // notifications working for packages already known to the CRM.
+  const directLookup = await fetchRecentPackageEventsByCode()
+  const directItems = [...contactItems, ...directLookup.events]
+  const mergedItems = new Map()
+  for (const item of [...recentItems, ...directItems]) {
+    const key = [
+      ...getPackageEventCodeValuesForLookup(item),
+      normalizeReference(item?.id),
+      normalizeReference(item?.evento_id),
+      String(getPackageEventTimestampValue(item)),
+    ].join('|')
+    if (key) mergedItems.set(key, item)
+  }
+
+  return [...mergedItems.values()].filter((item) => {
+    const eventTime = getPackageEventTimestampValue(item)
+    const isDirectLookup = directItems.includes(item)
+    return (
+      Number.isFinite(eventTime) &&
+      eventTime > 0 &&
+      (isDirectLookup || eventTime >= cutoffMs)
+    )
+  })
 }
 
 const normalizeBoliviaTestNumber = (value) => {
@@ -1355,6 +2185,277 @@ const saveSettingsByKey = async (integrationKey, settings) => {
   return settings
 }
 
+const normalizeAutomationIntervalMs = (value, fallbackMs, { minMs = 60 * 1000, maxMs = 24 * 60 * 60 * 1000 } = {}) => {
+  const numericValue = Number(value)
+  if (!Number.isFinite(numericValue)) {
+    return fallbackMs
+  }
+
+  return Math.min(Math.max(Math.round(numericValue), minMs), maxMs)
+}
+
+const AUTOMATION_WELCOME_INTERVAL_SETTINGS_VERSION = 7
+const DEFAULT_WELCOME_INTERVAL_MS = 5 * 60 * 1000
+const DEFAULT_PACKAGE_RECONCILIATION_INTERVAL_MS = 30 * 60 * 1000
+
+const getStoredAutomationConfig = async () => {
+  let settings = await getStoredSettingsByKey('crm_automation_config')
+  const migration = migrateWelcomeIntervalSetting({
+    settings,
+    currentVersion: AUTOMATION_WELCOME_INTERVAL_SETTINGS_VERSION,
+    defaultIntervalMs: DEFAULT_WELCOME_INTERVAL_MS,
+  })
+  if (migration.changed) {
+    settings = migration.settings
+    await saveSettingsByKey('crm_automation_config', settings)
+    const aiAgentSettings = await getStoredSettingsByKey('crm_ai_agent')
+    await saveSettingsByKey('crm_ai_agent', {
+      ...aiAgentSettings,
+      enabled: true,
+    })
+  }
+
+  return {
+    automaticWelcome: resolveAutomationBooleanSetting({
+      storedValue: settings.automaticWelcome,
+      envValue: process.env.WHATSAPP_NEW_PACKAGE_WELCOME_ENABLED,
+    }),
+    automaticStatusUpdates: resolveAutomationBooleanSetting({
+      storedValue: settings.automaticStatusUpdates,
+      envValue: process.env.WHATSAPP_NEW_PACKAGE_WATCHER_ENABLED,
+      defaultValue: true,
+    }),
+    automaticReconciliation: resolveAutomationBooleanSetting({
+      storedValue: settings.automaticReconciliation,
+      defaultValue: true,
+    }),
+    aiAutoReply:
+      typeof settings.aiAutoReply === 'boolean'
+        ? settings.aiAutoReply
+        : process.env.AI_AUTO_REPLY !== 'false',
+    welcomeResponseIntervalMs: normalizeAutomationIntervalMs(
+      settings.welcomeResponseIntervalMs,
+      DEFAULT_WELCOME_INTERVAL_MS,
+      { minMs: 60 * 1000, maxMs: 6 * 60 * 60 * 1000 },
+    ),
+    eventChangeResponseIntervalMs: normalizeAutomationIntervalMs(
+      settings.eventChangeResponseIntervalMs,
+      Number.isFinite(PACKAGE_EVENT_CHANGE_SYNC_INTERVAL_MS)
+        ? Math.max(PACKAGE_EVENT_CHANGE_SYNC_INTERVAL_MS, 60 * 1000)
+        : 15 * 60 * 1000,
+      { minMs: 60 * 1000, maxMs: 24 * 60 * 60 * 1000 },
+    ),
+    reconciliationIntervalMs: normalizeAutomationIntervalMs(
+      settings.reconciliationIntervalMs,
+      DEFAULT_PACKAGE_RECONCILIATION_INTERVAL_MS,
+      { minMs: 15 * 60 * 1000, maxMs: 24 * 60 * 60 * 1000 },
+    ),
+  }
+}
+
+const getAutomationWatcherStatus = async () => {
+  const [result, inboundResult, reconciliationResult] = await Promise.all([
+    pool.query(`
+    select event, level, created_at,
+           details->>'checkedAt' as checked_at,
+           details->>'totalPackages' as total_packages,
+           details->>'newPackages' as new_packages,
+           details->>'welcomeSent' as welcome_sent,
+           details->>'welcomeSkipped' as welcome_skipped,
+           details->>'eventSent' as event_sent,
+           details->>'eventSkipped' as event_skipped,
+           details->'eventSkippedByReason' as event_skipped_by_reason,
+           details->>'eventReason' as event_reason,
+           details->'packageCountsBySource' as package_counts_by_source,
+           details->'packageSourceFailures' as package_source_failures,
+           details->'welcomeSkippedByReason' as welcome_skipped_by_reason
+    from system_logs
+    where event in (
+      'whatsapp_new_package_fast_check_completed',
+      'whatsapp_new_package_fast_check_failed'
+    )
+    order by created_at desc, id desc
+    limit 1;
+  `),
+    pool.query(`
+      select details->>'inboundMessageId' as inbound_message_id, created_at
+      from system_logs
+      where event = 'whatsapp_inbound_message_saved'
+      order by created_at desc, id desc
+      limit 1;
+    `),
+    pool.query(`
+      select event, level, created_at,
+             details->>'checkedAt' as checked_at,
+             details->>'totalPackages' as total_packages,
+             details->>'sentTotal' as sent_total,
+             details->>'welcomeSent' as welcome_sent,
+             details->>'welcomeSkipped' as welcome_skipped,
+             details->'welcomeSkippedByReason' as welcome_skipped_by_reason,
+             details->>'welcomeReason' as welcome_reason,
+             details->>'eventSent' as event_sent,
+             details->>'eventSkipped' as event_skipped,
+             details->'eventSkippedByReason' as event_skipped_by_reason,
+             details->>'eventReason' as event_reason,
+             details->'sourceFailures' as source_failures,
+             details->'notificationFailures' as notification_failures
+      from system_logs
+      where event in (
+        'whatsapp_package_reconciliation_started',
+        'whatsapp_package_reconciliation_completed',
+        'whatsapp_package_reconciliation_failed'
+      )
+      order by created_at desc, id desc
+      limit 1;
+    `),
+  ])
+  const row = result.rows[0]
+  const latestInbound = inboundResult.rows[0] ?? null
+  const latestInboundReplyResult = latestInbound?.inbound_message_id
+    ? await pool.query(
+        `
+          select event, created_at, details->>'reason' as reason
+          from system_logs
+          where details->>'inboundMessageId' = $1
+            and event in (
+              'whatsapp_auto_reply_started',
+              'whatsapp_auto_reply_sent',
+              'whatsapp_auto_reply_skipped',
+              'whatsapp_auto_reply_failed',
+              'whatsapp_auto_reply_queue_failed'
+            )
+          order by created_at desc, id desc
+          limit 1;
+        `,
+        [latestInbound.inbound_message_id],
+      )
+    : { rows: [] }
+  const latestInboundReply = latestInboundReplyResult.rows[0] ?? null
+  const latestReconciliation = reconciliationResult.rows[0] ?? null
+
+  return {
+    watcher: row
+      ? {
+          checkedAt: row.checked_at || row.created_at,
+          status: row.event === 'whatsapp_new_package_fast_check_failed' ? 'failed' : 'completed',
+          totalPackages: Number(row.total_packages) || 0,
+          newPackages: Number(row.new_packages) || 0,
+          welcomeSent: Number(row.welcome_sent) || 0,
+          welcomeSkipped: Number(row.welcome_skipped) || 0,
+          eventSent: Number(row.event_sent) || 0,
+          eventSkipped: Number(row.event_skipped) || 0,
+          eventSkippedByReason: row.event_skipped_by_reason ?? {},
+          eventReason: row.event_reason ?? null,
+          packageCountsBySource: row.package_counts_by_source ?? {},
+          packageSourceFailures: row.package_source_failures ?? [],
+          welcomeSkippedByReason: row.welcome_skipped_by_reason ?? {},
+        }
+      : null,
+    reconciliation: latestReconciliation
+        ? {
+            checkedAt: latestReconciliation.checked_at || latestReconciliation.created_at,
+            status: latestReconciliation.event === 'whatsapp_package_reconciliation_failed'
+              ? 'failed'
+              : latestReconciliation.event === 'whatsapp_package_reconciliation_started'
+                ? 'running'
+              : (
+                (Array.isArray(latestReconciliation.source_failures) && latestReconciliation.source_failures.length > 0) ||
+                (Array.isArray(latestReconciliation.notification_failures) && latestReconciliation.notification_failures.length > 0)
+              )
+                ? 'partial'
+                : 'completed',
+            totalPackages: Number(latestReconciliation.total_packages) || 0,
+            sentTotal: Number(latestReconciliation.sent_total) || 0,
+            welcomeSent: Number(latestReconciliation.welcome_sent) || 0,
+            welcomeSkipped: Number(latestReconciliation.welcome_skipped) || 0,
+            welcomeSkippedByReason: latestReconciliation.welcome_skipped_by_reason ?? {},
+            welcomeReason: latestReconciliation.welcome_reason ?? null,
+            eventSent: Number(latestReconciliation.event_sent) || 0,
+            eventSkipped: Number(latestReconciliation.event_skipped) || 0,
+            eventSkippedByReason: latestReconciliation.event_skipped_by_reason ?? {},
+            eventReason: latestReconciliation.event_reason ?? null,
+            sourceFailures: latestReconciliation.source_failures ?? [],
+            notificationFailures: latestReconciliation.notification_failures ?? [],
+          }
+        : null,
+    inboundReply: {
+      receivedAt: latestInbound?.created_at ?? null,
+      event: latestInboundReply?.event ?? null,
+      attemptedAt: latestInboundReply?.created_at ?? null,
+      reason: latestInboundReply?.reason ?? null,
+    },
+  }
+}
+
+const saveAutomationConfig = async (partialConfig) => {
+  const currentConfig = await getStoredAutomationConfig()
+  return saveSettingsByKey('crm_automation_config', {
+    ...currentConfig,
+    ...partialConfig,
+    welcomeResponseIntervalVersion: AUTOMATION_WELCOME_INTERVAL_SETTINGS_VERSION,
+  })
+}
+
+app.get('/api/settings/automation', authMiddleware, async (_request, response) => {
+  try {
+    await ensureDatabaseReady()
+    const [config, automationStatus] = await Promise.all([
+      getStoredAutomationConfig(),
+      getAutomationWatcherStatus(),
+    ])
+    response.json({ config, ...automationStatus })
+  } catch (error) {
+    response.status(500).json({ message: 'No se pudo cargar las configuraciones.', error: error.message })
+  }
+})
+
+app.put('/api/settings/automation', authMiddleware, async (request, response) => {
+  try {
+    await ensureDatabaseReady()
+    const body = request.body ?? {}
+    const config = await saveAutomationConfig({
+      ...(typeof body.automaticWelcome === 'boolean' ? { automaticWelcome: body.automaticWelcome } : {}),
+      ...(typeof body.automaticStatusUpdates === 'boolean'
+        ? { automaticStatusUpdates: body.automaticStatusUpdates }
+        : {}),
+      ...(typeof body.automaticReconciliation === 'boolean'
+        ? { automaticReconciliation: body.automaticReconciliation }
+        : {}),
+      ...(typeof body.aiAutoReply === 'boolean' ? { aiAutoReply: body.aiAutoReply } : {}),
+      ...(body.welcomeResponseIntervalMs != null
+        ? {
+            welcomeResponseIntervalMs: normalizeAutomationIntervalMs(
+              body.welcomeResponseIntervalMs,
+              DEFAULT_WELCOME_INTERVAL_MS,
+              { minMs: 60 * 1000, maxMs: 6 * 60 * 60 * 1000 },
+            ),
+          }
+        : {}),
+      ...(body.eventChangeResponseIntervalMs != null
+        ? {
+            eventChangeResponseIntervalMs: normalizeAutomationIntervalMs(
+              body.eventChangeResponseIntervalMs,
+              PACKAGE_EVENT_CHANGE_SYNC_INTERVAL_MS,
+              { minMs: 60 * 1000, maxMs: 24 * 60 * 60 * 1000 },
+            ),
+          }
+        : {}),
+      ...(body.reconciliationIntervalMs != null
+        ? {
+            reconciliationIntervalMs: normalizeAutomationIntervalMs(
+              body.reconciliationIntervalMs,
+              DEFAULT_PACKAGE_RECONCILIATION_INTERVAL_MS,
+              { minMs: 15 * 60 * 1000, maxMs: 24 * 60 * 60 * 1000 },
+            ),
+          }
+        : {}),
+    })
+    response.json({ ok: true, config })
+  } catch (error) {
+    response.status(500).json({ message: 'No se pudo guardar las configuraciones.', error: error.message })
+  }
+})
+
 const sanitizeProntsColumnConfig = (columnKey, config = {}) => {
   const fallback = defaultProntsConfig[columnKey] ?? defaultProntsConfig.received
   const sampleContactId = Number(config.sampleContactId)
@@ -1651,27 +2752,101 @@ const saveWhatsAppConfig = async (partialConfig) => {
   return saveSettingsByKey('whatsapp_meta', nextConfig)
 }
 
-const extractTrackingApiPhoneCandidates = (item) => [
-  item?.telefono,
-  item?.phone,
-  item?.numero_telefono,
-  item?.numeroTelefono,
-  item?.telefonos?.remitente,
-  item?.telefonos?.destinatario,
-  item?.origen?.telefono,
-  item?.destino?.telefono,
+const collectNestedValuesByKey = (value, keys, result = []) => {
+  if (!value || typeof value !== 'object') return result
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectNestedValuesByKey(item, keys, result))
+    return result
+  }
+
+  for (const [key, nestedValue] of Object.entries(value)) {
+    const normalizedKey = key
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-z0-9]/gi, '')
+      .toLowerCase()
+    if (keys.has(normalizedKey) && typeof nestedValue !== 'object') {
+      result.push(nestedValue)
+    }
+    collectNestedValuesByKey(nestedValue, keys, result)
+  }
+  return result
+}
+
+const extractPackagePhoneCandidates = (item) =>
+  collectNestedValuesByKey(item, new Set([
+    'telefono',
+    'phone',
+    'numerotelefono',
+    'numerocelular',
+    'numero',
+    'telefono1',
+    'telefono2',
+    'celular',
+    'movil',
+    'whatsapp',
+    'telefonodestinatario',
+    'telefonoremitente',
+  ]))
+    .map(normalizePhoneNumber)
+    .filter(Boolean)
+    .filter((phone, index, phones) => phones.indexOf(phone) === index)
+
+const extractTrackingApiPhoneCandidates = (item) => extractPackagePhoneCandidates(item)
+
+const extractContactPackagesPhoneCandidates = (item) => extractPackagePhoneCandidates(item)
+
+const extractContactPackageRecipientPhoneCandidates = (item) => [
+  item?.destinatario?.telefono,
 ].map(normalizePhoneNumber).filter(Boolean)
 
-const extractContactPackagesPhoneCandidates = (item) => [
-  item?.remitente?.telefono,
-  item?.destinatario?.telefono,
-  item?.origen?.telefono,
-  item?.destino?.telefono,
-].map(normalizePhoneNumber).filter(Boolean)
+const getPackageSyncPhoneNames = (item, source = 'tracking') => {
+  const people = source === 'contact'
+    ? [
+      [item?.destinatario, item?.destinatario?.telefono || item?.telefonos?.destinatario],
+      [item?.remitente, item?.remitente?.telefono || item?.telefonos?.remitente],
+      [item?.origen, item?.origen?.telefono || item?.telefonos?.origen],
+      [item?.destino, item?.destino?.telefono || item?.telefonos?.destino],
+      ]
+    : [
+        [item?.destinatario, item?.telefonos?.destinatario || item?.destinatario?.telefono],
+        [item?.remitente, item?.telefonos?.remitente || item?.remitente?.telefono],
+        [item?.origen, item?.origen?.telefono],
+        [item?.destino, item?.destino?.telefono],
+      ]
+
+  return people.reduce((names, [person, phone]) => {
+    const normalizedPhone = normalizeBoliviaTestNumber(phone)
+    const name = normalizeReference(person?.nombre || person?.name)
+    if (normalizedPhone && name) {
+      names.set(normalizedPhone, name)
+    }
+    return names
+  }, new Map())
+}
 
 const getTrackingLatestEvent = (item) => {
   const events = Array.isArray(item?.eventos) ? item.eventos.filter(Boolean) : []
-  return events[events.length - 1] ?? null
+  return [...events].sort(
+    (firstEvent, secondEvent) =>
+      getPackageEventTimestampValue(secondEvent) - getPackageEventTimestampValue(firstEvent),
+  )[0] ?? null
+}
+
+const getInternationalIpsStageFromEvent = (event) => {
+  if (!event) return null
+
+  const eventId = Number(
+    event?.evento_id ?? event?.codigo_evento ?? event?.event_code ?? event?.event_type_cd ?? event?.event_id,
+  )
+  if (eventId === 37) return 'delivered'
+  if (eventId === 76) return 'cancelled'
+  if ([32, 36, 39, 73, 74, 75].includes(eventId)) return 'courier'
+  if ([13, 14, 35, 71, 72].includes(eventId)) return 'regional'
+  if ([31, 34, 38].includes(eventId)) return 'transit'
+  if ([1, 2, 3, 8, 12, 30].includes(eventId)) return 'received'
+
+  return null
 }
 
 const getPackageLatestEvent = (item) => {
@@ -1704,25 +2879,47 @@ const buildLatestPackageEventsByCode = (events = []) => {
 const getNationalPackageStageFromEvent = (event) => {
   if (!event) return null
 
-  const eventId = Number(event?.evento_id ?? event?.codigo_evento)
-  if ([318, 295, 2239, 2240, 240, 2241, 297, 2242].includes(eventId)) return 'received'
-  if ([168, 296].includes(eventId)) return 'transit'
-  if ([310, 312, 183, 4410, 2103, 4405, 4404, 3345, 4400].includes(eventId)) return 'regional'
-  if ([4409, 315].includes(eventId)) return 'courier'
-  if (eventId === 316) return 'delivered'
-  if (eventId === 4402) return 'cancelled'
-
   const eventText = normalizeReference(
     [event?.nombre, event?.evento_api, event?.evento_original, event?.movimiento_bolivia, event?.detalle]
       .filter(Boolean)
       .join(' '),
   ).toLowerCase()
 
+  if (isPackageReturnToOriginEvent({ eventLabel: eventText })) return 'cancelled'
+
+  const eventId = Number(event?.evento_id ?? event?.codigo_evento)
+  if ([318, 295, 2239, 2240, 2241, 297, 2242].includes(eventId)) return 'received'
+  if ([168, 240, 296].includes(eventId)) return 'transit'
+  if ([310, 312, 183, 4410, 2103, 4405, 4404, 3345, 4400].includes(eventId)) return 'regional'
+  if ([4409, 315].includes(eventId)) return 'courier'
+  if (eventId === 316) return 'delivered'
+  if (eventId === 4402) return 'cancelled'
+
   if (eventText.includes('cartero') || eventText.includes('reparto')) return 'courier'
-  if (eventText.includes('listo para entregar') || eventText.includes('oficina de entrega')) return 'regional'
+  if (
+    eventText.includes('listo para entregar') ||
+    eventText.includes('oficina de entrega') ||
+    eventText.includes('ventanilla') ||
+    eventText.includes('pendiente de recojo') ||
+    eventText.includes('pendiente de entrega') ||
+    eventText.includes('solicitud de recojo') ||
+    eventText.includes('listo para recoger')
+  ) {
+    return 'regional'
+  }
   if (eventText.includes('cancel') || eventText.includes('anul') || eventText.includes('rechaz')) return 'cancelled'
   if (eventText.includes('devuelto')) return 'cancelled'
   if (eventText.includes('entreg')) return 'delivered'
+  if (
+    eventText.includes('recibido en oficina') ||
+    eventText.includes('recibida en oficina') ||
+    eventText.includes('oficina destino') ||
+    eventText.includes('sucursal de destino') ||
+    eventText.includes('recibido destino') ||
+    eventText.includes('recibido regional')
+  ) {
+    return 'regional'
+  }
   if (eventText.includes('saca interna') || eventText.includes('salida') || eventText.includes('transito')) return 'transit'
   if (eventText.includes('recibido') || eventText.includes('origen')) return 'received'
 
@@ -1730,8 +2927,48 @@ const getNationalPackageStageFromEvent = (event) => {
 }
 
 const getPackageStageFromEvents = (item) => {
-  return getNationalPackageStageFromEvent(getPackageLatestEvent(item))
+  const events = Array.isArray(item?.eventos) ? item.eventos.filter(Boolean) : []
+  const latestEvent = getPackageLatestEvent(item)
+  const latestEventId = Number(latestEvent?.evento_id ?? latestEvent?.codigo_evento)
+  const hasPreviousTransit = events.some((event) => getNationalPackageStageFromEvent(event) === 'transit')
+
+  if (latestEventId === 297 && hasPreviousTransit) {
+    return 'regional'
+  }
+
+  return getNationalPackageStageFromEvent(latestEvent)
 }
+
+const hasContactPackageTransfer = (item) => {
+  const transferValues = [
+    item?.traspaso,
+    item?.fecha_traspaso,
+    item?.fechaTraspaso,
+    item?.transferencia,
+    item?.fecha_transferencia,
+    item?.cod_especial,
+    item?.codigo_especial,
+    item?.codigoEspecial,
+    item?.codigo_relacionado,
+    item?.numero_despacho,
+  ]
+
+  return transferValues.some((value) => Boolean(normalizeReference(value)))
+}
+
+const getContactPackageTransferCode = (item) =>
+  normalizeReference(item?.cod_especial) ||
+  normalizeReference(item?.codigo_especial) ||
+  normalizeReference(item?.codigoEspecial) ||
+  normalizeReference(item?.codigo_relacionado) ||
+  normalizeReference(item?.numero_despacho)
+
+const getContactPackageTransferDate = (item) =>
+  normalizeReference(item?.traspaso) ||
+  normalizeReference(item?.fecha_traspaso) ||
+  normalizeReference(item?.fechaTraspaso) ||
+  normalizeReference(item?.transferencia) ||
+  normalizeReference(item?.fecha_transferencia)
 
 const getPackageStageRank = (stage) => {
   if (stage === 'received') return 0
@@ -1743,10 +2980,20 @@ const getPackageStageRank = (stage) => {
   return -1
 }
 
+const getMostAdvancedPackageStage = (...stages) =>
+  stages
+    .filter(Boolean)
+    .sort((stageA, stageB) => getPackageStageRank(stageB) - getPackageStageRank(stageA))[0] ?? null
+
 const inferTrackingPackageStage = (item) => {
   const latestEvent = getTrackingLatestEvent(item)
+  const ipsStage = getInternationalIpsStageFromEvent(latestEvent)
+  if (ipsStage) return ipsStage
+
   const eventStage = getPackageStageFromEvents(item)
-  if (eventStage) return eventStage
+  const transferStage = hasContactPackageTransfer(item) ? 'transit' : null
+  const advancedStage = getMostAdvancedPackageStage(eventStage, transferStage)
+  if (advancedStage) return advancedStage
 
   return (
     normalizeEmsStatus(
@@ -1770,6 +3017,7 @@ const getPackageEventLabel = (event) =>
     event?.nombre ||
       event?.evento_api ||
       event?.evento_original ||
+      event?.event_name ||
       event?.movimiento_bolivia ||
       event?.detalle ||
       'Nuevo movimiento',
@@ -1778,25 +3026,44 @@ const getPackageEventLabel = (event) =>
 const getPackageEventSignature = (event) => {
   if (!event) return ''
 
-  return [
-    event?.evento_id,
-    event?.codigo_evento,
-    getPackageEventLabel(event),
-    getPackageEventLocation(event),
-    normalizeReference(event?.fecha),
-  ]
-    .map((value) => normalizeReference(value).toUpperCase())
-    .filter(Boolean)
-    .join('|')
+  return buildPackageEventSignature({
+    eventId: event?.evento_id ?? event?.event_id ?? event?.event_type_cd,
+    eventCode: event?.codigo_evento ?? event?.event_code,
+    label: getPackageEventLabel(event),
+    location: getPackageEventLocation(event),
+    date: normalizeReference(
+      event?.fecha_movimiento ||
+        event?.fechaMovimiento ||
+        event?.fecha_evento ||
+        event?.fechaEvento ||
+        event?.event_date ||
+        event?.fecha_hora ||
+        event?.fechaHora ||
+        event?.fecha_registro ||
+        event?.fecha ||
+        event?.created_at ||
+        event?.timestamp ||
+        getPackageEventTimestampValue(event),
+    ),
+  })
 }
 
 const inferContactPackageStage = (item) => {
   const statusText = normalizeReference(item?.estado?.nombre)
+  const resolvedStage = resolveContactPackageStage({
+    statusText,
+    latestEventStage: getPackageStageFromEvents(item),
+    transferStage: hasContactPackageTransfer(item) ? 'transit' : null,
+  })
+  if (resolvedStage) return resolvedStage
+
   const normalizedStatus = statusText.toLowerCase()
   const latestEventStage = getPackageStageFromEvents(item)
+  const transferStage = hasContactPackageTransfer(item) ? 'transit' : null
+  const advancedMovementStage = getMostAdvancedPackageStage(latestEventStage, transferStage)
 
-  if (latestEventStage) {
-    return latestEventStage
+  if (advancedMovementStage && advancedMovementStage !== 'received') {
+    return advancedMovementStage
   }
 
   if (
@@ -1805,7 +3072,8 @@ const inferContactPackageStage = (item) => {
     normalizedStatus.includes('recibido destino') ||
     normalizedStatus.includes('recibido regional') ||
     normalizedStatus.includes('sucursal de destino') ||
-    normalizedStatus.includes('pasar a recoger')
+    normalizedStatus.includes('pasar a recoger') ||
+    normalizedStatus.includes('ventanilla')
   ) {
     return 'regional'
   }
@@ -1814,7 +3082,7 @@ const inferContactPackageStage = (item) => {
     normalizedStatus.includes('cartero') ||
     normalizedStatus.includes('reparto') ||
     normalizedStatus.includes('distribucion') ||
-    normalizedStatus.includes('distribuciÃ³n')
+    normalizedStatus.includes('distribuciÃƒÂ³n')
   ) {
     return 'courier'
   }
@@ -1840,7 +3108,7 @@ const inferContactPackageStage = (item) => {
   if (
     normalizedStatus.includes('camino') ||
     normalizedStatus.includes('transit') ||
-    normalizedStatus.includes('trÃ¡nsito') ||
+    normalizedStatus.includes('trÃƒÂ¡nsito') ||
     normalizedStatus.includes('transito') ||
     normalizedStatus.includes('seguim') ||
     normalizedStatus.includes('aduan')
@@ -1852,14 +3120,17 @@ const inferContactPackageStage = (item) => {
     normalizedStatus === 'recibido' ||
     normalizedStatus === 'recibida' ||
     normalizedStatus === 'received' ||
-    normalizedStatus === 'ventanilla' ||
     normalizedStatus.includes('almacen') ||
-    normalizedStatus.includes('almacén') ||
+    normalizedStatus.includes('almacÃ©n') ||
     normalizedStatus.includes('admis') ||
     normalizedStatus.includes('recepcion') ||
     normalizedStatus.includes('origen')
   ) {
     return 'received'
+  }
+
+  if (advancedMovementStage) {
+    return advancedMovementStage
   }
 
   return normalizeEmsStatus(statusText) || 'received'
@@ -1935,14 +3206,31 @@ const mergeUniqueProfiles = (baseProfiles = [], nextProfiles = []) => {
   return merged
 }
 
-const getPackageCodeFromItem = (item) =>
-  normalizePackageCodeForLookup(item?.codigo_s10 || item?.codigo || item?.codigoSeguimiento || item?.tracking)
+const getPackageCodeFromItem = (item) => {
+  const directCode = normalizePackageCodeForLookup(
+    item?.codigo_s10 || item?.codigo || item?.codigoSeguimiento || item?.tracking,
+  )
+  if (isValidEmsPackageCode(directCode)) return directCode
+
+  const nestedValues = collectNestedValuesByKey(item, new Set([
+    'codigos10',
+    'codigo',
+    'codigoseguimiento',
+    'tracking',
+    'codigoems',
+    'guia',
+    'guiaseguimiento',
+  ]))
+  return nestedValues
+    .map(normalizePackageCodeForLookup)
+    .find(isValidEmsPackageCode) || ''
+}
 
 const isNationalPackageCode = (code) => /^[A-Z]{1,2}\d+[A-Z]{2}$/.test(normalizePackageCodeForLookup(code)) && normalizePackageCodeForLookup(code).endsWith('BO')
 
 const getPackageSyncPhoneCandidates = (item, source = 'tracking') => {
   if (source === 'contact') {
-    return extractContactPackagesPhoneCandidates(item)
+    return extractContactPackageRecipientPhoneCandidates(item)
   }
 
   return extractTrackingApiPhoneCandidates(item)
@@ -1962,7 +3250,7 @@ const getPackageSyncDisplayName = (entry) => {
 const getPackageSyncCompany = (entry) => {
   const sourceLabel = entry?.source === 'contact' ? 'Paquetes-Contactos API' : 'Tracking API'
   const destination = normalizeReference(entry?.destinationLabel)
-  return destination ? `${sourceLabel} · ${destination}` : sourceLabel
+  return destination ? `${sourceLabel} Â· ${destination}` : sourceLabel
 }
 
 const findPackageContactByCode = async (code, client = pool) => {
@@ -1978,7 +3266,7 @@ const findPackageContactByCode = async (code, client = pool) => {
       where exists (
         select 1
         from jsonb_array_elements(coalesce(social_profiles, '[]'::jsonb)) as profile
-        where lower(coalesce(profile->>'channel', '')) = 'ems'
+        where lower(coalesce(profile->>'channel', '')) like '%ems%'
           and upper(coalesce(profile->>'reference', '')) = $1
       )
       limit 1;
@@ -1996,11 +3284,21 @@ const upsertPackageContact = async (client, entry) => {
     : entry.phoneCandidates instanceof Set
       ? [...entry.phoneCandidates]
       : []
-  const primaryPhone =
-    normalizePhoneNumber(entry.primaryPhone) || phoneCandidates.map(normalizePhoneNumber).find(Boolean) || ''
-  const nextSocialProfiles = mergeUniqueProfiles(existingContact?.social_profiles, [
+  const allPhones = [
+    entry.primaryPhone,
+    ...phoneCandidates,
+  ]
+    .map(normalizeBoliviaTestNumber)
+    .filter(Boolean)
+    .filter((phone, index, phones) => phones.indexOf(phone) === index)
+  const primaryPhone = allPhones[0] || ''
+  const retainedProfiles = (Array.isArray(existingContact?.social_profiles) ? existingContact.social_profiles : []).filter((profile) => {
+    const channel = normalizeReference(profile?.channel).toLowerCase()
+    return channel !== 'whatsapp' && channel !== 'ems'
+  })
+  const nextSocialProfiles = mergeUniqueProfiles(retainedProfiles, [
     { channel: 'EMS', reference: entry.code },
-    ...(primaryPhone ? [{ channel: 'WhatsApp', reference: `+${primaryPhone}` }] : []),
+    ...allPhones.map((phone) => ({ channel: 'WhatsApp', reference: `+${phone}` })),
   ])
 
   const nextRow = {
@@ -2009,7 +3307,7 @@ const upsertPackageContact = async (client, entry) => {
     channel: primaryPhone ? 'WhatsApp, EMS' : 'EMS',
     socialProfiles: JSON.stringify(nextSocialProfiles),
     segment: entry.source === 'contact' ? 'Paquetes-contactos API' : 'Tracking API',
-    ownerName: 'Integración EMS',
+    ownerName: 'IntegraciÃ³n EMS',
     status: getPackageContactStatusForStage(entry.stage),
     score: getPackageContactScoreForStage(entry.stage),
   }
@@ -2079,16 +3377,80 @@ const upsertPackageContact = async (client, entry) => {
   return insertedRow ? { ...insertedRow, action: 'created' } : null
 }
 
+const persistInternationalTrackingCatalog = async (items = []) => {
+  if (!Array.isArray(items) || items.length === 0) return 0
+  await ensureDatabaseReady()
+
+  const rows = items.map((item) => {
+    const packageCode = getPackageCodeFromItem(item)
+    if (!packageCode) return null
+    const latestEvent = getTrackingLatestEvent(item)
+    const latestEventCode = Number(latestEvent?.evento_id ?? latestEvent?.codigo_evento)
+    return {
+      package_code: packageCode,
+      stage_key: inferTrackingPackageStage(item),
+      latest_event_code: Number.isFinite(latestEventCode) ? latestEventCode : null,
+      latest_event_name: getPackageEventLabel(latestEvent),
+      latest_event_at: normalizeReference(latestEvent?.fecha) || normalizeReference(item?.fecha_registro) || null,
+      search_text: JSON.stringify(item).toLowerCase(),
+      payload: item,
+    }
+  }).filter(Boolean)
+  const uniqueRowsByPackageCode = new Map()
+  rows.forEach((row) => {
+    const existingRow = uniqueRowsByPackageCode.get(row.package_code)
+    const existingTimestamp = Date.parse(existingRow?.latest_event_at ?? '') || 0
+    const candidateTimestamp = Date.parse(row.latest_event_at ?? '') || 0
+    if (!existingRow || candidateTimestamp >= existingTimestamp) {
+      uniqueRowsByPackageCode.set(row.package_code, row)
+    }
+  })
+  const uniqueRows = [...uniqueRowsByPackageCode.values()]
+
+  for (let offset = 0; offset < uniqueRows.length; offset += 1000) {
+    await pool.query(
+      `
+        insert into international_tracking_packages (
+          package_code, stage_key, latest_event_code, latest_event_name,
+          latest_event_at, search_text, payload, imported_at, updated_at
+        )
+        select
+          row.package_code, row.stage_key, row.latest_event_code, row.latest_event_name,
+          row.latest_event_at, row.search_text, row.payload, now(), now()
+        from jsonb_to_recordset($1::jsonb) as row(
+          package_code text, stage_key text, latest_event_code integer,
+          latest_event_name text, latest_event_at timestamptz,
+          search_text text, payload jsonb
+        )
+        on conflict (package_code) do update set
+          stage_key = excluded.stage_key,
+          latest_event_code = excluded.latest_event_code,
+          latest_event_name = excluded.latest_event_name,
+          latest_event_at = excluded.latest_event_at,
+          search_text = excluded.search_text,
+          payload = excluded.payload,
+          updated_at = now();
+      `,
+      [JSON.stringify(uniqueRows.slice(offset, offset + 1000))],
+    )
+  }
+
+  return uniqueRows.length
+}
+
 const fetchAllTrackingPackagesCatalog = async ({ forceRefresh = false } = {}) => {
   const cacheKey = 'all'
   const cachedCatalog = getCachedValue(packagePipelineSyncCache, cacheKey)
-  if (!forceRefresh && cachedCatalog) {
+  if (!forceRefresh && cachedCatalog && Array.isArray(cachedCatalog.data) && cachedCatalog.data.length > 0) {
     return cachedCatalog
+  }
+  if (cachedCatalog && (!Array.isArray(cachedCatalog.data) || cachedCatalog.data.length === 0)) {
+    packagePipelineSyncCache.delete(cacheKey)
   }
 
   const inFlightCacheKey = `${cacheKey}-tracking-in-flight`
   const pendingCatalog = getCachedValue(packagePipelineSyncCache, inFlightCacheKey)
-  if (!forceRefresh && pendingCatalog) {
+  if (pendingCatalog) {
     return pendingCatalog
   }
 
@@ -2104,10 +3466,19 @@ const fetchAllTrackingPackagesCatalog = async ({ forceRefresh = false } = {}) =>
       Accept: 'application/json',
     },
     perPage: 200,
-    maxPages: 500,
+    maxPages: 5000,
+    trustReportedTotal: false,
+    throwOnFirstPageError: true,
+    throwOnAnyPageError: true,
+    minimumPageIntervalMs: 2500,
+    maxRateLimitRetries: 6,
+    onPage: async (pageItems) => persistInternationalTrackingCatalog(pageItems),
   })
-    .then((items) =>
-      setCachedValue(
+    .then(async (items) => {
+      if (items.length === 0) {
+        throw new Error('La API SITRA respondio sin paquetes; se conserva el catalogo anterior.')
+      }
+      return setCachedValue(
         packagePipelineSyncCache,
         cacheKey,
         {
@@ -2116,14 +3487,44 @@ const fetchAllTrackingPackagesCatalog = async ({ forceRefresh = false } = {}) =>
           cachedAt: new Date().toISOString(),
         },
         CONTACT_PACKAGES_CATALOG_TTL_MS,
-      ),
-    )
+      )
+    })
     .finally(() => {
       packagePipelineSyncCache.delete(inFlightCacheKey)
     })
 
-  setCachedValue(packagePipelineSyncCache, inFlightCacheKey, catalogPromise, CONTACT_PACKAGES_CATALOG_TTL_MS)
+  packagePipelineSyncCache.set(inFlightCacheKey, {
+    value: catalogPromise,
+    expiresAt: Number.POSITIVE_INFINITY,
+  })
   return catalogPromise
+}
+
+let internationalPipelineSeedPromise = null
+
+const seedInternationalPipelineCatalog = async () => {
+  if (internationalPipelineSeedPromise) return internationalPipelineSeedPromise
+
+  reloadLocalEnv()
+  const trackingApiDefaults = getTrackingApiDefaults()
+  const trackingUrl = new URL('/api/tracking/paquetes', trackingApiDefaults.baseUrl)
+
+  internationalPipelineSeedPromise = fetchAllPaginatedItems({
+    url: trackingUrl,
+    headers: {
+      Authorization: `Bearer ${trackingApiDefaults.token}`,
+      Accept: 'application/json',
+    },
+    perPage: 100,
+    maxPages: 5000,
+    trustReportedTotal: false,
+    throwOnFirstPageError: true,
+    onPage: async (pageItems) => persistInternationalTrackingCatalog(pageItems),
+  }).finally(() => {
+    internationalPipelineSeedPromise = null
+  })
+
+  return internationalPipelineSeedPromise
 }
 
 const getCachedTrackingPackagesCatalog = () => {
@@ -2170,11 +3571,11 @@ const getEmsStageFromContactStatus = (status) => {
   if (normalizedStatus.includes('cancel')) return 'cancelled'
   if (normalizedStatus.includes('entregado') || normalizedStatus.includes('cerrado')) return 'delivered'
   if (normalizedStatus.includes('cartero') || normalizedStatus.includes('reparto')) return 'courier'
-  if (normalizedStatus.includes('destino') || normalizedStatus.includes('regional')) return 'regional'
+  if (normalizedStatus.includes('destino') || normalizedStatus.includes('regional') || normalizedStatus.includes('ventanilla')) return 'regional'
   if (
     normalizedStatus.includes('camino') ||
     normalizedStatus.includes('transito') ||
-    normalizedStatus.includes('tránsito') ||
+    normalizedStatus.includes('trÃ¡nsito') ||
     normalizedStatus.includes('seguimiento')
   ) {
     return 'transit'
@@ -2184,20 +3585,36 @@ const getEmsStageFromContactStatus = (status) => {
 
 const getEmsPackageCodeFromContact = (contact) => {
   const profiles = Array.isArray(contact?.social_profiles) ? contact.social_profiles : []
-  const emsProfile = profiles.find((profile) => normalizeReference(profile?.channel).toLowerCase() === 'ems')
-  const profileReference = normalizeReference(emsProfile?.reference)
-  if (profileReference) return profileReference
+  const emsProfileReferences = profiles
+    .filter((profile) => normalizeReference(profile?.channel).toLowerCase().includes('ems'))
+    .map((profile) => normalizePackageCodeForLookup(profile?.reference))
+    .filter(isValidEmsPackageCode)
+  if (emsProfileReferences[0]) return emsProfileReferences[0]
 
-  return (
-    extractPackageCode(
-      [
-        contact?.name,
-        contact?.company,
-        contact?.segment,
-        JSON.stringify(contact?.social_profiles ?? []),
-      ].join(' '),
-    ) || ''
-  )
+  return extractPackageCodeCandidates(
+    [
+      contact?.name,
+      contact?.company,
+      contact?.segment,
+      JSON.stringify(contact?.social_profiles ?? []),
+    ].join(' '),
+  ).find(isValidEmsPackageCode) || ''
+}
+
+const isValidEmsPackageCode = (value) => {
+  const code = normalizePackageCodeForLookup(value)
+  return /^[A-Z]{1,8}\d{3,}[A-Z]{2,5}$/.test(code)
+}
+
+const getWhatsAppPhonesFromStoredContact = (contact, configuredNumbers = []) => {
+  const configuredCandidates = configuredNumbers.flatMap((number) => getWhatsAppNumberCandidates(number))
+  const phones = (Array.isArray(contact?.social_profiles) ? contact.social_profiles : [])
+    .filter((profile) => normalizeReference(profile?.channel).toLowerCase().includes('whatsapp'))
+    .map((profile) => normalizeBoliviaTestNumber(profile?.reference))
+    .filter(Boolean)
+  return [...new Set(phones.filter((phone) =>
+    getWhatsAppNumberCandidates(phone).some((candidate) => configuredCandidates.includes(candidate)),
+  ))]
 }
 
 const fetchStoredEmsPipelineContacts = async () => {
@@ -2237,11 +3654,14 @@ const buildEmsPipelineCards = async () => {
     registeredCardCodes.add(normalizedCode)
 
     const registeredLatestEvent = latestEventsByCode.get(normalizedCode)
-    const stage = overrideMap[code] ?? getNationalPackageStageFromEvent(registeredLatestEvent) ?? inferContactPackageStage(item)
+    const stage = overrideMap[code] ?? inferContactPackageStage(item)
     const senderName =
       normalizeReference(item?.remitente?.nombre) || normalizeReference(item?.origen?.nombre) || 'Sin remitente'
     const recipientName =
       normalizeReference(item?.destinatario?.nombre) || normalizeReference(item?.destino?.nombre) || 'Sin destinatario'
+    const currentLocation =
+      getPackageEventLocation(registeredLatestEvent) ||
+      normalizeReference(item?.ubicacion || item?.oficina || item?.regional || item?.departamento)
 
     cards.push({
       id: `contact-${item?.id ?? code}`,
@@ -2260,6 +3680,8 @@ const buildEmsPipelineCards = async () => {
         normalizeReference(item?.destino?.nombre) ||
         normalizeReference(item?.destinatario?.direccion) ||
         'Sin destino',
+      currentLocation,
+      department: getBolivianDepartmentKey(currentLocation),
       status: getPackageEventLabel(registeredLatestEvent) || normalizeReference(item?.estado?.nombre) || getEmsStatusLabel(stage),
       updatedAt:
         getPackageContextDateValue(registeredLatestEvent?.fecha_registro) ||
@@ -2278,6 +3700,7 @@ const buildEmsPipelineCards = async () => {
     const stage = overrideMap[code] ?? getNationalPackageStageFromEvent(registeredLatestEvent) ?? getEmsStageFromContactStatus(contact?.status)
     const eventLabel = getPackageEventLabel(registeredLatestEvent) || getPackageEventTitle(registeredLatestEvent)
     const eventLocation = getPackageEventLocation(registeredLatestEvent)
+    const currentLocation = eventLocation || normalizeReference(contact?.company) || ''
     registeredCardCodes.add(code)
     cards.push({
       id: `stored-contact-${contact.id}`,
@@ -2296,6 +3719,8 @@ const buildEmsPipelineCards = async () => {
             )
           : '') || 'Sin referencia',
       destination: eventLocation || normalizeReference(contact?.company) || 'Sin destino',
+      currentLocation,
+      department: getBolivianDepartmentKey(currentLocation),
       status: eventLabel || normalizeReference(contact?.status) || getEmsStatusLabel(stage),
       updatedAt:
         getPackageContextDateValue(registeredLatestEvent?.fecha_registro) ||
@@ -2318,19 +3743,430 @@ const buildEmsPipelineCards = async () => {
   return { cards, customColumns }
 }
 
-const syncPackagePipelineFromApis = async () => {
+const getTestModePackageCodes = async (config) => {
+  const testModeEnabled = normalizeBoolean(config?.testModeEnabled, whatsappDefaults.testModeEnabled)
+  if (!testModeEnabled) return []
+
+  const result = await pool.query(
+    `
+      select id, name, company, social_profiles, segment
+      from contacts
+      where segment ilike '%Paquetes-contactos API%'
+         or exists (
+           select 1
+           from jsonb_array_elements(coalesce(social_profiles, '[]'::jsonb)) as profile
+           where lower(coalesce(profile->>'channel', '')) like '%ems%'
+         );
+    `,
+  )
+
+  const configuredNumbers = getConfiguredWhatsAppTestNumbers(config)
+  const configuredCandidates = configuredNumbers.flatMap((number) => getWhatsAppNumberCandidates(number))
+
+  return [...new Set(
+    result.rows
+      .filter((row) => {
+        const profiles = Array.isArray(row?.social_profiles) ? row.social_profiles : []
+        const profilePhones = profiles
+          .filter((profile) => normalizeReference(profile?.channel).toLowerCase().includes('whatsapp'))
+          .map((profile) => normalizeBoliviaTestNumber(profile?.reference))
+          .filter(Boolean)
+        return profilePhones.some((phone) =>
+          getWhatsAppNumberCandidates(phone).some((candidate) => configuredCandidates.includes(candidate)),
+        )
+      })
+      .map((row) => getEmsPackageCodeFromContact(row))
+      .map(normalizePackageCodeForLookup)
+      .filter(isValidEmsPackageCode),
+  )]
+}
+
+const fetchTestModePackageItemsByPhone = async ({ url, headers, queryParam, phone, source }) => {
+  const queryParams = [...new Set([
+    queryParam,
+    'telefono',
+    'phone',
+    'numero_telefono',
+    'numeroTelefono',
+    'numero',
+    'celular',
+    'whatsapp',
+    'destinatario_telefono',
+    'remitente_telefono',
+  ])]
+  const matchedItems = []
+
+  for (const currentQueryParam of queryParams) {
+    const lookupUrl = new URL(url.toString())
+    lookupUrl.searchParams.set(currentQueryParam, phone)
+    lookupUrl.searchParams.set('page', '1')
+    lookupUrl.searchParams.set('per_page', '200')
+    const response = await fetchJsonWithTimeout(lookupUrl, { headers }).catch(() => null)
+    if (!response?.ok) continue
+
+    const payload = await response.json().catch(() => null)
+    for (const item of getPaginatedPayloadItems(payload)) {
+      const itemPhones = source === 'tracking'
+        ? extractTrackingApiPhoneCandidates(item)
+        : extractContactPackagesPhoneCandidates(item)
+      if (
+        itemPhones.some((candidate) =>
+          getWhatsAppNumberCandidates(candidate).includes(phone),
+        ) &&
+        !matchedItems.some((existingItem) => getPackageCodeFromItem(existingItem) === getPackageCodeFromItem(item))
+      ) {
+        matchedItems.push(item)
+      }
+    }
+  }
+
+  return matchedItems
+}
+
+const fetchLatestTestModePackageItems = async ({ url, headers, source, configuredNumbers }) => {
+  const maxPages = Math.max(
+    1,
+    Math.min(Number.parseInt(process.env.WHATSAPP_TEST_MODE_LATEST_PACKAGE_PAGES || '3', 10) || 3, 20),
+  )
+  const queryAttempts = [
+    { ordering: '-fecha_registro' },
+    { sort: '-fecha_registro' },
+    {},
+  ]
+  const matchedItems = []
+
+  for (const query of queryAttempts) {
+    for (let page = 1; page <= maxPages; page += 1) {
+      const lookupUrl = new URL(url.toString())
+      lookupUrl.searchParams.set('page', String(page))
+      lookupUrl.searchParams.set('per_page', '200')
+      Object.entries(query).forEach(([key, value]) => lookupUrl.searchParams.set(key, value))
+      const response = await fetchJsonWithTimeout(lookupUrl, { headers }).catch(() => null)
+      if (!response?.ok) break
+
+      const payload = await response.json().catch(() => null)
+      const pageItems = getPaginatedPayloadItems(payload)
+      for (const item of pageItems) {
+        const itemPhones = source === 'tracking'
+          ? extractTrackingApiPhoneCandidates(item)
+          : extractContactPackagesPhoneCandidates(item)
+        const belongsToTestNumber = itemPhones.some((itemPhone) =>
+          configuredNumbers.some(
+            (number) => normalizeBoliviaTestNumber(itemPhone) === normalizeBoliviaTestNumber(number),
+          ),
+        )
+        const code = getPackageCodeFromItem(item)
+        if (
+          code &&
+          !matchedItems.some((existingItem) => getPackageCodeFromItem(existingItem) === code)
+        ) {
+          matchedItems.push({ ...item, __testModeDiscoveredBy: belongsToTestNumber ? 'phone' : 'recent' })
+        }
+      }
+
+      if (pageItems.length === 0 || pageItems.length < 200) break
+    }
+  }
+
+  return matchedItems.sort((first, second) => {
+    const firstDate = getPackageContextDateValue(
+      first?.fecha_registro || first?.created_at || first?.fechaCreacion,
+    )
+    const secondDate = getPackageContextDateValue(
+      second?.fecha_registro || second?.created_at || second?.fechaCreacion,
+    )
+    return secondDate - firstDate
+  })
+}
+
+const buildContactPackageSyncEntry = ({ item, latestEventsByCode = new Map() }) => {
+  const code = getPackageCodeFromItem(item)
+  if (!code) return null
+
+  const registeredLatestEvent = latestEventsByCode.get(normalizePackageCodeForLookup(code))
+  const itemEvents = Array.isArray(item?.eventos) ? item.eventos.filter(Boolean) : []
+  const latestContactEvent = [registeredLatestEvent, ...itemEvents]
+    .filter(Boolean)
+    .sort((firstEvent, secondEvent) => getPackageEventTimestampValue(secondEvent) - getPackageEventTimestampValue(firstEvent))[0] ?? null
+  const stage = inferContactPackageStage({
+    ...item,
+    eventos: [registeredLatestEvent, ...itemEvents]
+      .filter(Boolean)
+      .sort((firstEvent, secondEvent) => getPackageEventTimestampValue(firstEvent) - getPackageEventTimestampValue(secondEvent)),
+  })
+  const transferCode = getContactPackageTransferCode(item)
+  const transferDate = getContactPackageTransferDate(item)
+  const latestContactEventSignature = getPackageEventSignature(latestContactEvent)
+  const latestContactEventDate =
+    normalizeReference(latestContactEvent?.fecha_registro) ||
+    normalizeReference(latestContactEvent?.fecha)
+  const statusName = normalizeReference(item?.estado?.nombre)
+  const isVentanillaStatus = isVentanillaText(statusName)
+
+  return {
+    code,
+    source: 'contact',
+    stage,
+    updatedAt:
+      getPackageContextDateValue(registeredLatestEvent?.fecha_registro) ||
+      getPackageContextDateValue(registeredLatestEvent?.fecha) ||
+      getPackageContextDateValue(latestContactEventDate) ||
+      getPackageContextDateValue(item?.fecha_registro) ||
+      0,
+    latestEventTimestamp: getPackageEventTimestampValue(latestContactEvent),
+    originLabel: getPackageLocationLabel(item?.origen, 'Sin origen'),
+    destinationLabel:
+      getPackageDepartmentLabel(item?.destino) ||
+      getPackageLocationLabel(item?.destino, 'Sin destino') ||
+      normalizeReference(item?.destinatario?.direccion) ||
+      'Sin destino',
+    destinationAddress:
+      normalizeReference(item?.destinatario?.direccion) ||
+      normalizeReference(item?.destino?.direccion) ||
+      '',
+    recipientName: normalizeReference(item?.destinatario?.nombre) || '',
+    senderName: normalizeReference(item?.remitente?.nombre) || '',
+    primaryPhone: getPackageSyncPhoneCandidates(item, 'contact')[0] || '',
+    latestEventLabel: isVentanillaStatus
+      ? 'Ventanilla - correspondencia pendiente de recojo'
+      : stage === 'transit' && hasContactPackageTransfer(item) && !latestContactEventSignature
+        ? 'Paquete en transito'
+        : getPackageEventLabel(latestContactEvent) || statusName || 'Paquete registrado',
+    latestEventLocation:
+      getPackageEventLocation(latestContactEvent) ||
+      (stage === 'regional'
+        ? getPackageDepartmentLabel(item?.destino) || getPackageLocationLabel(item?.destino, '')
+        : getPackageLocationLabel(item?.origen, '')),
+    latestEventDate:
+      latestContactEventDate ||
+      transferDate ||
+      normalizeReference(item?.fecha_registro),
+    latestEventSignature: [
+      stage,
+      isVentanillaStatus ? 'VENTANILLA' : '',
+      latestContactEventSignature || (stage === 'transit' ? 'TRASPASO' : ''),
+      latestContactEventSignature ? '' : transferCode,
+      latestContactEventSignature ? '' : transferDate,
+      statusName || 'Paquete registrado',
+      normalizeReference(item?.fecha_registro),
+    ]
+      .map((value) => normalizeReference(value).toUpperCase())
+      .filter(Boolean)
+      .join('|'),
+    sources: ['Paquetes-Contactos'],
+    phoneCandidates: getPackageSyncPhoneCandidates(item, 'contact'),
+    phoneNames: getPackageSyncPhoneNames(item, 'contact'),
+  }
+}
+
+const buildTrackingPackageSyncEntry = ({ item, latestEventsByCode = new Map() }) => {
+  const code = getPackageCodeFromItem(item)
+  if (!code) return null
+
+  const registeredLatestEvent = latestEventsByCode.get(normalizePackageCodeForLookup(code))
+  const latestEvent = registeredLatestEvent ?? getTrackingLatestEvent(item)
+  const stage = inferTrackingPackageStage({
+    ...item,
+    eventos: registeredLatestEvent
+      ? [registeredLatestEvent, ...(Array.isArray(item?.eventos) ? item.eventos : [])]
+      : item?.eventos,
+  })
+  const allPhoneCandidates = getPackageSyncPhoneCandidates(item, 'tracking')
+  const welcomePhoneCandidates = getTrackingPackageRecipientPhoneCandidates(item)
+
+  return {
+    code,
+    source: 'tracking',
+    stage,
+    updatedAt:
+      getPackageContextDateValue(item?.fecha_registro || item?.created_at || item?.fechaCreacion) ||
+      getPackageContextDateValue(latestEvent?.fecha_registro) ||
+      getPackageContextDateValue(latestEvent?.fecha) ||
+      0,
+    latestEventTimestamp: getPackageEventTimestampValue(latestEvent),
+    originLabel: getPackageLocationLabel(item?.origen, 'Sin origen'),
+    destinationLabel: getTrackingDestinationPlace(item),
+    destinationAddress: getTrackingDestinationAddress(item),
+    recipientName:
+      normalizeReference(item?.destinatario?.nombre) ||
+      normalizeReference(item?.remitente?.nombre) ||
+      '',
+    senderName: normalizeReference(item?.remitente?.nombre) || '',
+    primaryPhone: welcomePhoneCandidates[0] || allPhoneCandidates[0] || '',
+    welcomePhoneCandidates,
+    latestEventLabel: getPackageEventLabel(latestEvent),
+    latestEventLocation: getPackageEventLocation(latestEvent),
+    latestEventDate: normalizeReference(latestEvent?.fecha),
+    latestEventSignature: getPackageEventSignature(latestEvent),
+    sources: ['Tracking'],
+    phoneCandidates: allPhoneCandidates,
+    phoneNames: getPackageSyncPhoneNames(item, 'tracking'),
+  }
+}
+
+const syncPackagePipelineFromApis = async ({ reconciliation = false } = {}) => {
   await ensureDatabaseReady()
   reloadLocalEnv()
 
-  const [trackingItems, contactPackageCatalog] = await Promise.all([
-    fetchAllTrackingPackagesCatalog({ forceRefresh: true }).then((payload) => payload.data ?? []),
-    fetchAllContactPackagesCatalog({ forceRefresh: true }).then((payload) => payload.data ?? []),
-  ])
-  const latestEventsByCode = buildLatestPackageEventsByCode(
-    await fetchAllPackageEventsCatalog({ forceRefresh: true })
-      .then((payload) => payload.data ?? [])
-      .catch(() => []),
-  )
+  const whatsappConfig = await getStoredWhatsAppConfig()
+  const configuredTestNumbers = getConfiguredWhatsAppTestNumbers(whatsappConfig)
+  const testModeCodes = await getTestModePackageCodes(whatsappConfig)
+  const testModeEnabled =
+    normalizeBoolean(whatsappConfig.testModeEnabled, whatsappDefaults.testModeEnabled) &&
+    WHATSAPP_PACKAGE_WATCHER_TEST_MODE_RESTRICTED
+
+  let trackingItems = []
+  let contactPackageCatalog = []
+  let latestEventsByCode = new Map()
+  const packageEventSourceFailures = []
+  const testModePackagePhones = new Map()
+
+  if (testModeEnabled) {
+    const trackingApiDefaults = getTrackingApiDefaults()
+    const trackingUrl = new URL('/api/tracking/paquetes', trackingApiDefaults.baseUrl)
+    const contactPackagesApiDefaults = getContactPackagesApiDefaults()
+    const contactUrl = new URL(contactPackagesApiDefaults.endpoint)
+    const trackingHeaders = {
+      Authorization: `Bearer ${trackingApiDefaults.token}`,
+      Accept: 'application/json',
+    }
+    const contactHeaders = {
+      Authorization: `Bearer ${contactPackagesApiDefaults.token}`,
+      Accept: 'application/json',
+    }
+
+    const phonePackageResults = await Promise.all(configuredTestNumbers.flatMap((number) =>
+      getWhatsAppNumberCandidates(number).map(async (phone) => ({
+        phone,
+        trackingItems: await fetchTestModePackageItemsByPhone({
+          url: trackingUrl,
+          headers: trackingHeaders,
+          queryParam: 'telefono',
+          phone,
+          source: 'tracking',
+        }),
+        contactItems: await fetchTestModePackageItemsByPhone({
+          url: contactUrl,
+          headers: contactHeaders,
+          queryParam: 'telefono',
+          phone,
+          source: 'contact',
+        }),
+      })),
+    ))
+    const latestPackageResults = await Promise.all([
+      fetchLatestTestModePackageItems({
+        url: trackingUrl,
+        headers: trackingHeaders,
+        source: 'tracking',
+        configuredNumbers: configuredTestNumbers,
+      }),
+      fetchLatestTestModePackageItems({
+        url: contactUrl,
+        headers: contactHeaders,
+        source: 'contact',
+        configuredNumbers: configuredTestNumbers,
+      }),
+    ])
+    const packageResultsBySource = latestPackageResults
+    const latestDiscoveredCodes = [...new Set(packageResultsBySource
+      .flatMap((items) => items.map(getPackageCodeFromItem))
+      .filter(Boolean))]
+    console.log(
+      `Modo prueba: paquetes recientes asociados detectados: ${latestDiscoveredCodes.slice(0, 20).join(', ') || 'ninguno'}.`,
+    )
+    phonePackageResults.push({
+      phone: '',
+      trackingItems: packageResultsBySource[0],
+      contactItems: packageResultsBySource[1],
+    })
+    const discoveredPackageCodes = phonePackageResults.flatMap((result) => [
+      ...result.trackingItems,
+      ...result.contactItems,
+    ]).map(getPackageCodeFromItem).filter(Boolean)
+    for (const result of phonePackageResults) {
+      for (const item of [...result.trackingItems, ...result.contactItems]) {
+        const code = getPackageCodeFromItem(item)
+        if (!code || !result.phone) continue
+        const phones = testModePackagePhones.get(code) ?? new Set()
+        phones.add(result.phone)
+        testModePackagePhones.set(code, phones)
+      }
+    }
+    const allTestModeCodes = [...new Set([...testModeCodes, ...discoveredPackageCodes])]
+
+    const packageResults = await Promise.all(allTestModeCodes.map(async (code) => {
+      const [trackingResult, contactResult, eventsResult] = await Promise.all([
+        fetchExactPackageCodeMatches({ url: trackingUrl, headers: trackingHeaders, queryParam: 'q', code }),
+        fetchExactPackageCodeMatches({ url: contactUrl, headers: contactHeaders, queryParam: 'codigo', code }),
+        fetchPackageEventsForCode(code).catch(() => null),
+      ])
+      return {
+        code,
+        trackingItems: trackingResult.items,
+        contactItems: contactResult.items,
+        events: Array.isArray(eventsResult?.data) ? eventsResult.data : [],
+      }
+    }))
+
+    trackingItems = packageResults.flatMap((result) => result.trackingItems)
+    contactPackageCatalog = packageResults.flatMap((result) => result.contactItems)
+    for (const result of packageResults) {
+      const associatedPhones = testModePackagePhones.get(result.code) ?? new Set()
+      for (const item of [...result.trackingItems, ...result.contactItems]) {
+        const itemPhones = [
+          ...extractTrackingApiPhoneCandidates(item),
+          ...extractContactPackagesPhoneCandidates(item),
+        ]
+        for (const itemPhone of itemPhones) {
+          const itemCandidates = getWhatsAppNumberCandidates(itemPhone)
+          const matchingConfiguredPhones = configuredTestNumbers.filter((number) =>
+            getWhatsAppNumberCandidates(number).some((candidate) => itemCandidates.includes(candidate)),
+          )
+          matchingConfiguredPhones.forEach((number) => {
+            const normalizedNumber = normalizeBoliviaTestNumber(number)
+            if (normalizedNumber) associatedPhones.add(normalizedNumber)
+          })
+        }
+      }
+      if (associatedPhones.size > 0) {
+        testModePackagePhones.set(result.code, associatedPhones)
+      }
+    }
+    latestEventsByCode = buildLatestPackageEventsByCode(
+      packageResults.flatMap((result) => result.events),
+    )
+    console.log(
+      `Modo prueba: sincronizando ${allTestModeCodes.length} paquete(s) asociado(s) a los nÃºmeros de prueba.`,
+    )
+    for (const number of configuredTestNumbers) {
+      const matchingCodes = [...new Set(phonePackageResults
+        .flatMap((result) => [...result.trackingItems, ...result.contactItems])
+        .filter((item) =>
+          [...extractTrackingApiPhoneCandidates(item), ...extractContactPackagesPhoneCandidates(item)]
+          .some((phone) => normalizeBoliviaTestNumber(phone) === normalizeBoliviaTestNumber(number)),
+        )
+        .map(getPackageCodeFromItem)
+        .filter(Boolean))]
+      console.log(
+        `Modo prueba: ${number} tiene ${matchingCodes.length} paquete(s) descubierto(s) por telÃ©fono: ${matchingCodes.join(', ') || 'ninguno'}.`,
+      )
+    }
+  } else {
+    ;[trackingItems, contactPackageCatalog, latestEventsByCode] = await Promise.all([
+      fetchAllTrackingPackagesCatalog({ forceRefresh: true }).then((payload) => payload.data ?? []),
+      fetchAllContactPackagesCatalog({ forceRefresh: true }).then((payload) => payload.data ?? []),
+      fetchAllPackageEventsCatalog({ forceRefresh: true })
+        .then((payload) => {
+          if (payload.skipped) packageEventSourceFailures.push('eventos-api-no-configurada')
+          return buildLatestPackageEventsByCode(payload.data ?? [])
+        })
+        .catch(() => {
+          packageEventSourceFailures.push('eventos-api-no-disponible')
+          return new Map()
+        }),
+    ])
+  }
 
   const packageEntriesByCode = new Map()
   const registerEntry = (entry) => {
@@ -2342,17 +4178,25 @@ const syncPackagePipelineFromApis = async () => {
         ...entry,
         sources: new Set(entry.sources ?? []),
         phoneCandidates: new Set(entry.phoneCandidates ?? []),
+        phoneNames: new Map(entry.phoneNames ?? []),
       })
       return
     }
 
     existing.sources = new Set([...(existing.sources ?? []), ...(entry.sources ?? [])])
     existing.phoneCandidates = new Set([...(existing.phoneCandidates ?? []), ...(entry.phoneCandidates ?? [])])
+    existing.phoneNames = new Map([...(existing.phoneNames ?? []), ...(entry.phoneNames ?? [])])
 
-    const shouldReplace =
-      entry.updatedAt > existing.updatedAt ||
-      (entry.updatedAt === existing.updatedAt &&
-        getPackageSyncEntrySpecificity(entry) > getPackageSyncEntrySpecificity(existing))
+    const entryEventTimestamp = Number(entry.latestEventTimestamp) || 0
+    const existingEventTimestamp = Number(existing.latestEventTimestamp) || 0
+    const hasComparableEventTimestamps = entryEventTimestamp > 0 || existingEventTimestamp > 0
+    const shouldReplace = hasComparableEventTimestamps
+      ? entryEventTimestamp > existingEventTimestamp ||
+        (entryEventTimestamp === existingEventTimestamp &&
+          getPackageSyncEntrySpecificity(entry) > getPackageSyncEntrySpecificity(existing))
+      : entry.updatedAt > existing.updatedAt ||
+        (entry.updatedAt === existing.updatedAt &&
+          getPackageSyncEntrySpecificity(entry) > getPackageSyncEntrySpecificity(existing))
 
     if (shouldReplace) {
       packageEntriesByCode.set(entry.code, {
@@ -2360,86 +4204,90 @@ const syncPackagePipelineFromApis = async () => {
         ...entry,
         sources: existing.sources,
         phoneCandidates: existing.phoneCandidates,
+        phoneNames: existing.phoneNames,
       })
     }
   }
 
   trackingItems.forEach((item) => {
-    const code = getPackageCodeFromItem(item)
-    if (!code) return
-
-    const registeredLatestEvent = latestEventsByCode.get(normalizePackageCodeForLookup(code))
-    const latestEvent = registeredLatestEvent ?? getTrackingLatestEvent(item)
-    const stage = getNationalPackageStageFromEvent(registeredLatestEvent) ?? inferTrackingPackageStage(item)
-    registerEntry({
-      code,
-      source: 'tracking',
-      stage,
-      updatedAt:
-        getPackageContextDateValue(latestEvent?.fecha_registro) ||
-        getPackageContextDateValue(latestEvent?.fecha) ||
-        getPackageContextDateValue(item?.fecha_registro) ||
-        0,
-      originLabel: getPackageLocationLabel(item?.origen, 'Sin origen'),
-      destinationLabel: getTrackingDestinationPlace(item),
-      destinationAddress: getTrackingDestinationAddress(item),
-      recipientName:
-        normalizeReference(item?.destinatario?.nombre) ||
-        normalizeReference(item?.remitente?.nombre) ||
-        '',
-      senderName: normalizeReference(item?.remitente?.nombre) || '',
-      primaryPhone: getPackageSyncPhoneCandidates(item, 'tracking')[0] || '',
-      latestEventLabel: getPackageEventLabel(latestEvent),
-      latestEventLocation: getPackageEventLocation(latestEvent),
-      latestEventDate: normalizeReference(latestEvent?.fecha),
-      latestEventSignature: getPackageEventSignature(latestEvent),
-      sources: ['Tracking'],
-      phoneCandidates: getPackageSyncPhoneCandidates(item, 'tracking'),
-    })
+    const entry = buildTrackingPackageSyncEntry({ item, latestEventsByCode })
+    if (entry) registerEntry(entry)
   })
 
   contactPackageCatalog.forEach((item) => {
-    const code = getPackageCodeFromItem(item)
-    if (!code) return
-
-    const registeredLatestEvent = latestEventsByCode.get(normalizePackageCodeForLookup(code))
-    const stage = getNationalPackageStageFromEvent(registeredLatestEvent) ?? inferContactPackageStage(item)
-    registerEntry({
-      code,
-      source: 'contact',
-      stage,
-      updatedAt:
-        getPackageContextDateValue(registeredLatestEvent?.fecha_registro) ||
-        getPackageContextDateValue(registeredLatestEvent?.fecha) ||
-        getPackageContextDateValue(item?.fecha_registro) ||
-        0,
-      originLabel: getPackageLocationLabel(item?.origen, 'Sin origen'),
-      destinationLabel:
-        getPackageDepartmentLabel(item?.destino) ||
-        getPackageLocationLabel(item?.destino, 'Sin destino') ||
-        normalizeReference(item?.destinatario?.direccion) ||
-        'Sin destino',
-      destinationAddress:
-        normalizeReference(item?.destinatario?.direccion) ||
-        normalizeReference(item?.destino?.direccion) ||
-        '',
-      recipientName: normalizeReference(item?.destinatario?.nombre) || '',
-      senderName: normalizeReference(item?.remitente?.nombre) || '',
-      primaryPhone: getPackageSyncPhoneCandidates(item, 'contact')[0] || '',
-      latestEventLabel: getPackageEventLabel(registeredLatestEvent) || normalizeReference(item?.estado?.nombre) || 'Paquete registrado',
-      latestEventLocation: getPackageEventLocation(registeredLatestEvent) || getPackageLocationLabel(item?.origen, ''),
-      latestEventDate: normalizeReference(registeredLatestEvent?.fecha_registro) || normalizeReference(registeredLatestEvent?.fecha) || normalizeReference(item?.fecha_registro),
-      latestEventSignature: getPackageEventSignature(registeredLatestEvent) || [
-        normalizeReference(item?.estado?.nombre) || 'Paquete registrado',
-        normalizeReference(item?.fecha_registro),
-      ]
-        .map((value) => normalizeReference(value).toUpperCase())
-        .filter(Boolean)
-        .join('|'),
-      sources: ['Paquetes-Contactos'],
-      phoneCandidates: getPackageSyncPhoneCandidates(item, 'contact'),
-    })
+    const entry = buildContactPackageSyncEntry({ item, latestEventsByCode })
+    if (entry) registerEntry(entry)
   })
+
+  if (testModeEnabled) {
+    for (const [code, entry] of packageEntriesByCode) {
+      const associatedPhones = [...(testModePackagePhones.get(code) ?? [])]
+      if (associatedPhones.length > 0) {
+        entry.testModeTargetPhones = associatedPhones
+      }
+    }
+
+    for (const code of testModeCodes) {
+      if (packageEntriesByCode.has(code)) continue
+
+      const contact = await findPackageContactByCode(code)
+      if (!contact) {
+        console.warn(`[${code}] No existe contacto CRM ni registro completo en las APIs.`)
+        continue
+      }
+
+      const latestEvent = latestEventsByCode.get(code)
+      const stage =
+        getPackageStageFromEvents({ eventos: latestEvent ? [latestEvent] : [] }) ||
+        getEmsStageFromContactStatus(contact.status)
+      const eventLabel = getPackageEventLabel(latestEvent) || normalizeReference(contact.status) || 'Paquete registrado'
+      const eventLocation = getPackageEventLocation(latestEvent) || cleanPackagePlaceLabel(contact.company)
+      const eventDate =
+        normalizeReference(latestEvent?.fecha_registro) ||
+        normalizeReference(latestEvent?.fecha) ||
+        (contact.updated_at ? new Date(contact.updated_at).toISOString() : '')
+      const eventSignature =
+        getPackageEventSignature(latestEvent) ||
+        [stage, code, eventLabel, eventLocation, eventDate]
+          .map((value) => normalizeReference(value).toUpperCase())
+          .filter(Boolean)
+          .join('|')
+      const targetPhones = [
+        ...(testModePackagePhones.get(code) ?? []),
+        ...getWhatsAppPhonesFromStoredContact(contact, configuredTestNumbers),
+      ].filter((phone, index, phones) => phones.indexOf(phone) === index)
+
+      registerEntry({
+        code,
+        source: 'contact',
+        stage,
+        updatedAt: getPackageContextDateValue(eventDate),
+        originLabel: 'origen',
+        destinationLabel: cleanPackagePlaceLabel(contact.company, 'destino'),
+        destinationAddress: '',
+        recipientName: normalizeReference(contact.name),
+        senderName: '',
+        primaryPhone: targetPhones[0] || '',
+        latestEventLabel: eventLabel,
+        latestEventLocation: eventLocation,
+        latestEventDate: eventDate,
+        latestEventSignature: eventSignature,
+        phoneCandidates: targetPhones,
+        phoneNames: new Map(targetPhones.map((number) => [
+          normalizeBoliviaTestNumber(number),
+          normalizeReference(contact.name),
+        ])),
+        testModeTargetPhones: targetPhones,
+        sources: ['CRM modo prueba'],
+      })
+      console.log(`[${code}] Se usarÃ¡ el contacto CRM como respaldo para notificar.`)
+    }
+
+    for (const [code, entry] of packageEntriesByCode) {
+      if (!testModeCodes.includes(code)) continue
+      entry.testModeTargetPhones = [...(testModePackagePhones.get(code) ?? [])]
+    }
+  }
 
   const packageEntries = [...packageEntriesByCode.values()]
   const client = await pool.connect()
@@ -2459,7 +4307,7 @@ const syncPackagePipelineFromApis = async () => {
         updatedCount += 1
       }
       if (nextResult?.id) {
-        syncedEntries.push({ ...entry, contactId: nextResult.id })
+        syncedEntries.push({ ...entry, contactId: nextResult.id, action: nextResult.action })
       }
     }
 
@@ -2476,13 +4324,51 @@ const syncPackagePipelineFromApis = async () => {
     statusCode: 200,
     details: {
       total: packageEntries.length,
+      packageCountsBySource: {
+        tracking: trackingItems.length,
+        contact: contactPackageCatalog.length,
+      },
+      packageEventSourceFailures,
       createdCount,
       updatedCount,
       syncedAt,
     },
   }).catch(() => {})
 
-  await notifyPackageEventChanges(syncedEntries).catch(async (error) => {
+  const welcomeIntervalMs = Number.isFinite(PACKAGE_NEW_PACKAGE_WELCOME_INTERVAL_MS)
+    ? Math.max(PACKAGE_NEW_PACKAGE_WELCOME_INTERVAL_MS, 60000)
+    : 600000
+  const shouldCheckNewPackageWelcome =
+    reconciliation ||
+    lastNewPackageWelcomeCheckAt === 0 ||
+    Date.now() - lastNewPackageWelcomeCheckAt >= welcomeIntervalMs ||
+    syncedEntries.some((entry) => entry?.action === 'created' && entry?.source === 'contact')
+  let newPackageWelcomeResult = {
+    sent: 0,
+    skipped: syncedEntries.length,
+    reason: 'new-package-welcome-check-not-due',
+  }
+
+  if (shouldCheckNewPackageWelcome) {
+    lastNewPackageWelcomeCheckAt = Date.now()
+    newPackageWelcomeResult = await notifyNewPackageContacts(syncedEntries).catch(async (error) => {
+      await writeSystemLog({
+        level: 'error',
+        event: 'whatsapp_new_package_welcome_failed',
+        statusCode: 500,
+        details: {
+          error: error instanceof Error ? error.message : 'Error desconocido.',
+        },
+      }).catch(() => {})
+      return {
+        sent: 0,
+        skipped: syncedEntries.length,
+        error: error instanceof Error ? error.message : 'Error desconocido.',
+      }
+    })
+  }
+
+  const eventNotificationResult = await notifyPackageEventChanges(syncedEntries, { requireWelcome: false }).catch(async (error) => {
     await writeSystemLog({
       level: 'error',
       event: 'package_event_change_notification_failed',
@@ -2491,17 +4377,192 @@ const syncPackagePipelineFromApis = async () => {
         error: error instanceof Error ? error.message : 'Error desconocido.',
       },
     }).catch(() => {})
+    return {
+      sent: 0,
+      skipped: syncedEntries.length,
+      error: error instanceof Error ? error.message : 'Error desconocido.',
+    }
   })
+
+  console.log(
+    `Notificaciones de eventos: ${eventNotificationResult.sent} enviado(s), ${eventNotificationResult.skipped} omitido(s).`,
+  )
 
   return {
     syncedAt,
     createdCount,
     updatedCount,
     total: packageEntries.length,
+    packageCountsBySource: {
+      tracking: trackingItems.length,
+      contact: contactPackageCatalog.length,
+    },
+    packageSourceFailures: packageEventSourceFailures,
+    newPackageWelcome: newPackageWelcomeResult,
+    eventNotifications: eventNotificationResult,
   }
 }
 
-const ensurePackagePipelineSync = async ({ force = false } = {}) => {
+const syncRecentPackageAutomations = async ({ sendWelcome = true, sendEvents = true } = {}) => {
+  await ensureDatabaseReady()
+
+  const automationConfig = await getStoredAutomationConfig()
+  const shouldSendWelcome = sendWelcome && automationConfig.automaticWelcome
+  const shouldSendEvents = sendEvents && automationConfig.automaticStatusUpdates
+
+  if (!shouldSendWelcome && !shouldSendEvents) {
+    return {
+      syncedAt: new Date().toISOString(),
+      total: 0,
+      createdCount: 0,
+      newPackageWelcome: { sent: 0, skipped: 0, reason: 'new-package-welcome-disabled' },
+      eventNotifications: { sent: 0, skipped: 0, reason: 'automatic-status-updates-disabled' },
+    }
+  }
+
+  let recentContactItems = []
+  let recentTrackingItems = []
+  const packageSourceFailures = []
+  if (shouldSendWelcome) {
+    const [contactResult, trackingResult] = await Promise.allSettled([
+      fetchRecentContactPackagesCatalog(),
+      fetchRecentTrackingPackagesCatalog(),
+    ])
+    if (contactResult.status === 'fulfilled') {
+      recentContactItems = contactResult.value
+    } else {
+      packageSourceFailures.push('paquetes-contactos')
+      console.warn(
+        `Watcher WhatsApp: no se pudo consultar Paquetes-Contactos para bienvenidas: ${contactResult.reason instanceof Error ? contactResult.reason.message : 'Error desconocido.'}`,
+      )
+    }
+    if (trackingResult.status === 'fulfilled') {
+      recentTrackingItems = trackingResult.value
+    } else {
+      packageSourceFailures.push('tracking')
+      console.warn(
+        `Watcher WhatsApp: no se pudo consultar Tracking para bienvenidas: ${trackingResult.reason instanceof Error ? trackingResult.reason.message : 'Error desconocido.'}`,
+      )
+    }
+    if (contactResult.status === 'rejected' && trackingResult.status === 'rejected') {
+      throw new Error('No se pudieron consultar las fuentes de paquetes recientes para bienvenidas.')
+    }
+  }
+  const packageCountsBySource = {
+    contact: recentContactItems.length,
+    tracking: recentTrackingItems.length,
+  }
+  const recentEvents = shouldSendEvents ? await fetchRecentPackageEventsCatalog() : []
+  const latestEventsByCode = buildLatestPackageEventsByCode(recentEvents)
+
+  let eventPackageItems = []
+  if (latestEventsByCode.size > 0) {
+    const contactPackagesApiDefaults = getContactPackagesApiDefaults()
+    const contactUrl = new URL(contactPackagesApiDefaults.endpoint)
+    const contactHeaders = {
+      Authorization: `Bearer ${contactPackagesApiDefaults.token}`,
+      Accept: 'application/json',
+    }
+    const eventCodes = [...latestEventsByCode.keys()]
+    const eventPackageResults = await Promise.all(
+      eventCodes.map((code) =>
+        fetchExactPackageCodeMatches({
+          url: contactUrl,
+          headers: contactHeaders,
+          queryParam: 'codigo',
+          code,
+          perPage: 20,
+          timeoutMs: Number.parseInt(process.env.CONTACT_PACKAGES_PAGE_TIMEOUT_MS || '8000', 10),
+        }).catch(() => ({ items: [] })),
+      ),
+    )
+    eventPackageItems = eventPackageResults.flatMap((result) => result.items ?? [])
+  }
+
+  const recentEntriesByCode = new Map()
+  for (const item of [...recentContactItems, ...eventPackageItems]) {
+    const entry = buildContactPackageSyncEntry({ item, latestEventsByCode })
+    if (!entry?.code) continue
+    const lookupCode = normalizePackageCodeForLookup(entry.code)
+    if (!lookupCode) continue
+    recentEntriesByCode.set(lookupCode, entry)
+  }
+  for (const item of recentTrackingItems) {
+    const entry = buildTrackingPackageSyncEntry({ item, latestEventsByCode })
+    if (!entry?.code) continue
+    const lookupCode = normalizePackageCodeForLookup(entry.code)
+    if (!lookupCode) continue
+    const existingEntry = recentEntriesByCode.get(lookupCode)
+    if (existingEntry) {
+      if (existingEntry.source === 'contact' && !existingEntry.primaryPhone) {
+        existingEntry.primaryPhone = entry.welcomePhoneCandidates[0] || ''
+        existingEntry.phoneNames = new Map([
+          ...(existingEntry.phoneNames ?? []),
+          ...(entry.phoneNames ?? []),
+        ])
+      }
+      continue
+    }
+    recentEntriesByCode.set(lookupCode, entry)
+  }
+  const recentEntries = [...recentEntriesByCode.values()]
+
+  if (recentEntries.length === 0) {
+    return {
+      syncedAt: new Date().toISOString(),
+      total: 0,
+      createdCount: 0,
+      packageCountsBySource,
+      packageSourceFailures,
+      newPackageWelcome: { sent: 0, skipped: 0 },
+      eventNotifications: { sent: 0, skipped: 0 },
+    }
+  }
+
+  const client = await pool.connect()
+  const syncedEntries = []
+  let createdCount = 0
+
+  try {
+    await client.query('begin')
+
+    for (const entry of recentEntries) {
+      const nextResult = await upsertPackageContact(client, entry)
+      if (nextResult?.action === 'created') {
+        createdCount += 1
+      }
+      if (nextResult?.id) {
+        syncedEntries.push({ ...entry, contactId: nextResult.id, action: nextResult.action })
+      }
+    }
+
+    await client.query('commit')
+  } catch (error) {
+    await client.query('rollback').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
+
+  const newPackageWelcome = shouldSendWelcome
+    ? await notifyNewPackageContacts(syncedEntries)
+    : { sent: 0, skipped: syncedEntries.length, reason: 'new-package-welcome-not-due' }
+  const eventNotifications = shouldSendEvents
+    ? await notifyPackageEventChanges(syncedEntries, { requireWelcome: false })
+    : { sent: 0, skipped: syncedEntries.length, reason: 'automatic-status-updates-disabled' }
+
+  return {
+    syncedAt: new Date().toISOString(),
+    total: recentEntries.length,
+    createdCount,
+    packageCountsBySource,
+    packageSourceFailures,
+    newPackageWelcome,
+    eventNotifications,
+  }
+}
+
+const ensurePackagePipelineSync = async ({ force = false, reconciliation = false } = {}) => {
   const cached = getCachedValue(packagePipelineSyncCache, 'last-sync')
   if (!force && cached && cached.syncedAt) {
     const age = Date.now() - Date.parse(cached.syncedAt)
@@ -2511,11 +4572,13 @@ const ensurePackagePipelineSync = async ({ force = false } = {}) => {
   }
 
   const pending = getCachedValue(packagePipelineSyncCache, 'in-flight')
-  if (!force && pending) {
-    return pending
+  if (pending) {
+    if (!force || !reconciliation) return pending
+    await pending.catch(() => {})
+    return ensurePackagePipelineSync({ force: true, reconciliation: true })
   }
 
-  const syncPromise = syncPackagePipelineFromApis()
+  const syncPromise = syncPackagePipelineFromApis({ reconciliation })
     .then((result) => {
       setCachedValue(packagePipelineSyncCache, 'last-sync', result, PACKAGE_PIPELINE_SYNC_TTL_MS)
       return result
@@ -2533,25 +4596,348 @@ const getPackagePipelineSyncSnapshot = () => {
   return cached && typeof cached === 'object' ? cached : null
 }
 
+const cleanPackagePlaceLabel = (value, fallback = '') => {
+  const cleaned = normalizeReference(value)
+    .replace(/(?:Paquetes-Contactos API|Tracking API)\s*Â·\s*/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  return cleaned || fallback
+}
+
 const buildPackageEventChangeMessage = ({ contact, entry }) => {
-  const contactName = normalizeReference(contact?.name) || 'Hola'
+  const contactName = normalizeReference(entry?.recipientName) || normalizeReference(contact?.name) || 'Hola'
   const packageCode = normalizeReference(entry?.code) || 'tu guia'
-  const destination = normalizeReference(entry?.destinationLabel) || 'destino'
+  const destination = cleanPackagePlaceLabel(entry?.destinationLabel, 'destino')
   const eventLabel = normalizeReference(entry?.latestEventLabel) || 'Nuevo movimiento registrado'
-  const eventLocation = normalizeReference(entry?.latestEventLocation)
+  const eventLocation = cleanPackagePlaceLabel(entry?.latestEventLocation)
   const eventDate = normalizeReference(entry?.latestEventDate)
+  const destinationBranchText = formatBranchText(getBoliviaBranchLocation(destination))
   const locationText = eventLocation ? ` en ${eventLocation}` : ''
   const dateText = eventDate ? ` (${eventDate})` : ''
 
+  if (isPackageReturnToOriginEvent({ eventLabel, eventSignature: entry?.latestEventSignature })) {
+    return buildPackageReturnToOriginMessage({
+      contactName,
+      packageCode,
+      origin: cleanPackagePlaceLabel(entry?.originLabel, 'su departamento de origen'),
+      noticeDates: entry?.deliveryNoticeDates,
+    })
+  }
+
+  if (isVentanillaText(eventLabel) || isVentanillaText(entry?.latestEventSignature)) {
+    return buildVentanillaPickupMessage({
+      packageCode,
+      branch: getBoliviaBranchLocation(destination) || getBoliviaBranchLocation(eventLocation),
+    })
+  }
+
+  if (['received', 'transit', 'regional', 'courier', 'delivered', 'cancelled'].includes(entry?.stage)) {
+    const origin = cleanPackagePlaceLabel(entry?.originLabel, 'origen')
+    const baseTitle = `Â¡Hola, ${contactName}! ðŸ‘‹ Tenemos una actualizaciÃ³n de tu paquete *${packageCode}*.`
+
+    if (entry.stage === 'received') {
+      return [
+        baseTitle,
+        '',
+        `ðŸ“¥ Fue recibido en *${eventLocation || origin}* y tiene destino a *${destination}*.`,
+        'ðŸšš Te avisaremos apenas sea despachado.',
+      ].join('\n')
+    }
+
+    if (entry.stage === 'transit') {
+      return [
+        baseTitle,
+        '',
+        `ðŸšš Tu paquete ya estÃ¡ en camino hacia *${destination}*.`,
+        eventLocation ? `ðŸ“ Ãšltima actualizaciÃ³n registrada en ${eventLocation}.` : 'ðŸ“ Ãšltima actualizaciÃ³n registrada.',
+        'ðŸ“² Te notificaremos cuando registre un nuevo movimiento.',
+      ].join('\n')
+    }
+
+    if (entry.stage === 'regional') {
+      return [
+        baseTitle,
+        '',
+        `ðŸ¤ Ya llegÃ³ a la sucursal de destino en *${destination}*.`,
+        destinationBranchText ? `ðŸ“ UbicaciÃ³n: ${destinationBranchText}.` : `ðŸ“ UbicaciÃ³n actual: ${eventLocation || destination}.`,
+        'ðŸš´â€â™‚ï¸ Siguiente paso: pasarÃ¡ a reparto o quedarÃ¡ disponible segÃºn el proceso de la regional.',
+      ].join('\n')
+    }
+
+    if (entry.stage === 'courier') {
+      return [
+        baseTitle,
+        '',
+        `ðŸš´â€â™‚ï¸ Ya estÃ¡ con cartero para entrega en *${destination}*.`,
+        eventLocation ? `ðŸ“ UbicaciÃ³n actual: ${eventLocation}.` : '',
+        'âœ… Te avisaremos cuando se confirme la entrega.',
+      ].filter(Boolean).join('\n')
+    }
+
+    if (entry.stage === 'delivered') {
+      return [
+        baseTitle,
+        '',
+        `âœ… Figura entregado con Ã©xito en *${destination}*.`,
+        'Gracias por preferir Correos de Bolivia ðŸ˜Š.',
+      ].join('\n')
+    }
+
+    return [
+      baseTitle,
+      '',
+      `âŒ Figura cancelado o devuelto${eventLocation ? ` en *${eventLocation}*` : ''}.`,
+      'ðŸ’¡ Si necesitas revisar el motivo, escribe *RECLAMO*.',
+    ].join('\n')
+  }
+
+  if (entry?.stage === 'regional') {
+    return [
+      `Â¡Hola, ${contactName}! ðŸ‘‹ Tenemos una actualizaciÃ³n de tu paquete *${packageCode}*.`,
+      '',
+      `ðŸ¤ Ya llegÃ³ a la sucursal de destino en *${destination}*.`,
+      destinationBranchText ? `ðŸ“ UbicaciÃ³n: ${destinationBranchText}.` : `ðŸ“ UbicaciÃ³n actual: ${eventLocation || destination}.`,
+      'ðŸš´â€â™‚ï¸ Siguiente paso: pasarÃ¡ a reparto o quedarÃ¡ disponible segÃºn el proceso de la regional.',
+    ].join('\n')
+  }
+
+  if (entry?.stage === 'received') {
+    return [
+      `Â¡Hola, ${contactName}! ðŸ‘‹ Tenemos una actualizaciÃ³n de tu paquete *${packageCode}*.`,
+      '',
+      `ðŸ“¥ Fue recibido en *${eventLocation || 'origen'}* y tiene destino a *${destination}*.`,
+      'ðŸšš Te avisaremos apenas sea despachado.',
+    ].join('\n')
+  }
+
+  if (entry?.stage === 'transit') {
+    const isInternalDispatch = normalizeSearchText(eventLabel).includes('saca interna')
+
+    if (isInternalDispatch) {
+      return [
+        `Â¡Hola, ${contactName}! ðŸ‘‹ Tenemos una actualizaciÃ³n de tu paquete *${packageCode}*.`,
+        '',
+        `ðŸ“¦ Fue despachado desde *${eventLocation || entry?.originLabel || 'origen'}* con destino a *${destination}*.`,
+        'ðŸšš EstÃ¡ en trÃ¡nsito; te avisaremos cuando registre llegada a la regional de destino.',
+      ].join('\n')
+    }
+
+    return [
+      `Â¡Hola, ${contactName}! ðŸ‘‹ Tenemos una actualizaciÃ³n de tu paquete *${packageCode}*.`,
+      '',
+      `ðŸšš EstÃ¡ en trÃ¡nsito hacia *${destination}*.`,
+      eventLocation ? `ðŸ“ Ãšltimo registro: ${eventLabel} en ${eventLocation}${dateText}.` : `ðŸ“ Ãšltimo registro: ${eventLabel}${dateText}.`,
+      'ðŸ“² Te notificaremos cuando registre un nuevo movimiento.',
+    ].join('\n')
+  }
+
+  if (entry?.stage === 'courier') {
+    return [
+      `Â¡Hola, ${contactName}! ðŸ‘‹ Tenemos una actualizaciÃ³n de tu paquete *${packageCode}*.`,
+      '',
+      `ðŸš´â€â™‚ï¸ Ya estÃ¡ con cartero para entrega en *${destination}*.`,
+      eventLocation ? `ðŸ“ UbicaciÃ³n actual: ${eventLocation}.` : '',
+      'âœ… Te avisaremos cuando se confirme la entrega.',
+    ].filter(Boolean).join('\n')
+  }
+
+  if (entry?.stage === 'delivered') {
+    return [
+      `Â¡Hola, ${contactName}! ðŸ‘‹ Tenemos una actualizaciÃ³n de tu paquete *${packageCode}*.`,
+      '',
+      `âœ… Figura entregado con Ã©xito en *${destination}*.`,
+      'Gracias por preferir Correos de Bolivia ðŸ˜Š.',
+    ].join('\n')
+  }
+
+  if (entry?.stage === 'cancelled') {
+    return [
+      `Â¡Hola, ${contactName}! ðŸ‘‹ Tenemos una actualizaciÃ³n de tu paquete *${packageCode}*.`,
+      '',
+      `âŒ Figura cancelado o devuelto${eventLocation ? ` en *${eventLocation}*` : ''}.`,
+      'ðŸ’¡ Si necesitas revisar el motivo, escribe *RECLAMO*.',
+    ].join('\n')
+  }
+
   return [
-    `¡Hola, ${contactName}! 👋 Tenemos una actualización de tu paquete ${packageCode}.`,
+    `Â¡Hola, ${contactName}! ðŸ‘‹ Tenemos una actualizaciÃ³n de tu paquete ${packageCode}.`,
     '',
-    `📍 Nuevo evento: ${eventLabel}${locationText}${dateText}.`,
-    `🚚 Destino: ${destination}. Te avisaremos cuando se confirme el siguiente movimiento.`,
+    `ðŸ“ Nuevo evento: ${eventLabel}${locationText}${dateText}.`,
+    `ðŸšš Destino: ${destination}. Te avisaremos cuando se confirme el siguiente movimiento.`,
   ].join('\n')
 }
 
-const notifyPackageEventChanges = async (entries = []) => {
+const repairMojibakeText = (value) => {
+  const text = String(value ?? '')
+  if (!/[ÃÂðŸâ]/.test(text)) {
+    return text
+  }
+
+  const windows1252Extensions = {
+    0x20ac: 0x80,
+    0x201a: 0x82,
+    0x0192: 0x83,
+    0x201e: 0x84,
+    0x2026: 0x85,
+    0x2020: 0x86,
+    0x2021: 0x87,
+    0x02c6: 0x88,
+    0x2030: 0x89,
+    0x0160: 0x8a,
+    0x2039: 0x8b,
+    0x0152: 0x8c,
+    0x017d: 0x8e,
+    0x2018: 0x91,
+    0x2019: 0x92,
+    0x201c: 0x93,
+    0x201d: 0x94,
+    0x2022: 0x95,
+    0x2013: 0x96,
+    0x2014: 0x97,
+    0x02dc: 0x98,
+    0x2122: 0x99,
+    0x0161: 0x9a,
+    0x203a: 0x9b,
+    0x0153: 0x9c,
+    0x017e: 0x9e,
+    0x0178: 0x9f,
+  }
+  const bytes = Uint8Array.from([...text].map((character) => {
+    const characterCode = character.codePointAt(0) ?? 0x3f
+    const code = windows1252Extensions[characterCode] ?? characterCode
+    return code <= 0xff ? code : 0x3f
+  }))
+
+  return Buffer.from(bytes).toString('utf8')
+}
+
+const getRecentPackageInquiryPhones = async (packageCode) => {
+  const normalizedCode = normalizePackageCodeForLookup(packageCode)
+  if (!normalizedCode) return []
+
+  const result = await pool.query(
+    `
+      select distinct regexp_replace(coalesce(recipient_reference, ''), '[^0-9]', '', 'g') as phone
+      from message_logs
+      where channel = 'WhatsApp'
+        and direction = 'inbound'
+        and created_at >= now() - interval '7 days'
+        and upper(coalesce(message_text, '')) like $1
+      order by phone asc;
+    `,
+    [`%${normalizedCode}%`],
+  )
+
+  return result.rows
+    .map((row) => normalizeBoliviaTestNumber(row.phone))
+    .filter(Boolean)
+    .filter((phone, index, phones) => phones.indexOf(phone) === index)
+}
+
+const getPackageWelcomeRecipients = async (packageCode) => {
+  const normalizedCode = normalizePackageCodeForLookup(packageCode)
+  if (!normalizedCode) return []
+
+  const result = await pool.query(
+    `
+      select distinct regexp_replace(coalesce(details->>'recipient', ''), '[^0-9]', '', 'g') as phone
+      from system_logs
+      where event = 'whatsapp_new_package_welcome_sent'
+        and details->>'packageCode' = $1
+        and created_at >= now() - interval '30 days'
+      order by phone asc;
+    `,
+    [normalizedCode],
+  )
+
+  return result.rows
+    .map((row) => normalizeBoliviaTestNumber(row.phone))
+    .filter(Boolean)
+    .filter((phone, index, phones) => phones.indexOf(phone) === index)
+}
+
+const getEntryPhoneCandidates = (entry) => [
+  ...(Array.isArray(entry?.phoneCandidates)
+    ? entry.phoneCandidates
+    : entry?.phoneCandidates instanceof Set
+      ? [...entry.phoneCandidates]
+      : []),
+  entry?.primaryPhone,
+]
+
+const getNormalizedWhatsAppRecipients = (phones = []) =>
+  phones
+    .map(normalizeBoliviaTestNumber)
+    .filter(Boolean)
+    .filter(isValidWhatsAppRecipientNumber)
+    .filter((phone, index, normalizedPhones) => normalizedPhones.indexOf(phone) === index)
+
+const getPackageNotificationRecipients = ({ config, entry, phones = [] }) => {
+  const testModeEnabled = normalizeBoolean(config?.testModeEnabled, whatsappDefaults.testModeEnabled)
+  const packageRecipients = getNormalizedWhatsAppRecipients(phones)
+  const testRecipients = getNormalizedWhatsAppRecipients(getConfiguredWhatsAppTestNumbers(config))
+  const associatedPhones = getNormalizedWhatsAppRecipients([
+    ...(entry?.phoneNames instanceof Map ? [...entry.phoneNames.keys()] : []),
+    ...(Array.isArray(entry?.testModeTargetPhones) ? entry.testModeTargetPhones : []),
+    ...phones,
+  ])
+
+  return selectPackageNotificationRecipients({
+    testModeEnabled,
+    packageRecipients,
+    testRecipients,
+    associatedPhones,
+  })
+}
+
+const insertOutboundWhatsAppLog = async ({ contactId, recipient, messageBody, providerMessageId }) =>
+  pool.query(
+    `
+      insert into message_logs (
+        contact_id,
+        channel,
+        direction,
+        recipient_reference,
+        message_text,
+        provider_name,
+        provider_message_id,
+        status
+      )
+      values ($1, 'WhatsApp', 'outbound', $2, $3, 'Meta Cloud API', $4, 'sent');
+    `,
+    [contactId ?? null, recipient, messageBody, providerMessageId],
+  )
+
+const sendAndLogPackageWhatsAppMessage = async ({ config, contactId, recipient, messageBody }) => {
+  const repairedMessageBody = repairMojibakeText(messageBody)
+  const providerResponse = await sendWhatsAppCloudMessage({
+    accessToken: config.accessToken,
+    apiVersion: config.apiVersion,
+    phoneNumberId: config.phoneNumberId,
+    to: recipient,
+    body: repairedMessageBody,
+  })
+  const providerMessageId = providerResponse?.messages?.[0]?.id ?? providerResponse?.message_id ?? null
+
+  await insertOutboundWhatsAppLog({
+    contactId,
+    recipient,
+    messageBody: repairedMessageBody,
+    providerMessageId,
+  })
+
+  return providerMessageId
+}
+
+const notifyPackageEventChanges = async (entries = [], { requireWelcome = true } = {}) => {
+  const automationConfig = await getStoredAutomationConfig()
+  if (!WHATSAPP_STAGE_WATCHER_ENABLED && !automationConfig.automaticStatusUpdates) {
+    console.log(
+      `Actualizaciones de estado desactivadas; se leyeron ${entries.length} paquetes sin enviar mensajes.`,
+    )
+    return { sent: 0, skipped: entries.length, reason: 'automatic-status-updates-disabled' }
+  }
   const config = await getStoredWhatsAppConfig()
   const configError = validateWhatsAppConfig(config)
 
@@ -2561,20 +4947,94 @@ const notifyPackageEventChanges = async (entries = []) => {
 
   let sent = 0
   let skipped = 0
+  const sentDetails = []
+  const skippedByReason = {}
+  const recordSkipped = async (entry, reason, extra = {}) => {
+    skipped += 1
+    skippedByReason[reason] = (skippedByReason[reason] || 0) + 1
+    await writeSystemLog({
+      event: 'whatsapp_package_event_update_skipped',
+      statusCode: 200,
+      details: {
+        packageCode: normalizePackageCodeForLookup(entry?.code),
+        contactId: entry?.contactId ?? null,
+        packageStage: entry?.stage ?? null,
+        eventSignature: normalizeReference(entry?.latestEventSignature),
+        reason,
+        ...extra,
+      },
+    }).catch(() => {})
+  }
 
   for (const entry of entries) {
     const packageCode = normalizePackageCodeForLookup(entry?.code)
     const eventSignature = normalizeReference(entry?.latestEventSignature)
-    const targetPhone = normalizePhoneNumber(entry?.primaryPhone)
-
-    if (!packageCode || !eventSignature || !targetPhone || !entry?.contactId) {
-      skipped += 1
+    if (!isPackageEventNotificationEligible({
+      stage: entry?.stage,
+      eventLabel: entry?.latestEventLabel,
+      eventSignature,
+    })) {
+      await recordSkipped(entry, 'ineligible-stage')
       continue
     }
 
+    if (requireWelcome) {
+      const welcomeResult = await pool.query(
+        `
+          select created_at, details
+          from system_logs
+          where event = 'whatsapp_new_package_welcome_sent'
+            and details->>'packageCode' = $1
+          order by created_at desc, id desc
+          limit 1;
+        `,
+        [packageCode],
+      )
+      const lastWelcome = welcomeResult.rows[0] ?? null
+      if (!lastWelcome) {
+        await recordSkipped(entry, 'welcome-not-sent')
+        continue
+      }
+    }
+
+    const interestedPhones = await getRecentPackageInquiryPhones(packageCode)
+    const packageWelcomeRecipients = await getPackageWelcomeRecipients(packageCode)
+    const isDeliveredUpdate = entry?.stage === 'delivered'
+    const targetPhones = getPackageNotificationRecipients({
+      config,
+      entry,
+      phones: (entry?.source === 'contact'
+      ? (isDeliveredUpdate
+          ? getEntryPhoneCandidates(entry)
+          : [entry?.primaryPhone])
+      : [
+          ...getEntryPhoneCandidates(entry),
+        ])
+        .concat(interestedPhones)
+        .concat(packageWelcomeRecipients)
+        .concat(entry?.testModeTargetPhones ?? []),
+    })
+
+    if (!packageCode || !eventSignature || targetPhones.length === 0 || !entry?.contactId) {
+      await recordSkipped(entry, !packageCode
+        ? 'missing-package-code'
+        : !eventSignature
+          ? 'missing-event-signature'
+          : targetPhones.length === 0
+            ? 'missing-recipient'
+            : 'missing-contact-id', {
+        recipients: targetPhones,
+      })
+      continue
+    }
+
+    console.log(
+      `[${packageCode}] Nuevo evento detectado: ${entry.latestEventLabel || 'sin descripciÃ³n'}; preparando mensaje para ${targetPhones.join(', ')}.`,
+    )
+
     const lastObservedResult = await pool.query(
       `
-        select details
+        select event, details
         from system_logs
         where event in ('package_event_observed', 'whatsapp_package_event_update_sent')
           and details->>'packageCode' = $1
@@ -2585,14 +5045,8 @@ const notifyPackageEventChanges = async (entries = []) => {
     )
     const lastSignature = normalizeReference(lastObservedResult.rows[0]?.details?.eventSignature)
 
-    if (lastSignature === eventSignature) {
-      skipped += 1
-      continue
-    }
-
     const baseDetails = {
       contactId: entry.contactId,
-      recipient: targetPhone,
       packageCode,
       eventSignature,
       packageStage: entry.stage,
@@ -2607,99 +5061,254 @@ const notifyPackageEventChanges = async (entries = []) => {
         statusCode: 200,
         details: baseDetails,
       }).catch(() => {})
-      skipped += 1
-      continue
     }
 
-    const outboundHistoryResult = await pool.query(
-      `
-        select id
-        from message_logs
-        where channel = 'WhatsApp'
-          and direction = 'outbound'
-          and contact_id = $1
-        order by created_at desc, id desc
-        limit 1;
-      `,
-      [entry.contactId],
-    )
+    const contact = await findPackageContactByCode(packageCode)
+    const phoneNames = entry?.phoneNames instanceof Map ? entry.phoneNames : new Map()
+    for (const targetPhone of targetPhones) {
+      const alreadySentResult = await pool.query(
+        `
+          select id
+          from system_logs
+          where event = 'whatsapp_package_event_update_sent'
+            and details->>'packageCode' = $1
+            and (
+              details->>'eventSignature' = $2
+              or ($4 = 'delivered' and details->>'packageStage' = 'delivered')
+            )
+            and regexp_replace(coalesce(details->>'recipient', ''), '[^0-9]', '', 'g') = $3
+          limit 1;
+        `,
+        [packageCode, eventSignature, targetPhone, entry.stage],
+      )
 
-    if (!outboundHistoryResult.rows[0]) {
+      if (alreadySentResult.rows[0]) {
+        console.log(
+          `[${packageCode}] Evento ya enviado a ${targetPhone}; no se duplicaron el mensaje.`,
+        )
+        await recordSkipped(entry, 'duplicate-event-recipient', {
+          recipient: targetPhone,
+        })
+        continue
+      }
+
+      let deliveryNoticeDates = []
+      if (isPackageReturnToOriginEvent({ eventLabel: entry.latestEventLabel, eventSignature })) {
+        const deliveryNoticeDatesResult = await pool.query(
+          `
+            select to_char(
+              created_at at time zone 'America/La_Paz',
+              'DD/MM/YYYY'
+            ) as sent_date,
+            min(created_at) as first_sent_at
+            from system_logs
+            where event = 'whatsapp_package_event_update_sent'
+              and details->>'packageCode' = $1
+              and details->>'packageStage' = 'courier'
+              and regexp_replace(coalesce(details->>'recipient', ''), '[^0-9]', '', 'g') = $2
+            group by sent_date
+            order by first_sent_at;
+          `,
+          [packageCode, targetPhone],
+        )
+        deliveryNoticeDates = deliveryNoticeDatesResult.rows.map((row) => row.sent_date)
+      }
+
+      const messageBody = buildPackageEventChangeMessage({
+        contact,
+        entry: {
+          ...entry,
+          deliveryNoticeDates,
+          recipientName:
+            phoneNames.get(targetPhone) ||
+            normalizeReference(entry?.recipientName) ||
+            normalizeReference(contact?.name),
+        },
+      })
+      const outboundMessageBody = repairMojibakeText(messageBody)
+
+      console.log(
+        `[${packageCode}] Mensaje pendiente de envio.\n` +
+          `  Numero destinatario: ${targetPhone}\n` +
+          `  Texto:\n${outboundMessageBody}`,
+      )
+      const providerMessageId = await sendAndLogPackageWhatsAppMessage({
+        config,
+        contactId: entry.contactId,
+        recipient: targetPhone,
+        messageBody: outboundMessageBody,
+      })
+
       await writeSystemLog({
-        event: 'package_event_observed',
+        event: 'whatsapp_package_event_update_sent',
         statusCode: 200,
         details: {
           ...baseDetails,
-          reason: 'conversation-not-started',
+          recipient: targetPhone,
+          providerMessageId,
         },
       }).catch(() => {})
-      skipped += 1
+
+      console.log(
+        `[${packageCode}] Mensaje enviado correctamente a ${targetPhone} (${providerMessageId || 'sin id'}).`,
+      )
+      sentDetails.push({
+        packageCode,
+        recipient: targetPhone,
+        message: outboundMessageBody,
+        providerMessageId,
+      })
+      sent += 1
+    }
+  }
+
+  return { sent, skipped, skippedByReason, sentDetails }
+}
+
+const notifyNewPackageContacts = async (entries = []) => {
+  const automationConfig = await getStoredAutomationConfig()
+  if (!automationConfig.automaticWelcome) {
+    return { sent: 0, skipped: entries.length, reason: 'new-package-welcome-disabled' }
+  }
+
+  const recentWindowMs = Number.isFinite(WHATSAPP_NEW_PACKAGE_WELCOME_RECENT_MS)
+    ? Math.max(WHATSAPP_NEW_PACKAGE_WELCOME_RECENT_MS, 60 * 1000)
+    : 24 * 60 * 60 * 1000
+  const eligibleEntries = entries.filter((entry) => isEligibleNewPackageWelcomeEntry({
+    contactId: entry?.contactId,
+    source: entry?.source,
+    action: entry?.action,
+    updatedAt: entry?.updatedAt,
+    recentWindowMs,
+  }))
+
+  if (eligibleEntries.length === 0) {
+    return {
+      sent: 0,
+      skipped: entries.length,
+      skippedByReason: entries.length > 0 ? { 'ineligible-entry': entries.length } : {},
+    }
+  }
+
+  const config = await getStoredWhatsAppConfig()
+  const configError = validateWhatsAppConfig(config)
+
+  if (configError) {
+    return {
+      sent: 0,
+      skipped: eligibleEntries.length,
+      skippedByReason: { 'invalid-whatsapp-config': eligibleEntries.length },
+      reason: configError,
+    }
+  }
+
+  let sent = 0
+  let skipped = 0
+  const skippedByReason = {}
+  const recordSkipped = async (entry, reason, extra = {}) => {
+    skipped += 1
+    skippedByReason[reason] = (skippedByReason[reason] || 0) + 1
+    const packageCode = normalizePackageCodeForLookup(entry?.code)
+    console.warn(`[${packageCode || 'sin codigo'}] Bienvenida omitida (${reason}).`)
+    await writeSystemLog({
+      event: 'whatsapp_new_package_welcome_skipped',
+      statusCode: 200,
+      details: {
+        contactId: entry?.contactId ?? null,
+        packageCode,
+        packageStage: entry?.stage,
+        reason,
+        ...extra,
+      },
+    }).catch(() => {})
+  }
+
+  for (const entry of eligibleEntries) {
+    const packageCode = normalizePackageCodeForLookup(entry?.code)
+    const originalPhones = getNewPackageWelcomePhoneCandidates(entry).filter(Boolean)
+    const targetPhones = getPackageNotificationRecipients({
+      config,
+      entry,
+      phones: originalPhones,
+    })
+
+    if (!packageCode || targetPhones.length === 0 || !entry?.contactId) {
+      await recordSkipped(
+        entry,
+        !packageCode
+          ? 'missing-package-code'
+          : targetPhones.length === 0
+            ? 'missing-package-recipient-phone'
+            : 'missing-contact-id',
+        { recipientCandidateCount: originalPhones.length },
+      )
       continue
     }
 
     const contact = await findPackageContactByCode(packageCode)
-    const messageBody = buildPackageEventChangeMessage({ contact, entry })
-    const providerResponse = await sendWhatsAppCloudMessage({
-      accessToken: config.accessToken,
-      apiVersion: config.apiVersion,
-      phoneNumberId: config.phoneNumberId,
-      to: targetPhone,
-      body: messageBody,
-    })
-    const providerMessageId = providerResponse?.messages?.[0]?.id ?? providerResponse?.message_id ?? null
+    const isVentanillaWelcome = isVentanillaText(entry?.latestEventLabel) || isVentanillaText(entry?.latestEventSignature)
+    const phoneNames = entry?.phoneNames instanceof Map ? entry.phoneNames : new Map()
 
-    await pool.query(
-      `
-        insert into message_logs (
-          contact_id,
-          channel,
-          direction,
-          recipient_reference,
-          message_text,
-          provider_name,
-          provider_message_id,
-          status
-        )
-        values ($1, 'WhatsApp', 'outbound', $2, $3, 'Meta Cloud API', $4, 'sent');
-      `,
-      [entry.contactId, targetPhone, messageBody, providerMessageId],
-    )
+    for (const targetPhone of targetPhones) {
+      const alreadySentResult = await pool.query(
+        `
+          select id
+          from system_logs
+          where event = 'whatsapp_new_package_welcome_sent'
+            and details->>'packageCode' = $1
+            and regexp_replace(coalesce(details->>'recipient', ''), '[^0-9]', '', 'g') = $2
+          limit 1;
+        `,
+        [packageCode, targetPhone],
+      )
 
-    await writeSystemLog({
-      event: 'whatsapp_package_event_update_sent',
-      statusCode: 200,
-      details: {
-        ...baseDetails,
-        providerMessageId,
-      },
-    }).catch(() => {})
+      if (alreadySentResult.rows[0]) {
+        await recordSkipped(entry, 'duplicate-recipient')
+        continue
+      }
 
-    sent += 1
+      const messageBody = buildNewPackageWelcomeMessage({
+        contactName: phoneNames.get(targetPhone) || contact?.name,
+        entry,
+      })
+
+      const providerMessageId = await sendAndLogPackageWhatsAppMessage({
+        config,
+        contactId: entry.contactId,
+        recipient: targetPhone,
+        messageBody,
+      })
+
+      await writeSystemLog({
+        event: 'whatsapp_new_package_welcome_sent',
+        statusCode: 200,
+        details: {
+          contactId: entry.contactId,
+          recipient: targetPhone,
+          packageCode,
+          packageStage: entry.stage,
+          providerMessageId,
+        },
+      }).catch(() => {})
+
+      sent += 1
+      console.log(`[${packageCode}] Bienvenida enviada correctamente (${providerMessageId || 'sin id'}).`)
+    }
   }
 
-  return { sent, skipped }
+  return { sent, skipped, skippedByReason }
 }
 
 const getPackageContextDateValue = (value) => {
-  const normalized = normalizeReference(value)
-  if (!normalized) return 0
-
-  const directTimestamp = Date.parse(normalized)
-  if (Number.isFinite(directTimestamp)) {
-    return directTimestamp
-  }
-
-  const normalizedForParse = normalized.replace(' ', 'T')
-  const fallbackTimestamp = Date.parse(normalizedForParse)
-  return Number.isFinite(fallbackTimestamp) ? fallbackTimestamp : 0
+  return parsePackageTimestamp(value)
 }
 
 const getPackageLocationLabel = (value, fallback = 'Sin dato') => {
   if (typeof value === 'string') {
-    return normalizeReference(value) || fallback
+    return cleanPackagePlaceLabel(value, fallback)
   }
 
-  return normalizeReference(value?.nombre) || normalizeReference(value?.codigo) || fallback
+  return cleanPackagePlaceLabel(value?.nombre) || cleanPackagePlaceLabel(value?.codigo) || fallback
 }
 
 const getPackageDepartmentLabel = (value, fallback = '') => {
@@ -2743,6 +5352,11 @@ const getPaginatedPayloadItems = (payload) => {
 
   for (const candidate of candidateArrays) {
     if (Array.isArray(candidate)) return candidate
+  }
+
+  const nestedPackage = payload?.data && typeof payload.data === 'object' ? payload.data : payload
+  if (getPackageCodeValuesForLookup(nestedPackage).length > 0) {
+    return [nestedPackage]
   }
 
   return []
@@ -2798,46 +5412,109 @@ const fetchAllPaginatedItems = async ({
   maxPages = 50,
   stopWhen = null,
   timeoutMs = 30000,
+  trustReportedTotal = true,
+  throwOnFirstPageError = false,
+  throwOnAnyPageError = false,
+  minimumPageIntervalMs = 0,
+  maxRateLimitRetries = 3,
+  onPage = null,
 }) => {
   const allItems = []
+  const pageSignatures = new Set()
+  let lastRequestAt = 0
 
   for (let page = 1; page <= maxPages; page += 1) {
     const paginatedUrl = new URL(url.toString())
     paginatedUrl.searchParams.set('page', String(page))
     paginatedUrl.searchParams.set('per_page', String(perPage))
 
+    const pageWaitMs = minimumPageIntervalMs - (Date.now() - lastRequestAt)
+    if (pageWaitMs > 0) await sleep(pageWaitMs)
+
     let response = null
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
+    for (let attempt = 1; attempt <= maxRateLimitRetries + 1; attempt += 1) {
+      lastRequestAt = Date.now()
       response = await fetchJsonWithTimeout(paginatedUrl, { headers }, timeoutMs).catch(() => null)
       if (response?.status !== 429) break
 
-      const retryAfterSeconds = Number(response.headers?.get?.('retry-after'))
-      const retryDelayMs = Number.isFinite(retryAfterSeconds)
-        ? Math.min(Math.max(retryAfterSeconds * 1000, 1000), 10000)
-        : attempt * 1500
-      await sleep(retryDelayMs)
+      if (attempt <= maxRateLimitRetries) {
+        const retryAfter = normalizeReference(response.headers?.get?.('retry-after'))
+        const retryAfterSeconds = Number(retryAfter)
+        const retryAfterDate = Date.parse(retryAfter)
+        const retryDelayMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+          ? Math.min(retryAfterSeconds * 1000, 120000)
+          : Number.isFinite(retryAfterDate)
+            ? Math.min(Math.max(retryAfterDate - Date.now(), 1000), 120000)
+            : Math.min(5000 * (2 ** (attempt - 1)), 60000)
+        await sleep(retryDelayMs)
+      }
     }
 
     if (!response?.ok) {
+      if (throwOnAnyPageError || (throwOnFirstPageError && page === 1)) {
+        const error = new Error(
+          response?.status === 429
+            ? `La API externa limitó la consulta en la página ${page} (HTTP 429).`
+            : response
+              ? `La API externa respondió HTTP ${response.status} en la página ${page}.`
+              : `No se pudo conectar con la API externa en la página ${page}.`,
+        )
+        if (response?.status === 429) error.code = 'UPSTREAM_RATE_LIMIT'
+        throw error
+      }
       break
     }
 
     const payload = await response.json().catch(() => null)
+    if (!payload && throwOnAnyPageError) {
+      throw new Error(`La API externa devolvió una respuesta no válida en la página ${page}.`)
+    }
     const pageItems = getPaginatedPayloadItems(payload)
     if (!pageItems.length) {
       break
     }
 
+    const pageSignature = pageItems
+      .slice(0, 5)
+      .map((item) => getPackageCodeFromItem(item) || JSON.stringify(item).slice(0, 120))
+      .join('|')
+    if (pageSignatures.has(pageSignature)) {
+      if (throwOnAnyPageError) {
+        throw new Error(`La API externa repitió los resultados en la página ${page}.`)
+      }
+      break
+    }
+    pageSignatures.add(pageSignature)
+
     allItems.push(...pageItems)
+
+    if (typeof onPage === 'function') {
+      await onPage(pageItems, page, payload)
+    }
 
     if (typeof stopWhen === 'function' && stopWhen(pageItems, allItems, payload)) {
       break
     }
 
     const totalItems = getPaginatedPayloadTotal(payload)
-    if (Number.isFinite(totalItems) && allItems.length >= totalItems) {
+    if (trustReportedTotal && Number.isFinite(totalItems) && allItems.length >= totalItems) {
       break
     }
+    const effectivePerPage = Number(
+      payload?.meta?.per_page ||
+      payload?.per_page ||
+      payload?.por_pagina ||
+      payload?.paginacion?.por_pagina ||
+      payload?.pagination?.per_page ||
+      perPage,
+    )
+    if (!trustReportedTotal && pageItems.length < effectivePerPage) {
+      break
+    }
+  }
+
+  if (allItems.length > 0 && allItems.length >= maxPages * perPage && throwOnAnyPageError) {
+    throw new Error(`La API externa superó el límite de ${maxPages} páginas; el catálogo no está completo.`)
   }
 
   return allItems
@@ -2880,7 +5557,7 @@ const extractPackageCodeCandidates = (messageBody) => {
     uniqueCandidates.push(compactCandidate)
   }
 
-  const shortCodeMatches = normalized.matchAll(/\b(?:CODIGO|C[OÓ]DIGO|GUIA|GU[IÍ]A|TRACKING|PAQUETE)\s*(?:N(?:RO|UMERO)?\.?|#|:)?\s*(\d{3,7})\b/g)
+  const shortCodeMatches = normalized.matchAll(/\b(?:CODIGO|C[OÃ“]DIGO|GUIA|GU[IÃ]A|TRACKING|PAQUETE)\s*(?:N(?:RO|UMERO)?\.?|#|:)?\s*(\d{3,7})\b/g)
 
   for (const match of shortCodeMatches) {
     const compactCandidate = normalizePackageCodeForLookup(match[1])
@@ -2904,9 +5581,15 @@ const normalizePackageCodeForLookup = (value) => {
 }
 
 const getPackageCodeValuesForLookup = (item) => {
-  return [item?.codigo_s10, item?.codigo, item?.codigoSeguimiento, item?.tracking]
+  return [...new Set([
+    item?.codigo_s10,
+    item?.codigo,
+    item?.codigoSeguimiento,
+    item?.tracking,
+    getPackageCodeFromItem(item),
+  ]
     .map(normalizePackageCodeForLookup)
-    .filter(Boolean)
+    .filter(Boolean))]
 }
 
 const getPackageEventsPayloadItems = (payload) => {
@@ -2940,6 +5623,9 @@ const getPackageEventCodeValuesForLookup = (item) => {
     item?.paquete?.codigo_s10,
     item?.paquete?.codigo,
     item?.paquete?.codigoSeguimiento,
+    item?.paquete?.tracking,
+    item?.evento?.codigo_s10,
+    item?.evento?.codigo,
   ]
     .map(normalizePackageCodeForLookup)
     .filter(Boolean)
@@ -2947,6 +5633,14 @@ const getPackageEventCodeValuesForLookup = (item) => {
 
 const getPackageEventTimestampValue = (item) => {
   const candidateValues = [
+    item?.fecha_movimiento,
+    item?.fechaMovimiento,
+    item?.event_gmt_dt,
+    item?.fecha_evento,
+    item?.fechaEvento,
+    item?.event_date,
+    item?.fecha_hora,
+    item?.fechaHora,
     item?.fecha_registro,
     item?.fecha,
     item?.created_at,
@@ -2955,8 +5649,8 @@ const getPackageEventTimestampValue = (item) => {
   ]
 
   for (const candidate of candidateValues) {
-    const parsed = Date.parse(normalizeReference(candidate))
-    if (!Number.isNaN(parsed)) {
+    const parsed = parsePackageTimestamp(candidate)
+    if (parsed > 0) {
       return parsed
     }
   }
@@ -2976,6 +5670,8 @@ const getPackageEventTitle = (item) =>
 
 const getPackageEventLocation = (item) =>
   normalizeReference(item?.oficina) ||
+  normalizeReference(item?.office_name) ||
+  normalizeReference(item?.off_name) ||
   normalizeReference(item?.ubicacion) ||
   normalizeReference(item?.lugar) ||
   normalizeReference(item?.regional) ||
@@ -2983,6 +5679,38 @@ const getPackageEventLocation = (item) =>
   normalizeReference(item?.ciudad) ||
   normalizeReference(item?.detalle) ||
   ''
+
+const getBolivianDepartmentKey = (value) => {
+  const normalized = normalizeReference(value)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+  const departments = [
+    ['la-paz', ['la paz', 'el alto', 'viacha', 'achocalla', 'lpz']],
+    ['cochabamba', ['cochabamba', 'cbba', 'sacaba', 'quillacollo']],
+    ['santa-cruz', ['santa cruz', 'scz', 'montero', 'warnes']],
+    ['oruro', ['oruro']],
+    ['potosi', ['potosi']],
+    ['tarija', ['tarija']],
+    ['chuquisaca', ['chuquisaca', 'sucre']],
+    ['beni', ['beni', 'trinidad', 'riberalta']],
+    ['pando', ['pando', 'cobija']],
+  ]
+
+  return departments.find(([, aliases]) => aliases.some((alias) => normalized.includes(alias)))?.[0] ?? ''
+}
+
+const getBoliviaDateKey = (value) => {
+  const timestamp = typeof value === 'number' ? value : Date.parse(normalizeReference(value))
+  if (!Number.isFinite(timestamp)) return ''
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/La_Paz',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date(timestamp))
+  return `${parts.find((part) => part.type === 'year')?.value}-${parts.find((part) => part.type === 'month')?.value}-${parts.find((part) => part.type === 'day')?.value}`
+}
 
 const buildPackageEventsTimelineText = (events, packageCode = '') => {
   const orderedEvents = (Array.isArray(events) ? events : [])
@@ -3020,19 +5748,22 @@ const findPackageCodeInPaginatedApi = async ({
   code,
   perPage = 100,
   maxPages = 500,
+  startPage = 1,
+  timeoutMs = 15000,
 }) => {
   let pagesChecked = 0
   let totalItems = 0
   let statusCode = null
   let errorMessage = ''
+  let complete = false
 
-  for (let page = 1; page <= maxPages; page += 1) {
+  for (let page = startPage; page < startPage + maxPages; page += 1) {
     const paginatedUrl = new URL(url.toString())
     paginatedUrl.searchParams.set('page', String(page))
     paginatedUrl.searchParams.set('per_page', String(perPage))
 
-    const response = await fetchJsonWithTimeout(paginatedUrl, { headers }).catch(() => null)
-    pagesChecked = page
+    const response = await fetchJsonWithTimeout(paginatedUrl, { headers }, timeoutMs).catch(() => null)
+    pagesChecked += 1
 
     if (!response?.ok) {
       statusCode = response?.status ?? 502
@@ -3041,9 +5772,16 @@ const findPackageCodeInPaginatedApi = async ({
     }
 
     statusCode = response.status
-    const payload = await response.json().catch(() => null)
+    let payload
+    try {
+      payload = await response.json()
+    } catch {
+      errorMessage = 'La API devolvio una respuesta que no es JSON.'
+      break
+    }
     const items = getPaginatedPayloadItems(payload)
-    totalItems = getPaginatedPayloadTotal(payload) ?? Math.max(totalItems, page * perPage, items.length)
+    const reportedTotal = getPaginatedPayloadTotal(payload)
+    totalItems = reportedTotal ?? totalItems + items.length
 
     const match = items.find((item) => getPackageCodeValuesForLookup(item).includes(code))
     if (match) {
@@ -3052,6 +5790,8 @@ const findPackageCodeInPaginatedApi = async ({
         found: true,
         pagesChecked,
         pageFound: page,
+        nextPage: page + 1,
+        complete: true,
         totalItems,
         statusCode,
         code,
@@ -3061,10 +5801,20 @@ const findPackageCodeInPaginatedApi = async ({
     }
 
     if (!items.length) {
+      statusCode = response.status
+      complete = true
       break
     }
 
-    if (totalItems > 0 && page * perPage >= totalItems) {
+    const responsePageSize = Number(
+      payload?.meta?.per_page ||
+        payload?.por_pagina ||
+        payload?.paginacion?.por_pagina ||
+        payload?.pagination?.per_page ||
+        perPage,
+    )
+    if (reportedTotal > 0 && page * responsePageSize >= reportedTotal) {
+      complete = true
       break
     }
   }
@@ -3074,6 +5824,8 @@ const findPackageCodeInPaginatedApi = async ({
     found: false,
     pagesChecked,
     pageFound: null,
+    nextPage: complete ? 1 : startPage + (errorMessage ? 0 : pagesChecked),
+    complete,
     totalItems,
     statusCode,
     code,
@@ -3185,6 +5937,8 @@ const fetchMatchingPackageContext = async (reference, packageCode = '') => {
       packageCodes: [],
       summaryText: '',
       agentFactsText: '',
+      lookupUnavailable: false,
+      trackingLookupUnavailable: false,
       lifecycleInstruction: '',
     }, PACKAGE_CONTEXT_TTL_MS)
   }
@@ -3214,44 +5968,38 @@ const fetchMatchingPackageContext = async (reference, packageCode = '') => {
 
   let trackingItems = []
   let contactItems = []
+  let externalLookupUnavailable = false
+  let trackingLookupUnavailable = false
+  let trackingApiLookupUrl = trackingUrl.toString()
 
   if (normalizedPackageCode) {
-    const [exactTrackingResult, exactContactResult] = await Promise.all([
-      fetchExactPackageCodeMatches({
-        url: trackingUrl,
-        headers: trackingHeaders,
-        queryParam: 'q',
-        code: normalizedPackageCode,
-      }),
-      fetchExactPackageCodeMatches({
-        url: contactUrl,
-        headers: contactHeaders,
-        queryParam: 'codigo',
-        code: normalizedPackageCode,
-      }),
-    ])
-
-    trackingItems = exactTrackingResult.items
+    const exactContactResult = await fetchExactPackageCodeMatches({
+      url: contactUrl,
+      headers: contactHeaders,
+      queryParam: 'codigo',
+      code: normalizedPackageCode,
+    })
     contactItems = exactContactResult.items
 
-    if (!trackingItems.length && !contactItems.length) {
-      ;[trackingItems, contactItems] = await Promise.all([
-        fetchAllPaginatedItems({
-          url: trackingUrl,
-          headers: trackingHeaders,
-          perPage: 100,
-          maxPages: 500,
-          stopWhen: (pageItems) => pageItems.some((item) => matchesCode(item)),
-        }),
-        fetchAllPaginatedItems({
-          url: contactUrl,
-          headers: contactHeaders,
-          perPage: 100,
-          maxPages: 500,
-          stopWhen: (pageItems) => pageItems.some((item) => matchesCode(item)),
-        }),
-      ])
+    if (!contactItems.some(matchesCode)) {
+      const exactTrackingResult = await fetchExactTrackingPackageMatch({
+        url: trackingUrl,
+        headers: trackingHeaders,
+        code: normalizedPackageCode,
+      })
+      trackingApiLookupUrl = exactTrackingResult.url
+      trackingLookupUnavailable = exactTrackingResult.unavailable
+      if (exactTrackingResult.item) trackingItems = [exactTrackingResult.item]
+      externalLookupUnavailable = trackingLookupUnavailable || !exactContactResult.ok
+
+      if (!trackingItems.some(matchesCode)) {
+        const storedInternationalPackage = await fetchStoredInternationalTrackingPackageByCode(normalizedPackageCode)
+        if (storedInternationalPackage && matchesCode(storedInternationalPackage)) {
+          trackingItems.push(storedInternationalPackage)
+        }
+      }
     }
+
   } else {
     ;[trackingItems, contactItems] = await Promise.all([
       fetchAllPaginatedItems({
@@ -3319,6 +6067,13 @@ const fetchMatchingPackageContext = async (reference, packageCode = '') => {
       source: 'tracking',
       stage,
       updatedAt,
+      statusLabel: statusText,
+      latestEventLabel:
+        normalizeReference(latestEvent?.evento_api) ||
+        normalizeReference(latestEvent?.evento_original) ||
+        '',
+      latestEventLocation: latestLocation,
+      latestEventAt: normalizeReference(latestEvent?.fecha),
       originLabel: getPackageLocationLabel(item?.origen, 'Sin origen'),
       originDepartment,
       destinationLabel,
@@ -3353,11 +6108,17 @@ const fetchMatchingPackageContext = async (reference, packageCode = '') => {
       normalizeReference(item?.destinatario?.direccion) ||
       normalizeReference(item?.destino?.direccion) ||
       ''
+    const transferCode = getContactPackageTransferCode(item)
+    const transferDate = getContactPackageTransferDate(item)
     return {
       code: packageCode,
       source: 'contact',
       stage: inferContactPackageStage(item),
       updatedAt: getPackageContextDateValue(item?.fecha_registro),
+      statusLabel: statusText,
+      latestEventLabel: '',
+      latestEventLocation: '',
+      latestEventAt: '',
       originLabel: getPackageLocationLabel(item?.origen, 'Sin origen'),
       originDepartment,
       destinationLabel,
@@ -3373,6 +6134,8 @@ const fetchMatchingPackageContext = async (reference, packageCode = '') => {
         `destino ${destinationLabel}`,
         destinationDepartment ? `departamento destino ${destinationDepartment}` : '',
         destinationAddress ? `direccion destino ${destinationAddress}` : '',
+        transferCode ? `codigo especial ${transferCode}` : '',
+        transferDate ? `traspaso ${transferDate}` : '',
         normalizeReference(item?.fecha_registro) ? `registro ${normalizeReference(item?.fecha_registro)}` : '',
       ]
         .filter(Boolean)
@@ -3383,15 +6146,7 @@ const fetchMatchingPackageContext = async (reference, packageCode = '') => {
   const trackingSummaries = trackingPackageEntries.slice(0, 3).map((entry) => entry.summary)
   const contactSummaries = contactPackageEntries.slice(0, 3).map((entry) => entry.summary)
   const packageEntries = [...trackingPackageEntries, ...contactPackageEntries]
-  const latestPackageEntry =
-    packageEntries
-      .slice()
-      .sort((firstEntry, secondEntry) => {
-        if (secondEntry.updatedAt !== firstEntry.updatedAt) {
-          return secondEntry.updatedAt - firstEntry.updatedAt
-        }
-        return getPackageStageRank(firstEntry.stage) - getPackageStageRank(secondEntry.stage)
-      })[0] ?? null
+  const latestPackageEntry = selectLatestPackageEntry(packageEntries, getPackageStageRank)
   const relatedEntries = latestPackageEntry
     ? packageEntries.filter((entry) => entry.code === latestPackageEntry.code)
     : []
@@ -3412,18 +6167,16 @@ const fetchMatchingPackageContext = async (reference, packageCode = '') => {
     relatedEntries
       .slice()
       .sort((firstEntry, secondEntry) => {
-        const stageDelta = getPackageStageRank(secondEntry.stage) - getPackageStageRank(firstEntry.stage)
-        if (stageDelta !== 0) {
-          return stageDelta
-        }
-
         if (secondEntry.updatedAt !== firstEntry.updatedAt) {
           return secondEntry.updatedAt - firstEntry.updatedAt
         }
 
-        return getEntrySpecificityScore(secondEntry) - getEntrySpecificityScore(firstEntry)
+        return (
+          getPackageStageRank(secondEntry.stage) - getPackageStageRank(firstEntry.stage) ||
+          getEntrySpecificityScore(secondEntry) - getEntrySpecificityScore(firstEntry)
+        )
       })[0] ?? latestPackageEntry
-  const stage = mostAdvancedEntry?.stage ?? latestPackageEntry?.stage ?? null
+  const stage = latestPackageEntry?.stage ?? mostAdvancedEntry?.stage ?? null
 
   const summarySections = []
 
@@ -3453,10 +6206,15 @@ const fetchMatchingPackageContext = async (reference, packageCode = '') => {
 
   return setCachedValue(packageContextCache, cacheKey, {
     matched: matchingTrackingItems.length > 0 || matchingContactItems.length > 0,
+    trackingApiLookupUrl,
     isTestModeNumber,
     stage,
     currentPackageCode: mostAdvancedEntry?.code ?? latestPackageEntry?.code ?? '',
     currentPackageUpdatedAt: mostAdvancedEntry?.updatedAt ?? latestPackageEntry?.updatedAt ?? 0,
+    currentStatusLabel: mostAdvancedEntry?.statusLabel ?? latestPackageEntry?.statusLabel ?? '',
+    currentLatestEventLabel: mostAdvancedEntry?.latestEventLabel ?? latestPackageEntry?.latestEventLabel ?? '',
+    currentLatestEventLocation: mostAdvancedEntry?.latestEventLocation ?? latestPackageEntry?.latestEventLocation ?? '',
+    currentLatestEventAt: mostAdvancedEntry?.latestEventAt ?? latestPackageEntry?.latestEventAt ?? '',
     currentOriginLabel: mostSpecificEntry?.originLabel ?? mostAdvancedEntry?.originLabel ?? latestPackageEntry?.originLabel ?? '',
     currentOriginDepartment:
       mostSpecificEntry?.originDepartment ?? mostAdvancedEntry?.originDepartment ?? latestPackageEntry?.originDepartment ?? '',
@@ -3472,8 +6230,58 @@ const fetchMatchingPackageContext = async (reference, packageCode = '') => {
     packageEvents,
     packageEventsText,
     packageEventsCount: packageEvents.length,
+    lookupUnavailable: externalLookupUnavailable && !matchingTrackingItems.length && !matchingContactItems.length,
+    trackingLookupUnavailable:
+      trackingLookupUnavailable && !matchingTrackingItems.length,
     lifecycleInstruction: getPackageLifecycleInstruction(stage),
   }, PACKAGE_CONTEXT_TTL_MS)
+}
+
+const scheduleWhatsAppTrackingRetry = async ({ contactId, sender, packageCode, inboundMessageId }) => {
+  const normalizedSender = normalizePhoneNumber(sender)
+  const normalizedCode = normalizePackageCodeForLookup(packageCode)
+  if (!normalizedSender || !normalizedCode) {
+    throw new Error('No se puede programar el rastreo sin un WhatsApp y una guia validos.')
+  }
+
+  const { nextAttemptAt, expiresAt } = getWhatsAppTrackingRetrySchedule()
+  const result = await pool.query(
+    `
+      insert into whatsapp_tracking_retry_queue (
+        contact_id, sender, package_code, inbound_message_id,
+        next_attempt_at, expires_at
+      )
+      values ($1, $2, $3, $4, $5, $6)
+      on conflict (sender, package_code)
+        where status in ('pending', 'processing')
+      do nothing
+      returning id;
+    `,
+    [
+      Number.isInteger(contactId) && contactId > 0 ? contactId : null,
+      normalizedSender,
+      normalizedCode,
+      inboundMessageId ?? null,
+      nextAttemptAt,
+      expiresAt,
+    ],
+  )
+
+  if (result.rows[0]) return true
+
+  const existingResult = await pool.query(
+    `
+      select id
+      from whatsapp_tracking_retry_queue
+      where sender = $1
+        and package_code = $2
+        and status in ('pending', 'processing')
+      limit 1;
+    `,
+    [normalizedSender, normalizedCode],
+  )
+
+  return Boolean(existingResult.rows[0])
 }
 
 const isTestModeNumberListedInApis = async (targetNumber) => {
@@ -3593,7 +6401,8 @@ app.get('/api/package-code-lookup', cors(), authMiddleware, async (request, resp
 
 const getStoredAiAgentConfig = async (client = pool) => {
   const settings = await getStoredSettingsByKey('crm_ai_agent', client)
-  const fallbackEnabled = process.env.AI_AUTO_REPLY === undefined ? true : process.env.AI_AUTO_REPLY !== 'false'
+  const automationConfig = await getStoredAutomationConfig()
+  const fallbackEnabled = automationConfig.aiAutoReply
   const assistedContactIds = Array.isArray(settings.assistedContactIds)
     ? settings.assistedContactIds
         .map((value) => Number(value))
@@ -3766,13 +6575,14 @@ const sendWhatsAppCloudMessage = async ({
   media,
 }) => {
   const endpoint = `https://graph.facebook.com/${apiVersion}/${phoneNumberId}/messages`
+  const repairedBody = repairMojibakeText(body)
   let messagePayload = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
     to,
     type: 'text',
     text: {
-      body,
+      body: repairedBody,
       preview_url: false,
     },
   }
@@ -3797,7 +6607,7 @@ const sendWhatsAppCloudMessage = async ({
         type: 'image',
         image: {
           id: uploadedMedia.id,
-          ...(body ? { caption: body } : {}),
+          ...(repairedBody ? { caption: repairedBody } : {}),
         },
       }
     } else if (media.kind === 'audio') {
@@ -4034,7 +6844,7 @@ const normalizeEmsStatus = (value) => {
     normalized.includes('courier') ||
     normalized.includes('reparto') ||
     normalized.includes('distribucion') ||
-    normalized.includes('distribución')
+    normalized.includes('distribuciÃ³n')
   ) {
     return 'courier'
   }
@@ -4057,7 +6867,7 @@ const normalizeEmsStatus = (value) => {
     normalized.includes('ventanilla') ||
     normalized.includes('almacen origen') ||
     normalized.includes('almacen') ||
-    normalized.includes('almacén') ||
+    normalized.includes('almacÃ©n') ||
     normalized.includes('admis') ||
     normalized.includes('recepcion') ||
     normalized.includes('recibido origen') ||
@@ -4085,7 +6895,7 @@ const normalizeEmsStatus = (value) => {
   if (
     normalized.includes('camino') ||
     normalized.includes('transit') ||
-    normalized.includes('tránsito') ||
+    normalized.includes('trÃ¡nsito') ||
     normalized.includes('transito') ||
     normalized.includes('seguim') ||
     normalized.includes('aduan') ||
@@ -4100,7 +6910,7 @@ const normalizeEmsStatus = (value) => {
     normalized.includes('received') ||
     normalized.includes('admis') ||
     normalized.includes('almacen') ||
-    normalized.includes('almacén') ||
+    normalized.includes('almacÃ©n') ||
     normalized.includes('nuevo') ||
     normalized.includes('retenc') ||
     normalized.includes('inici') ||
@@ -4355,6 +7165,64 @@ const getPackageOriginBranch = (packageContext = null) =>
       normalizeReference(packageContext?.summaryText),
   )
 
+const formatBranchShortAddress = (branch) => {
+  if (!branch?.address) return ''
+
+  return branch.address
+    .replace('Av. Mariscal Santa Cruz N 1260, esq. Calle Oruro (Edificio Telecomunicaciones).', 'Av. Mariscal Santa Cruz #1260')
+    .replace('Calle Cobija entre Sucre y Ballivian N 24.', 'Calle Cobija #24')
+    .replace('Calle Presidente Montes esq. Junin N 1456.', 'Calle Presidente Montes #1456')
+    .replace('Calle Hoyos esq. Topater, Villa Imperial de Potosi.', 'Calle Hoyos esq. Topater')
+    .replace('Calle Mariscal Sucre esq. Virginio Lema N 397.', 'Calle Mariscal Sucre #397')
+    .replace('Calle Junin esq. Ayacucho N 699.', 'Calle Junin #699')
+}
+
+const formatBranchText = (branch) => {
+  if (!branch?.label) return ''
+
+  const address = formatBranchShortAddress(branch)
+  const label = branch.label === 'La Paz' ? 'Sucursal Central' : `Sucursal ${branch.label}`
+  return address ? `${label}: ${address}` : label
+}
+
+const isVentanillaText = (value) => {
+  const normalized = normalizeReference(value).toLowerCase()
+  return (
+    normalized.includes('ventanilla') ||
+    normalized.includes('pendiente de recojo') ||
+    normalized.includes('pendiente de entrega') ||
+    normalized.includes('solicitud de recojo') ||
+    normalized.includes('listo para recoger') ||
+    normalized.includes('listo para entregar') ||
+    normalized.includes('listo para entrega') ||
+    normalized.includes('oficina de entrega')
+  )
+}
+
+const hasVentanillaPackageContext = (packageContext = null) =>
+  isVentanillaText(packageContext?.summaryText) ||
+  (Array.isArray(packageContext?.packageEvents) &&
+    packageContext.packageEvents.some((event) =>
+      isVentanillaText(
+        [event?.nombre, event?.evento_api, event?.evento_original, event?.movimiento_bolivia, event?.detalle]
+          .filter(Boolean)
+          .join(' '),
+      ),
+    ))
+
+const buildVentanillaPickupMessage = ({ packageCode = '', branch = null } = {}) => {
+  const branchText = formatBranchText(branch)
+  return [
+    'ðŸ“¬ Estimado(a) usuario(a):',
+    '',
+    `La Agencia Boliviana de Correos (AGBC) tiene el agrado de informarle que cuenta con correspondencia pendiente de entrega a su nombre${packageCode ? `, guÃ­a *${packageCode}*` : ''}.`,
+    `ðŸ¤ Le solicitamos apersonarse a la Ventanilla N.Âº 3${branchText ? ` (${branchText})` : ''} para su recojo, en horario de atenciÃ³n de 08:30 a 16:30 horas, portando su documento de identidad.`,
+    '',
+    'ðŸªª No olvide llevar su documento de identidad.',
+    'ðŸ™ Agradecemos su atenciÃ³n y esperamos su visita.',
+  ].join('\n')
+}
+
 const formatPackageAgencyContext = (packageContext = null) => {
   const agencies = [
     packageContext?.currentOriginLabel
@@ -4398,7 +7266,7 @@ const buildFallbackAgentReplyLegacy = ({ contact, messageBody, currentStatus, pa
   const destinationLocationText = destinationBranch?.address
     ? `${destinationDisplay} (${destinationBranch.address})`
     : destinationDisplay
-  const isDeliveryQuestion =
+const isDeliveryQuestion =
     normalizedMessage.includes('llego') ||
     normalizedMessage.includes('lleg??') ||
     normalizedMessage.includes('entregado') ||
@@ -4406,34 +7274,41 @@ const buildFallbackAgentReplyLegacy = ({ contact, messageBody, currentStatus, pa
     normalizedMessage.includes('envio') ||
     normalizedMessage.includes('env??o')
 
+  if (packageContext?.matched && hasVentanillaPackageContext(packageContext)) {
+    return buildVentanillaPickupMessage({
+      packageCode,
+      branch: destinationBranch || originBranch,
+    })
+  }
+
   if (packageContext?.matched && packageContext.stage === 'delivered') {
-    return `Revisé la guía ${packageCode || 'indicada'} y figura como entregada${destinationLocationText ? ` en ${destinationLocationText}` : ''}. Si necesitas más detalle sobre la entrega, puedo ayudarte a revisarlo.`
+    return `RevisÃ© la guÃ­a ${packageCode || 'indicada'} y figura como entregada${destinationLocationText ? ` en ${destinationLocationText}` : ''}. Si necesitas mÃ¡s detalle sobre la entrega, puedo ayudarte a revisarlo.`
   }
 
   if (packageContext?.matched && packageContext.stage === 'cancelled') {
-    return `Revisé la guía ${packageCode || 'indicada'} y figura como cancelada${originLocationText ? ` en la Sucursal ${originLocationText}` : ''}. Para revisar el motivo, comunícate con esa sucursal o atención al cliente.`
+    return `RevisÃ© la guÃ­a ${packageCode || 'indicada'} y figura como cancelada${originLocationText ? ` en la Sucursal ${originLocationText}` : ''}. Para revisar el motivo, comunÃ­cate con esa sucursal o atenciÃ³n al cliente.`
   }
 
   if (packageContext?.matched && packageContext.stage === 'courier') {
-    return `Revisé la guía ${packageCode || 'indicada'} y figura asignada a cartero${destinationLocationText ? ` en ${destinationLocationText}` : ''}. Está en proceso de reparto; no aparece como entregada todavía.`
+    return `RevisÃ© la guÃ­a ${packageCode || 'indicada'} y figura asignada a cartero${destinationLocationText ? ` en ${destinationLocationText}` : ''}. EstÃ¡ en proceso de reparto; no aparece como entregada todavÃ­a.`
   }
 
   if (packageContext?.matched && packageContext.stage === 'transit') {
     return [
-      `¡Hola, ${contactName}! 👋 Muchas gracias por escribirnos.`,
+      `Â¡Hola, ${contactName}! ðŸ‘‹ Muchas gracias por escribirnos.`,
       '',
-      `🚚 Tu paquete ya está en tránsito con destino a **${destinationDisplay}** 📦. Seguimos monitoreando su avance 🔎 para avisarte en cuanto se confirme el siguiente movimiento 📲.`,
+      `ðŸšš Tu paquete ya estÃ¡ en trÃ¡nsito con destino a **${destinationDisplay}** ðŸ“¦. Seguimos monitoreando su avance ðŸ”Ž para avisarte en cuanto se confirme el siguiente movimiento ðŸ“².`,
     ].join('\n')
   }
 
   if (packageContext?.matched && packageContext.stage === 'regional') {
     return [
-      `¡Perfecto! Confirmamos la guia ${packageCode || 'sin codigo'}:`,
+      `Â¡Perfecto! Confirmamos la guia ${packageCode || 'sin codigo'}:`,
       '',
-      `📍 ¿Dónde está tu paquete hoy? Recibido y procesado en la Sucursal ${originLocationText}.`,
-      `🚛 Próximo paso: Saldrá en el próximo despacho con destino a ${destinationDisplay}.`,
+      `ðŸ“ Â¿DÃ³nde estÃ¡ tu paquete hoy? Recibido y procesado en la Sucursal ${originLocationText}.`,
+      `ðŸš› PrÃ³ximo paso: SaldrÃ¡ en el prÃ³ximo despacho con destino a ${destinationDisplay}.`,
       '',
-      `Te notificaremos apenas entre en tránsito. Si prefieres hacer una gestión presencial antes de que salga, puedes pasar por la sucursal de ${originDisplay} con tu carnet de identidad original.`,
+      `Te notificaremos apenas entre en trÃ¡nsito. Si prefieres hacer una gestiÃ³n presencial antes de que salga, puedes pasar por la sucursal de ${originDisplay} con tu carnet de identidad original.`,
     ]
       .filter(Boolean)
       .join('\n')
@@ -4441,12 +7316,12 @@ const buildFallbackAgentReplyLegacy = ({ contact, messageBody, currentStatus, pa
 
   if (packageContext?.matched && packageContext.stage === 'received') {
     return [
-      `¡Perfecto! Confirmamos la guia ${packageCode || 'sin codigo'}:`,
+      `Â¡Perfecto! Confirmamos la guia ${packageCode || 'sin codigo'}:`,
       '',
-      `📍 ¿Dónde está tu paquete hoy? Recibido y procesado en la Sucursal ${originLocationText}.`,
-      `🚛 Próximo paso: Saldrá en el próximo despacho con destino a ${destinationDisplay}.`,
+      `ðŸ“ Â¿DÃ³nde estÃ¡ tu paquete hoy? Recibido y procesado en la Sucursal ${originLocationText}.`,
+      `ðŸš› PrÃ³ximo paso: SaldrÃ¡ en el prÃ³ximo despacho con destino a ${destinationDisplay}.`,
       '',
-      `Te notificaremos apenas entre en tránsito. Si prefieres hacer una gestión presencial antes de que salga, puedes pasar por la sucursal de ${originDisplay} con tu carnet de identidad original.`,
+      `Te notificaremos apenas entre en trÃ¡nsito. Si prefieres hacer una gestiÃ³n presencial antes de que salga, puedes pasar por la sucursal de ${originDisplay} con tu carnet de identidad original.`,
     ]
       .filter(Boolean)
       .join('\n')
@@ -4491,76 +7366,271 @@ const buildFriendlyFallbackAgentReply = ({ contact, messageBody, currentStatus, 
     : destinationDisplay
   const isDeliveryQuestion =
     normalizedMessage.includes('llego') ||
-    normalizedMessage.includes('llegó') ||
+    normalizedMessage.includes('llegÃ³') ||
     normalizedMessage.includes('entregado') ||
     normalizedMessage.includes('paquete') ||
     normalizedMessage.includes('envio') ||
-    normalizedMessage.includes('envío')
+    normalizedMessage.includes('envÃ­o')
+  const packageEventsText = normalizeReference(packageContext?.packageEventsText)
+  const shouldShowPackageEvents =
+    packageContext?.matched &&
+    packageEventsText &&
+    (isPackageHistoryQuestion(messageBody) ||
+      normalizedMessage.includes('eventos') ||
+      normalizedMessage.includes('historial') ||
+      normalizedMessage.includes('por donde estuvo') ||
+      normalizedMessage.includes('donde estuvo') ||
+      normalizedMessage.includes('donde estaba') ||
+      normalizedMessage.includes('donde ira') ||
+      normalizedMessage.includes('a donde va'))
+
+  if (shouldShowPackageEvents) {
+    return formatPackageHistoryReply(packageContext)
+  }
 
   if (packageContext?.matched && packageContext.stage === 'delivered') {
-    return `Revisé la guía ${packageCode || 'indicada'} 📦 y figura como entregada ✅${destinationLocationText ? ` en ${destinationLocationText} 📍` : ''}. Si necesitas más detalle sobre la entrega, puedo ayudarte a revisarlo 😊.`
+    return `RevisÃ© la guÃ­a ${packageCode || 'indicada'} ðŸ“¦ y figura como entregada âœ…${destinationLocationText ? ` en ${destinationLocationText} ðŸ“` : ''}. Si necesitas mÃ¡s detalle sobre la entrega, puedo ayudarte a revisarlo ðŸ˜Š.`
   }
 
   if (packageContext?.matched && packageContext.stage === 'cancelled') {
-    return `Revisé la guía ${packageCode || 'indicada'} 📦 y figura como cancelada ❌${originLocationText ? ` en la Sucursal ${originLocationText} 📍` : ''}. Para revisar el motivo, comunícate con esa sucursal o atención al cliente 📞.`
+    return `RevisÃ© la guÃ­a ${packageCode || 'indicada'} ðŸ“¦ y figura como cancelada âŒ${originLocationText ? ` en la Sucursal ${originLocationText} ðŸ“` : ''}. Para revisar el motivo, comunÃ­cate con esa sucursal o atenciÃ³n al cliente ðŸ“ž.`
   }
 
   if (packageContext?.matched && packageContext.stage === 'courier') {
-    return `Revisé la guía ${packageCode || 'indicada'} 📦 y figura asignada a cartero 🛵${destinationLocationText ? ` en ${destinationLocationText} 📍` : ''}. Está en proceso de reparto 🚚; no aparece como entregada todavía ⏳.`
+    return `RevisÃ© la guÃ­a ${packageCode || 'indicada'} ðŸ“¦ y figura asignada a cartero ðŸ›µ${destinationLocationText ? ` en ${destinationLocationText} ðŸ“` : ''}. EstÃ¡ en proceso de reparto ðŸšš; no aparece como entregada todavÃ­a â³.`
   }
 
   if (packageContext?.matched && packageContext.stage === 'transit') {
     return [
-      `¡Hola, ${contactName}! 👋 Muchas gracias por escribirnos.`,
+      `Â¡Hola, ${contactName}! ðŸ‘‹ Muchas gracias por escribirnos.`,
       '',
-      `🚚 Tu paquete está en tránsito con destino a ${destinationDisplay} 📦. Seguimos monitoreando su avance 🔎 y te avisaremos cuando haya un nuevo movimiento 📲.`,
+      `ðŸšš Tu paquete estÃ¡ en trÃ¡nsito con destino a ${destinationDisplay} ðŸ“¦. Seguimos monitoreando su avance ðŸ”Ž y te avisaremos cuando haya un nuevo movimiento ðŸ“².`,
     ].join('\n')
   }
 
   if (packageContext?.matched && packageContext.stage === 'regional') {
     return [
-      `¡Perfecto! 👌 Confirmamos la guía ${packageCode || 'sin código'} 📦:`,
+      `Â¡Perfecto! ðŸ‘Œ Confirmamos la guÃ­a ${packageCode || 'sin cÃ³digo'} ðŸ“¦:`,
       '',
-      `📍 ¿Dónde está tu paquete hoy? Fue recibido y procesado en la Sucursal ${originLocationText}.`,
-      `🚛 Próximo paso: pasará a reparto o estará disponible según el proceso de la regional de destino ${destinationDisplay}.`,
+      `ðŸ“ Â¿DÃ³nde estÃ¡ tu paquete hoy? Fue recibido y procesado en la Sucursal ${originLocationText}.`,
+      `ðŸš› PrÃ³ximo paso: pasarÃ¡ a reparto o estarÃ¡ disponible segÃºn el proceso de la regional de destino ${destinationDisplay}.`,
       '',
-      'Te notificaremos 📲 apenas haya una nueva actualización. Si necesitas gestión presencial, lleva tu carnet de identidad original 🪪.',
+      'Te notificaremos ðŸ“² apenas haya una nueva actualizaciÃ³n. Si necesitas gestiÃ³n presencial, lleva tu carnet de identidad original ðŸªª.',
     ].join('\n')
   }
 
   if (packageContext?.matched && packageContext.stage === 'received') {
     return [
-      `¡Perfecto! 👌 Confirmamos la guía ${packageCode || 'sin código'} 📦:`,
+      `Â¡Perfecto! ðŸ‘Œ Confirmamos la guÃ­a ${packageCode || 'sin cÃ³digo'} ðŸ“¦:`,
       '',
-      `📍 ¿Dónde está tu paquete hoy? Fue recibido y procesado en la Sucursal ${originLocationText}.`,
-      `🚛 Próximo paso: saldrá en el próximo despacho con destino a ${destinationDisplay}.`,
+      `ðŸ“ Â¿DÃ³nde estÃ¡ tu paquete hoy? Fue recibido y procesado en la Sucursal ${originLocationText}.`,
+      `ðŸš› PrÃ³ximo paso: saldrÃ¡ en el prÃ³ximo despacho con destino a ${destinationDisplay}.`,
       '',
-      'Te notificaremos 📲 apenas entre en tránsito. Si necesitas gestión presencial, puedes pasar por la sucursal con tu carnet de identidad original 🪪.',
+      'Te notificaremos ðŸ“² apenas entre en trÃ¡nsito. Si necesitas gestiÃ³n presencial, puedes pasar por la sucursal con tu carnet de identidad original ðŸªª.',
     ].join('\n')
   }
 
   if (currentStatus === 'Recibido Destino') {
-    return `¡Perfecto! 🙌 Tu paquete ya llegó y está listo para que lo pases a recoger en ${destinationDisplay} 📍. Lleva tu carnet de identidad original 🪪.`
+    return `Â¡Perfecto! ðŸ™Œ Tu paquete ya llegÃ³ y estÃ¡ listo para que lo pases a recoger en ${destinationDisplay} ðŸ“. Lleva tu carnet de identidad original ðŸªª.`
   }
 
   if (currentStatus === 'Nuevo') {
-    return `Tu paquete fue recibido en nuestra sucursal de origen 📦${originDisplay ? `, ${originDisplay}` : ''}${destinationDisplay ? `, con destino a ${destinationDisplay}` : ''}. Te avisaremos cuando sea despachado 📲.`
+    return `Tu paquete fue recibido en nuestra sucursal de origen ðŸ“¦${originDisplay ? `, ${originDisplay}` : ''}${destinationDisplay ? `, con destino a ${destinationDisplay}` : ''}. Te avisaremos cuando sea despachado ðŸ“².`
   }
 
   if (currentStatus === 'Activo' || currentStatus === 'Entregado') {
-    return 'Tu paquete figura como entregado ✅. Si necesitas revisar algún detalle adicional, aquí te ayudo 😊.'
+    return 'Tu paquete figura como entregado âœ…. Si necesitas revisar algÃºn detalle adicional, aquÃ­ te ayudo ðŸ˜Š.'
   }
 
   if (currentStatus === 'En seguimiento') {
     return isDeliveryQuestion
-      ? 'Tu paquete está en seguimiento 🔎. Apenas tengamos una actualización, te la compartimos 📲.'
-      : 'Ya estamos revisando tu envío 🔎. En cuanto avance, te compartimos la actualización 📲.'
+      ? 'Tu paquete estÃ¡ en seguimiento ðŸ”Ž. Apenas tengamos una actualizaciÃ³n, te la compartimos ðŸ“².'
+      : 'Ya estamos revisando tu envÃ­o ðŸ”Ž. En cuanto avance, te compartimos la actualizaciÃ³n ðŸ“².'
   }
 
-  return 'Estamos revisando tu caso 🔎. Apenas tengamos una actualización, te la compartimos 📲.'
+  return 'Estamos revisando tu caso ðŸ”Ž. Apenas tengamos una actualizaciÃ³n, te la compartimos ðŸ“².'
 }
 
 const buildFallbackAgentReply = buildFriendlyFallbackAgentReply
+
+const isPackageHistoryQuestion = (messageBody) => {
+  const normalized = normalizeIntentText(messageBody)
+
+  return (
+    /\b(todo|historial|eventos?|movimientos?|recorrido|paso|pas[oó]|pasado|trazabilidad|seguimiento completo)\b/.test(normalized) ||
+    /\b(donde|dónde)\s+(estaba|estuvo|ira|ir[aá]|ir|va|esta|est[aá])\b/.test(normalized) ||
+    /\b(que|qué)\s+(paso|pas[oó])\b/.test(normalized)
+  )
+}
+
+const isPackageDisputeMessage = (messageBody) => {
+  const normalized = normalizeIntentText(messageBody)
+  return (
+    /\b(reclamo|error|equivocado|incorrecto|inconsistencia|no corresponde|no es correcto)\b/.test(normalized) ||
+    /\b(por que|porque)\b.*\b(dice|figura|aparece|marca)\b/.test(normalized) ||
+    /\b(aun no|todavia no|no lo|no he|no lo he|no lo lleve|no lo entregue)\b.*\b(lleve|llevado|entregue|entregado|llevare|entregare)\b/.test(normalized) ||
+    /\b(lo entregare|lo llevare|voy a llevar|voy a entregar)\b.*\b(manana|luego|despues|mas tarde)\b/.test(normalized)
+  )
+}
+
+const getFriendlyPackageEventTitle = (event) => {
+  const rawTitle = normalizeReference(getPackageEventTitle(event))
+  const normalized = normalizeIntentText(rawTitle)
+
+  if (normalized.includes('recibido') && normalized.includes('cliente')) {
+    return 'Paquete recibido en origen 📥'
+  }
+
+  if (normalized.includes('almacen') || normalized.includes('centro') || normalized.includes('procesamiento')) {
+    return 'Recibido en centro de procesamiento 🏢'
+  }
+
+  if (
+    normalized.includes('saca') ||
+    normalized.includes('despach') ||
+    normalized.includes('transito') ||
+    normalized.includes('camino')
+  ) {
+    return '¡En camino a su destino! 🚚💨'
+  }
+
+  if (
+    normalized.includes('destino') ||
+    normalized.includes('regional') ||
+    normalized.includes('oficina') ||
+    normalized.includes('ventanilla')
+  ) {
+    return '¡Llegó a la ciudad de destino! 🏙️'
+  }
+
+  if (
+    normalized.includes('listo') ||
+    normalized.includes('entrega fisica') ||
+    normalized.includes('entrega fisica') ||
+    normalized.includes('cartero') ||
+    normalized.includes('reparto')
+  ) {
+    return '¡Listo para entregar! 🎉'
+  }
+
+  if (normalized.includes('fallido')) {
+    return 'Intento de entrega no concretado ⚠️'
+  }
+
+  if (normalized.includes('devuel')) {
+    return 'Paquete devuelto ↩️'
+  }
+
+  if (normalized.includes('entregado')) {
+    return '¡Entregado con éxito! ✅'
+  }
+
+  return normalized === 'nuevo movimiento' ? '' : rawTitle || ''
+}
+
+const getFriendlyPackageCurrentStatus = (packageContext, latestEvent) => {
+  const stage = normalizeReference(packageContext?.stage)
+  const latestTitle = normalizeIntentText(getPackageEventTitle(latestEvent))
+
+  if (stage === 'delivered' || latestTitle.includes('entregado')) {
+    return 'Entregado.'
+  }
+
+  if (stage === 'cancelled' || latestTitle.includes('devuel') || latestTitle.includes('cancel')) {
+    return 'Devuelto o cancelado.'
+  }
+
+  if (stage === 'courier' || latestTitle.includes('cartero') || latestTitle.includes('reparto')) {
+    return 'En reparto para entrega.'
+  }
+
+  if (
+    stage === 'regional' ||
+    latestTitle.includes('destino') ||
+    latestTitle.includes('oficina') ||
+    latestTitle.includes('ventanilla')
+  ) {
+    return 'Disponible para entrega en oficina.'
+  }
+
+  if (stage === 'transit' || latestTitle.includes('transito') || latestTitle.includes('despach')) {
+    return 'En camino a destino.'
+  }
+
+  return 'Recibido en origen.'
+}
+
+const formatPackageHistoryReply = (packageContext) => {
+  const packageCode = normalizeReference(packageContext?.currentPackageCode) || 'la guia indicada'
+  const events = Array.isArray(packageContext?.packageEvents) ? packageContext.packageEvents : []
+  const orderedEvents = events
+    .slice()
+    .sort((firstEvent, secondEvent) => getPackageEventTimestampValue(firstEvent) - getPackageEventTimestampValue(secondEvent))
+  const packageEventsText = normalizeReference(packageContext?.packageEventsText)
+
+  if (!orderedEvents.length && !packageEventsText) {
+    return ''
+  }
+
+  if (!orderedEvents.length) {
+    const destination =
+      normalizeReference(packageContext?.currentDestinationDepartment) ||
+      normalizeReference(packageContext?.currentDestinationLabel) ||
+      normalizeReference(packageContext?.currentDestinationAddress)
+
+    return [
+      `¡Hola! 👋 ${getBoliviaDayGreeting()}. Soy Jaimito de Correos de Bolivia ✉️.`,
+      `📦 Te detallo el recorrido de tu paquete *${packageCode}*:`,
+      '',
+      packageEventsText,
+      '',
+      destination ? `🎯 Destino registrado: ${destination}.` : '',
+      '💬 Puedes escribirnos a este número si tienes alguna duda. ¡Gracias por preferirnos! 😊',
+    ]
+      .filter(Boolean)
+      .join('\n')
+  }
+
+  const seenEvents = new Set()
+  const lines = orderedEvents.map((event) => {
+    const timestamp = getPackageEventTimestampValue(event)
+    const formattedDate = timestamp
+      ? new Intl.DateTimeFormat('es-BO', {
+          dateStyle: 'short',
+          timeStyle: 'short',
+          timeZone: 'America/La_Paz',
+        }).format(new Date(timestamp))
+      : 'sin fecha'
+    const title = getFriendlyPackageEventTitle(event)
+    if (!title) return ''
+
+    const dedupeKey = `${timestamp || formattedDate}|${normalizeIntentText(title)}`
+    if (seenEvents.has(dedupeKey)) return ''
+    seenEvents.add(dedupeKey)
+
+    return `*${formattedDate}*: ${title}`
+  }).filter(Boolean)
+
+  const latestEvent = orderedEvents[orderedEvents.length - 1]
+  const currentStatus = getFriendlyPackageCurrentStatus(packageContext, latestEvent)
+  const destination =
+    normalizeReference(packageContext?.currentDestinationDepartment) ||
+    normalizeReference(packageContext?.currentDestinationLabel) ||
+    normalizeReference(packageContext?.currentDestinationAddress)
+
+  return [
+    `¡Hola! 👋 ${getBoliviaDayGreeting()}. Soy Jaimito de Correos de Bolivia ✉️.`,
+    `📦 Te detallo el recorrido de tu paquete *${packageCode}*:`,
+    '',
+    ...lines,
+    '',
+    `📍 *Estado actual:* ${currentStatus}`,
+    destination ? `🎯 *Destino:* ${destination}` : '',
+    '💬 Puedes pasar a recogerlo o escribirnos a este número si tienes alguna duda. ¡Gracias por preferirnos! 😊',
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
 
 const getBoliviaDayGreeting = () => {
   const hour = Number(
@@ -4583,7 +7653,7 @@ const getBoliviaDayGreeting = () => {
 }
 
 const isGreetingMessage = (messageBody) =>
-  /^(?:(?:hola|buenas?)\s+)?(?:buenos?\s+(?:dias|días)|buenas?\s+(?:tardes|noches|nohces)|hola|buenas)[!.,?\s]*$/i.test(
+  /^(?:(?:hola|buenas?)\s+)?(?:buenos?\s+(?:dias|dÃ­as)|buenas?\s+(?:tardes|noches|nohces)|hola|buenas)[!.,?\s]*$/i.test(
     normalizeReference(messageBody),
   )
 
@@ -4595,6 +7665,40 @@ const normalizeIntentText = (value) =>
     .replace(/[^a-z0-9\s]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
+
+const isOpenAssistanceMessage = (messageBody) => {
+  const normalized = normalizeIntentText(messageBody)
+
+  return /^(hola|buenas|buenos dias|buenas tardes|buenas noches)?\s*(una consulta|tengo una consulta|consulta|puedo consultar|me ayudas|ayuda|necesito ayuda)\s*$/.test(
+    normalized,
+  )
+}
+
+const isLowSignalMessage = (messageBody) => {
+  const normalized = normalizeIntentText(messageBody)
+  if (!normalized) return true
+
+  const compact = normalized.replace(/\s+/g, '')
+  const words = normalized.split(' ').filter(Boolean)
+  const uniqueWords = new Set(words)
+  const hasVowel = /[aeiou]/.test(compact)
+  const hasLongConsonantChunk = /[bcdfghjklmnpqrstvwxyz]{6,}/.test(compact)
+  const repeatedShortGreeting = words.length > 1 && uniqueWords.size === 1 && ['hola', 'hols', 'buenas'].includes(words[0])
+
+  return compact.length < 2 || !hasVowel || hasLongConsonantChunk || repeatedShortGreeting
+}
+
+const isCorreosRelatedMessage = (messageBody) => {
+  const normalized = normalizeIntentText(messageBody)
+
+  return /\b(correo|correos|bolivia|paquete|paquetes|envio|envios|guia|guias|tracking|rastreo|rastrear|seguimiento|entrega|entregado|cartero|reparto|oficina|sucursal|ventanilla|puerta|casa|domicilio|direccion|destino|reclamo|cancelado|devuelto|tarifa|precio|costo|cotizacion|delivery|express|ems)\b/.test(
+    normalized,
+  )
+}
+
+const isNonActionableCustomerMessage = (messageBody) =>
+  !isGreetingMessage(messageBody) &&
+  (isLowSignalMessage(messageBody) || (!isCorreosRelatedMessage(messageBody) && !hasPackageCode(messageBody)))
 
 const getEditDistance = (firstValue, secondValue) => {
   const first = normalizeReference(firstValue)
@@ -4646,6 +7750,7 @@ const getEmptyPackageContext = () => ({
   packageCodes: [],
   summaryText: '',
   agentFactsText: '',
+  lookupUnavailable: false,
   lifecycleInstruction: '',
 })
 
@@ -4655,55 +7760,279 @@ const buildMultiPackageContextReply = (packageResults) => {
     .filter((result) => !result.context?.matched)
     .map((result) => result.code)
 
-  const formatLocation = (context) =>
-    normalizeReference(context.currentDestinationDepartment) ||
-    normalizeReference(context.currentDestinationLabel) ||
-    normalizeReference(context.currentDestinationAddress) ||
-    normalizeReference(context.currentOriginDepartment) ||
-    normalizeReference(context.currentOriginLabel) ||
-    'sin ubicacion precisa'
+  const formatDisplayLocation = (value) => {
+    const normalized = normalizeReference(value)
+    if (!normalized) return ''
 
-  const formatResult = ({ code, context }) => {
+    return normalized
+      .toLowerCase()
+      .split(' ')
+      .filter(Boolean)
+      .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+      .join(' ')
+  }
+
+  const formatLocation = (context) =>
+    formatDisplayLocation(context.currentDestinationDepartment) ||
+    formatDisplayLocation(context.currentDestinationLabel) ||
+    formatDisplayLocation(context.currentDestinationAddress) ||
+    formatDisplayLocation(context.currentOriginDepartment) ||
+    formatDisplayLocation(context.currentOriginLabel) ||
+    'sin ubicaciÃ³n precisa'
+
+  const formatDestination = (context) =>
+    formatDisplayLocation(context.currentDestinationDepartment) ||
+    formatDisplayLocation(context.currentDestinationLabel) ||
+    formatDisplayLocation(context.currentDestinationAddress) ||
+    ''
+
+  const formatDestinationLine = (context) => {
+    const destination = formatDestination(context)
+    return destination ? `ðŸŽ¯ **Destino:** Va dirigido a ${destination}.` : ''
+  }
+
+  const formatBranchShortAddress = (branch) => {
+    if (!branch?.address) return ''
+
+    return branch.address
+      .replace('Av. Mariscal Santa Cruz N 1260, esq. Calle Oruro (Edificio Telecomunicaciones).', 'Av. Mariscal Santa Cruz #1260')
+      .replace('Calle Cobija entre Sucre y Ballivian N 24.', 'Calle Cobija #24')
+      .replace('Calle Presidente Montes esq. Junin N 1456.', 'Calle Presidente Montes #1456')
+      .replace('Calle Hoyos esq. Topater, Villa Imperial de Potosi.', 'Calle Hoyos esq. Topater')
+      .replace('Calle Mariscal Sucre esq. Virginio Lema N 397.', 'Calle Mariscal Sucre #397')
+      .replace('Calle Junin esq. Ayacucho N 699.', 'Calle Junin #699')
+  }
+
+  const formatBranchInline = (context, fallbackLocation = '') => {
+    const destinationBranch = getPackageDestinationBranch(context)
+    const originBranch = getPackageOriginBranch(context)
+    const branch = destinationBranch || originBranch || findBranchForLocation(fallbackLocation || formatLocation(context))
+    const address = formatBranchShortAddress(branch)
+
+    return address ? ` ðŸ“ *(${branch.label === 'La Paz' ? 'Sucursal Central' : branch.label}: ${address})*` : ''
+  }
+
+  const formatCodeList = (codes) => {
+    if (codes.length <= 1) return codes[0] || ''
+    if (codes.length === 2) return `${codes[0]} y ${codes[1]}`
+    return `${codes.slice(0, -1).join(', ')} y ${codes[codes.length - 1]}`
+  }
+
+  const findBranchForLocation = (location) => {
+    const normalizedLocation = normalizeReference(location).toLowerCase()
+    if (!normalizedLocation) return null
+
+    return BOLIVIA_BRANCH_LOCATIONS.find((branch) =>
+      branch.terms.some((term) => normalizedLocation.includes(normalizeReference(term).toLowerCase())),
+    )
+  }
+
+  const formatPickupPoint = (context) => {
+    const location = formatLocation(context)
+    const branch = findBranchForLocation(location)
+
+    if (!branch) return ''
+
+    return `\nðŸ¢ **Punto de recojo final:** ${branch.label} (${branch.address})`
+  }
+
+  const formatBranchLine = (label, context) => {
+    const destinationBranch = getPackageDestinationBranch(context)
+    const originBranch = getPackageOriginBranch(context)
+    const branch = destinationBranch || originBranch || findBranchForLocation(formatLocation(context))
+
+    if (!branch?.address) return ''
+
+    return `ðŸ¤ **${label}:** ${branch.label} (${branch.address})`
+  }
+
+  const formatResult = ({ code, context }, index) => {
     const packageCode = normalizeReference(context.currentPackageCode) || code
-    const location =
-      context.stage === 'courier'
-        ? `va en reparto hacia ${formatLocation(context)}`
-        : context.stage === 'regional'
-          ? `ya llego a destino en ${formatLocation(context)}`
-          : context.stage === 'delivered'
-            ? `ya figura entregado en ${formatLocation(context)}`
-            : context.stage === 'transit'
-              ? `esta en camino hacia ${formatLocation(context)}`
-              : context.stage === 'cancelled'
-                ? `figura cancelado en ${formatLocation(context)}`
-                : `esta en ${formatLocation(context)}`
+    const location = formatLocation(context)
     const latestEvent = Array.isArray(context.packageEvents)
       ? context.packageEvents
           .slice()
           .sort((firstEvent, secondEvent) => getPackageEventTimestampValue(secondEvent) - getPackageEventTimestampValue(firstEvent))[0]
       : null
-    const latestEventText = latestEvent && context.stage !== 'courier' && context.stage !== 'regional'
-      ? ` Ultimo evento: ${getPackageEventTitle(latestEvent)}${getPackageEventLocation(latestEvent) ? ` en ${getPackageEventLocation(latestEvent)}` : ''}.`
+    const latestEventTitle = latestEvent ? normalizeReference(getPackageEventTitle(latestEvent)) : ''
+    const latestEventLocation = latestEvent ? formatDisplayLocation(getPackageEventLocation(latestEvent)) : ''
+    const latestEventText = latestEventTitle
+      ? `\nðŸ§¾ **Ãšltimo registro:** ${latestEventTitle}${latestEventLocation ? ` en ${latestEventLocation}` : ''}.`
       : ''
 
-    return `- ${packageCode}: ${location}.${latestEventText}`
+    if (context.stage === 'courier') {
+      return [
+        `ðŸ“¦ **${index}. GuÃ­a: ${packageCode}**`,
+        `ðŸšš **Estado:** ðŸŸ¡ Con cartero repartiendo en ${location}.`,
+        formatDestinationLine(context),
+        `ðŸ“ **UbicaciÃ³n actual:** ${location}`,
+        formatBranchLine('Sucursal de reparto', context),
+      ].join('\n')
+    }
+
+    if (context.stage === 'regional') {
+      return [
+        `ðŸ“¦ **${index}. GuÃ­a: ${packageCode}**`,
+        `ðŸ¢ **Estado:** ðŸŸ¡ Ya llegÃ³ a destino en ${location}.`,
+        formatDestinationLine(context),
+        `ðŸ“ **UbicaciÃ³n actual:** Oficina de destino / lista para gestiÃ³n.`,
+        formatBranchLine('Sucursal actual', context),
+        formatPickupPoint(context),
+      ].filter(Boolean).join('\n')
+    }
+
+    if (context.stage === 'delivered') {
+      return [
+        `ðŸ“¦ **${index}. GuÃ­a: ${packageCode}**`,
+        `âœ… **Estado:** Â¡Entregado con Ã©xito!`,
+        formatDestinationLine(context),
+        `ðŸ“ **Lugar de entrega:** ${location}`,
+        formatBranchLine('Sucursal de entrega', context),
+      ].join('\n')
+    }
+
+    if (context.stage === 'transit') {
+      return [
+        `ðŸ“¦ **${index}. GuÃ­a: ${packageCode}**`,
+        `ðŸšš **Estado:** ðŸŸ¡ En trÃ¡nsito / En camino a ${location}.`,
+        formatDestinationLine(context),
+        `ðŸ“ **UbicaciÃ³n actual:** ${latestEventLocation || 'Centro de clasificaciÃ³n / En ruta'}`,
+        formatPickupPoint(context),
+        latestEventText,
+      ].filter(Boolean).join('\n')
+    }
+
+    if (context.stage === 'received') {
+      return [
+        `ðŸ“¦ **${index}. GuÃ­a: ${packageCode}**`,
+        `ðŸ“¥ **Estado:** Recibido en origen / pendiente de despacho.`,
+        formatDestinationLine(context),
+        `ðŸ“ **UbicaciÃ³n actual:** ${location}`,
+        formatBranchLine('Sucursal de origen', context),
+      ].filter(Boolean).join('\n')
+    }
+
+    if (context.stage === 'cancelled') {
+      return [
+        `âŒ **${index}. GuÃ­a: ${packageCode}**`,
+        `ðŸ”´ **Estado:** Cancelado / Devuelto`,
+        formatDestinationLine(context),
+        `ðŸ“ **Registro:** ${location}`,
+        formatBranchLine('Sucursal de registro', context),
+        `ðŸ’¡ *Si necesitas ayuda para consultar el motivo de cancelaciÃ³n, escribe la palabra* **RECLAMO**.`,
+      ].join('\n')
+    }
+
+    return [
+      `ðŸ“¦ **${index}. GuÃ­a: ${packageCode}**`,
+      `â„¹ï¸ **Estado:** En revisiÃ³n`,
+      formatDestinationLine(context),
+      `ðŸ“ **UbicaciÃ³n actual:** ${location}`,
+      formatBranchLine('Sucursal relacionada', context),
+      latestEventText,
+    ].filter(Boolean).join('\n')
   }
 
   const deliveryResults = foundResults.filter((result) => result.context?.stage === 'courier')
-  const arrivedResults = foundResults.filter((result) => ['regional', 'delivered'].includes(result.context?.stage))
+  const regionalResults = foundResults.filter((result) => result.context?.stage === 'regional')
+  const deliveredResults = foundResults.filter((result) => result.context?.stage === 'delivered')
   const transitResults = foundResults.filter((result) => result.context?.stage === 'transit')
+  const receivedResults = foundResults.filter((result) => result.context?.stage === 'received')
   const cancelledResults = foundResults.filter((result) => result.context?.stage === 'cancelled')
   const otherResults = foundResults.filter(
-    (result) => !['courier', 'regional', 'delivered', 'transit', 'cancelled'].includes(result.context?.stage),
+    (result) => !['courier', 'regional', 'delivered', 'transit', 'received', 'cancelled'].includes(result.context?.stage),
   )
 
-  const lines = [
-    ...deliveryResults.map((result) => formatResult(result)),
-    ...arrivedResults.map((result) => formatResult(result)),
-    ...transitResults.map((result) => formatResult(result)),
-    ...cancelledResults.map((result) => formatResult(result)),
-    ...otherResults.map((result) => formatResult(result)),
-  ]
+  const lines = []
+
+  if (deliveryResults.length > 0) {
+    lines.push('ðŸš´â€â™‚ï¸ **En reparto hoy:**')
+    lines.push(
+      ...deliveryResults.map(({ code, context }) => {
+        const packageCode = normalizeReference(context.currentPackageCode) || code
+        const location = formatLocation(context)
+        return `â€¢ **${packageCode}:** El cartero ya lo tiene en calle para entrega en **${location}**${formatBranchInline(context, location)}.`
+      }),
+    )
+    lines.push('')
+  }
+
+  if (deliveredResults.length > 0) {
+    lines.push('âœ… **Entregado:**')
+    lines.push(
+      ...deliveredResults.map(({ code, context }) => {
+        const packageCode = normalizeReference(context.currentPackageCode) || code
+        const location = formatLocation(context)
+        return `â€¢ **${packageCode}:** Finalizado con Ã©xito en **${location}**${formatBranchInline(context, location)}.`
+      }),
+    )
+    lines.push('')
+  }
+
+  if (regionalResults.length > 0) {
+    lines.push('ðŸ¢ **Listos en destino:**')
+    lines.push(
+      ...regionalResults.map(({ code, context }) => {
+        const packageCode = normalizeReference(context.currentPackageCode) || code
+        const location = formatLocation(context)
+        return `â€¢ **${packageCode}:** Ya llegÃ³ a la agencia de destino en **${location}**${formatBranchInline(context, location)}.`
+      }),
+    )
+    lines.push('')
+  }
+
+  if (transitResults.length > 0) {
+    lines.push('ðŸšš **En trÃ¡nsito:**')
+    lines.push(
+      ...transitResults.map(({ code, context }) => {
+        const packageCode = normalizeReference(context.currentPackageCode) || code
+        const destination = formatDestination(context) || formatLocation(context)
+        return `â€¢ **${packageCode}:** En camino a **${destination}**${formatBranchInline(context, destination)}.`
+      }),
+    )
+    lines.push('')
+  }
+
+  if (receivedResults.length > 0) {
+    lines.push('ðŸ“¥ **Pendientes de despacho (En origen):**')
+    const groupedByLocation = new Map()
+    for (const result of receivedResults) {
+      const location = formatLocation(result.context)
+      const key = `${location}|${formatBranchInline(result.context, location)}`
+      const group = groupedByLocation.get(key) ?? {
+        location,
+        branchText: formatBranchInline(result.context, location),
+        codes: [],
+      }
+      group.codes.push(normalizeReference(result.context.currentPackageCode) || result.code)
+      groupedByLocation.set(key, group)
+    }
+    lines.push(
+      ...Array.from(groupedByLocation.values()).map(
+        (group) =>
+          `â€¢ **${formatCodeList(group.codes)}:** ${group.codes.length > 1 ? 'Recibidos' : 'Recibido'} en agencia **${group.location}**${group.branchText}.`,
+      ),
+    )
+    lines.push('')
+  }
+
+  if (cancelledResults.length > 0) {
+    lines.push('âŒ **Cancelados / Devueltos:**')
+    lines.push(
+      ...cancelledResults.map(({ code, context }) => {
+        const packageCode = normalizeReference(context.currentPackageCode) || code
+        const location = formatLocation(context)
+        return `â€¢ **${packageCode}:** Registro cancelado en **${location}**${formatBranchInline(context, location)}.`
+      }),
+    )
+    lines.push('ðŸ’¡ *Si necesitas ayuda para consultar el motivo de cancelaciÃ³n, escribe la palabra* **RECLAMO**.')
+    lines.push('')
+  }
+
+  if (otherResults.length > 0) {
+    lines.push(...otherResults.map((result, index) => formatResult(result, index + 1)))
+    lines.push('')
+  }
 
   if (missingCodes.length > 0) {
     lines.push(`No pude localizar: ${missingCodes.join(', ')}. Verifica esos codigos, por favor.`)
@@ -4714,11 +8043,10 @@ const buildMultiPackageContextReply = (packageResults) => {
   }
 
   return [
-    'Claro, revise las guias que me enviaste:',
-    ...lines,
-    deliveryResults.length > 0
-      ? 'Los que estan con cartero son los que van camino a entrega.'
-      : 'No veo ninguna de esas guias marcada como cartero/reparto por ahora.',
+    'Â¡Listo! AquÃ­ tienes el estado exacto de tus paquetes:',
+    '',
+    ...lines.filter((line, index, values) => line !== '' || values[index - 1] !== ''),
+    'ðŸ‘‰ Â¿Deseas que active las notificaciones a tu WhatsApp para cuando los paquetes pendientes salgan a ruta?',
   ].join('\n')
 }
 
@@ -4735,7 +8063,7 @@ const isPackageInquiryMessage = (messageBody) => {
 const isGratitudeOnlyMessage = (messageBody) => {
   const normalized = normalizeReference(messageBody)
     .toLowerCase()
-    .replace(/[!¡¿?.,;:"'()[\]{}]/g, ' ')
+    .replace(/[!Â¡Â¿?.,;:"'()[\]{}]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
 
@@ -4744,8 +8072,9 @@ const isGratitudeOnlyMessage = (messageBody) => {
   )
 }
 
+const supportContactNumber = process.env.BOT_SUPPORT_CONTACT_NUMBER?.trim() || '71596249'
 const PROMPT_INJECTION_SAFE_REPLY =
-  'No puedo ayudarte con eso. Solo puedo ayudarte con consultas relacionadas con Correos de Bolivia, seguimiento de paquetes y atencion al cliente.'
+  `No puedo ayudarte con eso. Solo puedo ayudarte con consultas relacionadas con Correos de Bolivia, seguimiento de paquetes y atencion al cliente. Para mas informacion, comunicate al ${supportContactNumber}.`
 
 const isPromptInjectionAttempt = (messageBody) => {
   const normalized = normalizeIntentText(messageBody)
@@ -4767,6 +8096,14 @@ const isPromptInjectionAttempt = (messageBody) => {
     /\bmuestra\b.*\b(prompt|codigo|instrucciones|reglas)\b/,
     /\brevela\b.*\b(prompt|codigo|instrucciones|reglas)\b/,
     /\bdime\b.*\b(prompt|instrucciones|reglas internas)\b/,
+    /\b(escribe|responde|di|confirma)\b.*\b(exactamente|literalmente|texto)\b/,
+    /\b(costo|cuesta|cobran|cobrar|tarifa|precio|envio)\b.*\b(bs\s*0|0\s*bs|gratis|gratuito|sin costo|costo cero)\b/,
+    /\b(descuento|rebaja)\b.*\b(100\s*%|cien por ciento|total)\b/,
+    /\b(free|free[-\s]?\d+|#free)\b/,
+    /\b(gerente|director|jefe|autorizacion|codigo de autorizacion)\b.*\b(gratis|sin costo|descuento|100\s*%|free)\b/,
+    /\b(auditoria|prueba del sistema|test del sistema)\b.*\b(escribe|responde|di|confirma)\b/,
+    /\b(override system|override_system|system override|role|service|price)\b.*\b(true|0|gratis|sin costo)\b/,
+    /\bprocesa\b.*\b(json|override|system|price|service)\b/,
     /\breceta\b|\bcocina\b|\bsopa\b|\bmani\b/,
     /\bsuma\b.*\b\d+\b.*\b\d+\b/,
   ]
@@ -4780,13 +8117,293 @@ const hasPackageCode = (messageBody) => {
 }
 
 const isTariffInquiryMessage = (messageBody) => {
-  const normalized = normalizeReference(messageBody).toLowerCase()
-  return /\b(tarifa|tarifas|precio|precios|costo|costos|cotiza|cotizacion|cotización|cuanto cuesta|cuánto cuesta|envio nacional|envio internacional|peso|kilo|kilogramo)\b/.test(
+  const normalized = normalizeTariffLookupText(messageBody)
+  return /\b(tarifa|tarifas|precio|precios|costo|costos|costaria|cotiza|cotizar|cotizacion|cuanto cuesta|cuanto sale|cuanto me costaria|descuento|rebaja|tercera edad|adulto mayor|mandar|enviar|enviear|enbiar|llevar|envio nacional|envio internacional|peso|pesa|pesan|kilo|kilos|kilogramo|kilogramos|ems|delivery|express)\b/.test(
     normalized,
   )
 }
 
-const inferIntentHeuristically = (messageBody) => {
+const hasDeclinedEmsDimensions = (messageBody) => {
+  const normalized = normalizeTariffLookupText(messageBody)
+  return /\b(no las tengo|no tengo las medidas|no se las medidas|no se las dimensiones|sin medidas|solo con el peso|cotiza solo con peso|cotiza sin medidas|continua solo con el peso)\b/.test(normalized)
+}
+
+const isEmsTariffFollowUp = (messageBody, recentConversation = '') => {
+  const normalizedConversation = normalizeTariffLookupText(recentConversation)
+  const hasRecentEmsSelection =
+    /\b(ems nacional|ems internacional)\b/.test(normalizedConversation)
+  const wasAskedForEmsData =
+    hasRecentEmsSelection &&
+    /\b(peso|dimensiones|alto|ancho|largo|pais de destino|departamento de destino|quieres cotizar ems)\b/.test(normalizedConversation)
+  const normalizedMessage = normalizeTariffLookupText(messageBody)
+  const isSimpleDestinationReply =
+    wasAskedForEmsData &&
+    /\b(pais de destino|departamento de bolivia)\b/.test(normalizedConversation) &&
+    /^[a-z\s-]{2,40}$/.test(normalizedMessage) &&
+    !/\b(ok|listo|gracias|perfecto|dale|bueno|no|si)\b/.test(normalizedMessage)
+
+  return wasAskedForEmsData &&
+    (
+      Boolean(inferEmsCalculatorCategory(messageBody)) ||
+      Boolean(inferEmsInternationalDestination(messageBody).destinationCode) ||
+      getTariffPlaceMatchCount(messageBody) > 0 ||
+      Boolean(extractTariffWeightKg(messageBody)) ||
+      isEmsWeightReply(messageBody, recentConversation) ||
+      isEmsWeightReplyMissingUnit(messageBody, recentConversation) ||
+      Boolean(extractEmsPackageDimensions(messageBody)) ||
+      hasDeclinedEmsDimensions(messageBody) ||
+      isSimpleDestinationReply
+    )
+}
+
+const isSeniorDiscountQuestion = (messageBody) => {
+  const normalized = normalizeTariffLookupText(messageBody)
+  return /\b(descuento|rebaja|beneficio|promocion)\b/.test(normalized) &&
+    /\b(tercera edad|adulto mayor|mayor de edad|85 anos|85)\b/.test(normalized)
+}
+
+const isUnsupportedTariffServiceRequest = (messageBody) => {
+  const normalized = normalizeTariffLookupText(messageBody)
+  return /\b(nacional express|express nacional|nacional rapido|modalidad nacional express)\b/.test(normalized)
+}
+
+const isMultipleTariffQuoteRequest = (messageBody) => {
+  const normalized = normalizeTariffLookupText(messageBody)
+  const numberedItems = (normalized.match(/\b\d+\s*(?:\)|\.|-)/g) || []).length
+  const packageMentions = (normalized.match(/\bpaquete\b/g) || []).length
+  return (
+    /\b(\d+)\s*(envios|paquetes|cotizaciones)\b/.test(normalized) ||
+    /\b(desglose|total final|en un solo mensaje|al mismo tiempo)\b/.test(normalized) ||
+    numberedItems >= 2 ||
+    packageMentions >= 2
+  )
+}
+
+const splitMultipleTariffItems = (messageBody) => {
+  const normalized = normalizeReference(messageBody)
+  const matches = [...normalized.matchAll(/(?:^|\s)(\d+)\s*[\).:-]\s*/g)]
+  if (matches.length < 2) return []
+
+  return matches.map((match, index) => {
+    const start = match.index + match[0].length
+    const end = matches[index + 1]?.index ?? normalized.length
+    return normalized.slice(start, end).trim()
+  }).filter(Boolean)
+}
+
+const summarizeTariffItemForDraft = (itemText, index) => {
+  const weightKg = extractTariffWeightKg(itemText)
+  const deliveryMode = inferDeliveryExpressMode(itemText)
+  const serviceKey = inferTariffServiceKey(itemText) || (deliveryMode ? 'delivery_express' : '')
+  const originKey = inferTariffOriginKey(itemText)
+  const destinationKey = inferTariffDestinationKey(itemText, serviceKey)
+  const missing = []
+  const deliveryExpressMaxWeightKg = Number(botKnowledge.deliveryExpress?.limits?.maxWeightKg || 5)
+  const invalidReason = serviceKey === 'delivery_express' && Number(weightKg) > deliveryExpressMaxWeightKg
+    ? 'delivery_express_weight_exceeded'
+    : serviceKey === 'delivery_express' && hasUnsupportedDeliveryExpressMode(itemText)
+      ? 'unsupported_delivery_express_mode'
+      : ''
+
+  if (!originKey) missing.push('origen')
+  if (!destinationKey) missing.push('destino')
+  if (!weightKg) missing.push('peso')
+  if (!invalidReason) {
+    if (!serviceKey) missing.push('servicio: EMS Nacional e Internacional o Delivery Express')
+    if (serviceKey === 'ems') missing.push('confirmar si se cotizara por EMS Nacional e Internacional o Delivery Express')
+    if (serviceKey === 'delivery_express' && !deliveryMode) missing.push('modalidad Delivery Express')
+  }
+
+  const serviceLabel =
+    serviceKey === 'ems'
+      ? 'EMS Nacional e Internacional'
+      : serviceKey === 'delivery_express'
+        ? `Delivery Express${deliveryMode ? ` ${getDeliveryModeLabel(deliveryMode)}` : ''}`
+        : 'servicio pendiente'
+
+  return {
+    index,
+    originKey,
+    destinationKey,
+    weightKg,
+    serviceKey,
+    serviceLabel,
+    missing,
+    invalidReason,
+    itemText,
+  }
+}
+
+const formatMultipleTariffRoute = (summary) =>
+  summary.originKey && summary.destinationKey
+    ? `${summary.originKey.replaceAll('-', ' ')} a ${summary.destinationKey.replaceAll('-', ' ')}`
+    : 'ruta incompleta'
+
+const formatMultipleTariffWeight = (summary) =>
+  summary.weightKg
+    ? `${Number(summary.weightKg).toLocaleString('es-BO', {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 3,
+      })} kg`
+    : 'peso pendiente'
+
+const buildMultipleTariffQuotedLine = (summary, quote) => {
+  const route = formatMultipleTariffRoute(summary)
+  const weight = formatMultipleTariffWeight(summary)
+
+  if (quote?.matched && quote.rate) {
+    const price = formatTariffMoney(quote.rate.price, quote.rate.currency)
+    const serviceName = normalizeTariffDisplayValue(quote.rate.service_name) || summary.serviceLabel
+    const notes = normalizeReference(quote.rate.notes)
+    return {
+      line: `${summary.index}) ${route}, ${weight}, ${serviceName}: ${price}.${notes ? ` ${notes}` : ''}`,
+      price: Number(quote.rate.price),
+    }
+  }
+
+  return {
+    line: `${summary.index}) ${route}, ${weight}, ${summary.serviceLabel}. Por el momento estoy consultando la tarifa para esa ruta; si la API no responde, debe confirmarse con un asesor.`,
+    price: null,
+  }
+}
+
+const buildMultipleTariffMissingQuestion = (summary) => {
+  const route = formatMultipleTariffRoute(summary)
+  const weight = formatMultipleTariffWeight(summary)
+
+  if (summary.invalidReason === 'delivery_express_weight_exceeded') {
+    const maxWeightKg = botKnowledge.deliveryExpress?.limits?.maxWeightKg || 5
+    return `${summary.index}) ${route}, ${weight}, Delivery Express. Delivery Express solo aplica para paquetes de hasta ${maxWeightKg} kg; para ese peso corresponde cotizarlo por EMS Nacional e Internacional.`
+  }
+
+  if (summary.invalidReason === 'unsupported_delivery_express_mode') {
+    return `${summary.index}) Sobre el paquete ${route} de ${weight} por Delivery Express, la modalidad indicada no existe. Las modalidades validas son: puerta a puerta, puerta a ventanilla o ventanilla a ventanilla. Confirmame cual corresponde para cotizarlo.`
+  }
+
+  if (summary.serviceKey === 'delivery_express' && summary.missing.includes('modalidad Delivery Express')) {
+    return `${summary.index}) Sobre el paquete ${route} de ${weight} por Delivery Express, necesito que me especifiques la modalidad: puerta a puerta, puerta a ventanilla o ventanilla a ventanilla.`
+  }
+
+  if (summary.serviceKey === 'ems') {
+    return `${summary.index}) Sobre el paquete ${route} de ${weight}, confirmame si se cotizara por EMS Nacional e Internacional o por Delivery Express.`
+  }
+
+  return `${summary.index}) ${route}, ${weight}, ${summary.serviceLabel}. Falta: ${summary.missing.join(', ')}.`
+}
+
+const buildMultipleTariffDraftReply = async (messageBody) => {
+  const items = splitMultipleTariffItems(messageBody)
+  if (!items.length) {
+    return getResponseTemplate(
+      'multipleTariffQuoteRequest',
+      'Puedo ayudarte a cotizar varios envios, pero necesito tener origen, destino, peso y servicio de cada uno. Enviamelos numerados y los revisamos uno por uno.',
+    )
+  }
+
+  const summaries = items.map((item, index) => summarizeTariffItemForDraft(item, index + 1))
+  const quotedLines = []
+  let quotedTotal = 0
+  let quotedCount = 0
+
+  for (const summary of summaries) {
+    if (summary.invalidReason || summary.missing.length) {
+      quotedLines.push(buildMultipleTariffMissingQuestion(summary))
+      continue
+    }
+
+    const quote = await getTariffQuote({
+      messageBody: summary.itemText,
+      recentConversation: '',
+      skipMultipleCheck: true,
+    })
+    const quoted = buildMultipleTariffQuotedLine(summary, quote)
+    quotedLines.push(quoted.line)
+
+    if (Number.isFinite(quoted.price)) {
+      quotedTotal += quoted.price
+      quotedCount += 1
+    }
+  }
+
+  const hasPendingItems = summaries.some((summary) => summary.invalidReason || summary.missing.length)
+  const totalLine = quotedCount
+    ? hasPendingItems
+      ? `Total parcial cotizado: ${formatTariffMoney(quotedTotal)}. No incluye los items pendientes.`
+      : `Total final cotizado: ${formatTariffMoney(quotedTotal)}.`
+    : ''
+
+  return [
+    'Puedo preparar la cotizacion de varios envios. Revise cada item asi:',
+    ...quotedLines,
+    totalLine,
+    hasPendingItems ? 'Confirmame los datos faltantes y completo la cotizacion.' : '',
+  ].join('\n')
+}
+
+const isRecentTariffConversation = (recentConversation = '') => {
+  const normalized = normalizeTariffLookupText(recentConversation)
+  return /\b(tarifa exacta|te cotizo|cotizo|ems nacional|delivery express|dime cual necesitas|servicio que buscas)\b/.test(
+    normalized,
+  )
+}
+
+const isTariffFollowUpMessage = (messageBody) => {
+  const normalized = normalizeTariffLookupText(messageBody)
+  return /\b(ems|delivery|express|expres|internacional|nacional|por ems|por delivery|por express|puerta|ventanilla(?:s)?|sucursal(?:es)?|oficina(?:s)?|dejo|dejar|recogen|recoger|retiran|retirar|tiempo|llegaria|llega|llegar|demora|tarda|tardaria|cuanto tarda|cuanto tiempo|\d+(?:\.\d+)?\s*(kg|kilo|kilos|gramo|gramos|g|gr))\b/.test(
+    normalized,
+  )
+}
+
+const isExplicitTrackingRequest = (messageBody) => {
+  const normalized = normalizeIntentText(messageBody)
+  return /\b(donde esta|ubicacion|ubicar|rastreo|rastrear|seguimiento|estado|numero de guia|nro guia|mi guia|codigo de seguimiento|trackear|tracking)\b/.test(
+    normalized,
+  )
+}
+
+const isTariffConversationContinuation = (messageBody, recentConversation = '') => {
+  if (hasPackageCode(messageBody) || isExplicitTrackingRequest(messageBody)) {
+    return false
+  }
+
+  if (!isRecentTariffConversation(recentConversation)) {
+    return false
+  }
+
+  const normalized = normalizeTariffLookupText(messageBody)
+  if (!normalized || /^(hola|buenas|buenos dias|buenas tardes|buenas noches|gracias|ok|listo)$/.test(normalized)) {
+    return false
+  }
+
+  return true
+}
+
+const inferIntentHeuristically = (messageBody, recentConversation = '') => {
+  const normalizedTariffText = normalizeTariffLookupText(messageBody)
+  const looksLikeShipmentQuote =
+    getTariffPlaceMatchCount(messageBody) >= 2 &&
+    /\b(quiero|quisiera|necesito|mandar|enviar|enviear|enbiar|llevar)\b/.test(normalizedTariffText) &&
+    /\b(paquete|paquetes|encomienda|envio)\b/.test(normalizedTariffText)
+
+  if (looksLikeShipmentQuote && !hasPackageCode(messageBody)) {
+    return 'TARIFAS'
+  }
+
+  if (
+    isTariffConversationContinuation(messageBody, recentConversation) &&
+    (isTariffFollowUpMessage(messageBody) || isPackageInquiryMessage(messageBody) || isTariffInquiryMessage(messageBody))
+  ) {
+    return 'TARIFAS'
+  }
+
+  if (isTariffConversationContinuation(messageBody, recentConversation)) {
+    return 'TARIFAS'
+  }
+
+  if (isTariffInquiryMessage(messageBody) && !hasPackageCode(messageBody)) {
+    return 'TARIFAS'
+  }
+
   if (hasPackageCode(messageBody) || isPackageInquiryMessage(messageBody)) {
     return 'TRACKING'
   }
@@ -4799,13 +8416,1170 @@ const inferIntentHeuristically = (messageBody) => {
 }
 
 const routeCustomerIntent = async ({ messageBody, recentConversation = '' }) => {
-  const heuristicIntent = inferIntentHeuristically(messageBody)
+  const heuristicIntent = inferIntentHeuristically(messageBody, recentConversation)
 
   return {
     category: heuristicIntent,
     model: 'heuristic',
     source: 'heuristic',
   }
+}
+
+const normalizeTariffLookupText = (value) =>
+  normalizeReference(value)
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s.]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+const inferTariffServiceKey = (messageBody) => {
+  const normalized = normalizeTariffLookupText(messageBody)
+  if (/\b(ems|prioritario)\b/.test(normalized)) return 'ems'
+  if (/\b(delivery|express|expres|expreso|rapido|urgente)\b/.test(normalized)) return 'delivery_express'
+  return ''
+}
+
+const isDeliveryExpressProvinceDestination = (messageBody) => {
+  const normalized = normalizeTariffLookupText(messageBody)
+  const keywords = Array.isArray(botKnowledge.deliveryExpress?.coverage?.provinceKeywords)
+    ? botKnowledge.deliveryExpress.coverage.provinceKeywords
+    : ['provincia', 'provincial', 'comunidad', 'municipio']
+  return keywords.some((keyword) => {
+    const normalizedKeyword = normalizeTariffLookupText(keyword)
+    return normalizedKeyword && new RegExp(`\\b${normalizedKeyword}\\b`).test(normalized)
+  })
+}
+
+const isDeliveryExpressDimensionQuestion = (messageBody) => {
+  const normalized = normalizeTariffLookupText(messageBody)
+  return /\b(mide|medida|medidas|alto|altura|ancho|largo|dimension|dimensiones|metro|metros|cm|centimetro|centimetros)\b/.test(normalized)
+}
+
+const hasUnsupportedDeliveryExpressMode = (messageBody) => {
+  const normalized = normalizeTariffLookupText(messageBody)
+  return (
+    /ventanil{1,2}a\s+a\s+puerta/.test(normalized) ||
+    /ventanil{1,2}a\s+puerta/.test(normalized) ||
+    /\b(sucursal(?:es)?|ventanil{1,2}a(?:s)?|oficina(?:s)?)\b.*\b(casa|domicilio|direccion|puerta)\b/.test(normalized)
+  )
+}
+
+const inferDeliveryExpressMode = (messageBody) => {
+  const normalized = normalizeTariffLookupText(messageBody)
+  if (hasUnsupportedDeliveryExpressMode(messageBody)) {
+    return ''
+  }
+  if (
+    /puerta\s+a\s+puerta|puerta\s+puerta/.test(normalized) ||
+    /\b(casa|domicilio|direccion)\b.*\b(casa|domicilio|direccion)\b/.test(normalized) ||
+    /\brecog(?:er|ida|emos)?\b.*\b(casa|domicilio|direccion)\b.*\b(entreg(?:ar|a|uen)|llevar|llevamos)\b.*\b(casa|domicilio|direccion)\b/.test(normalized)
+  ) {
+    return 'puerta_a_puerta'
+  }
+  if (
+    /ventanilla\s+a\s+ventanilla|ventanilla\s+ventanilla/.test(normalized) ||
+    /\b(sucursal(?:es)?|ventanilla(?:s)?|oficina(?:s)?)\b.*\b(sucursal(?:es)?|ventanilla(?:s)?|oficina(?:s)?)\b/.test(normalized) ||
+    /\b(dejo|dejar|dejaria|entrego|entregar)\b.*\b(sucursal(?:es)?|ventanilla(?:s)?|oficina(?:s)?)\b.*\b(recog(?:er|e|en|eria|erian|ieran|en)|recogen|retir(?:ar|a|an|en))\b.*\b(sucursal(?:es)?|ventanilla(?:s)?|oficina(?:s)?)\b/.test(normalized) ||
+    /\b(recog(?:er|e|en|eria|erian|ieran|en)|recogen|retir(?:ar|a|an|en))\b.*\b(sucursal(?:es)?|ventanilla(?:s)?|oficina(?:s)?)\b/.test(normalized) && /\b(dejo|dejar|dejaria|entrego|entregar)\b.*\b(sucursal(?:es)?|ventanilla(?:s)?|oficina(?:s)?)\b/.test(normalized)
+  ) {
+    return 'ventanilla_a_ventanilla'
+  }
+  if (
+    /puerta\s+a\s+ventanilla|puerta\s+ventanilla/.test(normalized) ||
+    /\b(casa|domicilio|direccion)\b.*\b(sucursal(?:es)?|ventanilla(?:s)?|oficina(?:s)?)\b/.test(normalized) ||
+    /\brecog(?:er|ida|emos)?\b.*\b(casa|domicilio|direccion)\b.*\b(sucursal(?:es)?|ventanilla(?:s)?|oficina(?:s)?)\b/.test(normalized) ||
+    /\b(recog\w*|retir\w*)\b.*\b(entreg\w*|llevar\w*)\b.*\b(sucursal(?:es)?|ventanilla(?:s)?|oficina(?:s)?)\b/.test(normalized)
+  ) {
+    return 'puerta_a_ventanilla'
+  }
+  return ''
+}
+
+const inferRecentCustomerTariffServiceKey = (recentConversation = '') => {
+  const customerMessages = normalizeReference(recentConversation)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => /^Cliente:/i.test(line))
+    .map((line) => line.replace(/^Cliente:\s*/i, ''))
+    .reverse()
+
+  for (const message of customerMessages) {
+    const serviceKey = inferTariffServiceKey(message)
+    if (serviceKey) return serviceKey
+  }
+
+  return ''
+}
+
+const getRecentCustomerConversationText = (recentConversation = '') =>
+  normalizeReference(recentConversation)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => /^Cliente:/i.test(line))
+    .map((line) => line.replace(/^Cliente:\s*/i, ''))
+    .join('\n')
+
+const getRecentCustomerTariffRouteText = (recentConversation = '') => {
+  const customerMessages = normalizeReference(recentConversation)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => /^Cliente:/i.test(line))
+    .map((line) => line.replace(/^Cliente:\s*/i, ''))
+    .reverse()
+
+  return (
+    customerMessages.find((message) => {
+      const normalized = normalizeTariffLookupText(message)
+      const matchedCities = tariffDestinationAliases.filter((place) =>
+        place.terms.some((term) => normalized.includes(term)),
+      )
+      return isTariffInquiryMessage(message) && matchedCities.length >= 2
+    }) ?? ''
+  )
+}
+
+const inferRecentQuotedDeliveryMode = (recentConversation = '') => {
+  const outboundMessages = normalizeReference(recentConversation)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => /^Equipo:/i.test(line))
+    .map((line) => line.replace(/^Equipo:\s*/i, ''))
+    .reverse()
+
+  for (const message of outboundMessages) {
+    const normalized = normalizeTariffLookupText(message)
+    if (normalized.includes('puerta a puerta')) return 'puerta_a_puerta'
+    if (normalized.includes('puerta a ventanilla')) return 'puerta_a_ventanilla'
+    if (normalized.includes('ventanilla a ventanilla')) return 'ventanilla_a_ventanilla'
+  }
+
+  return ''
+}
+
+const inferRecentQuotedTariffContext = (recentConversation = '') => {
+  const outboundMessages = normalizeReference(recentConversation)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => /^Equipo:/i.test(line))
+    .map((line) => line.replace(/^Equipo:\s*/i, ''))
+    .reverse()
+
+  const quotedMessage = outboundMessages.find((message) => {
+    const normalized = normalizeTariffLookupText(message)
+    return normalized.startsWith('la tarifa ') || normalized.startsWith('para servicio ')
+  })
+
+  if (!quotedMessage) {
+    return {
+      originKey: '',
+      destinationKey: '',
+      deliveryMode: '',
+      text: '',
+    }
+  }
+
+  return {
+    originKey: inferTariffOriginKey(quotedMessage),
+    destinationKey: inferTariffDestinationKey(quotedMessage, 'delivery_express'),
+    deliveryMode: inferDeliveryExpressMode(quotedMessage),
+    text: quotedMessage,
+  }
+}
+
+const isTariffDeliveryTimeQuestion = (messageBody) => {
+  const normalized = normalizeTariffLookupText(messageBody)
+  if (/\bal mismo tiempo\b|\bmismo tiempo\b/.test(normalized)) return false
+  return /\b(tiempo|llegaria|llega|llegar|demora|tarda|tardaria|cuanto tarda|cuanto tiempo)\b/.test(normalized)
+}
+
+const tariffDestinationAliases = [
+  { key: 'la-paz', terms: ['la paz', 'lapaz', 'el alto', 'lp'] },
+  { key: 'cochabamba', terms: ['cochabamba', 'cbba', 'cocha'] },
+  { key: 'santa-cruz', terms: ['santa cruz', 'santacruz', 'santa cruz de la sierra', 'scz'] },
+  { key: 'oruro', terms: ['oruro'] },
+  { key: 'potosi', terms: ['potosi'] },
+  { key: 'tarija', terms: ['tarija'] },
+  { key: 'sucre', terms: ['sucre', 'chuquisaca'] },
+  { key: 'beni', terms: ['beni', 'trinidad'] },
+  { key: 'pando', terms: ['pando', 'cobija'] },
+  { key: 'internacional', terms: ['internacional', 'exterior', 'afuera', 'otro pais'] },
+]
+
+const getTariffPlaceMatchCount = (messageBody) => {
+  const normalized = normalizeTariffLookupText(messageBody)
+  return tariffDestinationAliases.filter((place) =>
+    place.terms.some((term) => normalized.includes(term)),
+  ).length
+}
+
+const isTariffRouteChangeQuestion = (messageBody) => {
+  const normalized = normalizeTariffLookupText(messageBody)
+  if (inferDeliveryExpressMode(messageBody)) return false
+  const matchedCities = tariffDestinationAliases.filter((place) =>
+    place.terms.some((term) => normalized.includes(term)),
+  )
+  return matchedCities.length >= 2 && /\b(y si|si quiero|quiero mandar|quiero enviar|mandar|enviar|llevar)\b/.test(normalized)
+}
+
+const isNewPackageTariffQuestion = (messageBody) => {
+  const normalized = normalizeTariffLookupText(messageBody)
+  const matchedCities = getTariffPlaceMatchCount(messageBody)
+  return matchedCities >= 2 && /\b(otro paquete|otra cotizacion|otra tarifa|ahora tambien|tambien tengo|nuevo paquete)\b/.test(normalized)
+}
+
+const inferTariffDestinationKey = (messageBody, serviceKey = '') => {
+  const normalized = normalizeTariffLookupText(messageBody)
+  const matchedDestination = tariffDestinationAliases
+    .map((destination) => ({
+      destination,
+      position: Math.max(...destination.terms.map((term) => normalized.lastIndexOf(term))),
+    }))
+    .filter((match) => match.position >= 0)
+    .sort((first, second) => second.position - first.position)[0]?.destination
+
+  if (matchedDestination) return matchedDestination.key
+  if (serviceKey === 'internacional') return 'internacional'
+  if (serviceKey === 'ems' || serviceKey === 'delivery_express') return 'nacional'
+  return ''
+}
+
+const inferTariffOriginKey = (messageBody) => {
+  const normalized = normalizeTariffLookupText(messageBody)
+  const matchedOrigin = tariffDestinationAliases
+    .map((origin) => ({
+      origin,
+      position: Math.min(...origin.terms.map((term) => normalized.indexOf(term)).filter((position) => position >= 0)),
+    }))
+    .filter((match) => Number.isFinite(match.position))
+    .sort((first, second) => first.position - second.position)[0]?.origin
+
+  return matchedOrigin?.key ?? ''
+}
+
+const tariffPlaceMatchesKey = (value, key = '') => {
+  const normalized = normalizeTariffLookupText(value)
+  const normalizedKey = normalizeTariffLookupText(key)
+  const place = tariffDestinationAliases.find((candidate) => candidate.key === key)
+
+  if (!normalizedKey || !normalized) return true
+  if (normalized.includes(normalizedKey)) return true
+
+  return Boolean(place?.terms.some((term) => normalized.includes(normalizeTariffLookupText(term))))
+}
+
+const extractExternalTariffRates = (payload) => {
+  if (Array.isArray(payload)) return payload
+
+  const candidates = [
+    payload?.data,
+    payload?.items,
+    payload?.tarifas,
+    payload?.rates,
+    payload?.results,
+    payload?.data?.data,
+    payload?.data?.items,
+    payload?.data?.tarifas,
+  ]
+
+  return candidates.find((candidate) => Array.isArray(candidate)) ?? []
+}
+
+const getExternalDeliveryExpressPrice = (rate) =>
+  rate.price ??
+  rate.precio ??
+  rate.amount ??
+  rate.monto ??
+  rate.tarifa ??
+  rate.peso1
+
+const getExternalTariffServiceName = (rate, serviceKey, deliveryMode, fallback = '') => {
+  if (serviceKey === 'delivery_express') {
+    const modeLabel = getDeliveryModeLabel(deliveryMode)
+    return modeLabel ? `Delivery Express ${modeLabel}` : 'Delivery Express'
+  }
+
+  return (
+    rate.service_name ??
+    rate.servicio_extra?.nombre ??
+    rate.servicio_extra?.descripcion ??
+    rate.servicio ??
+    fallback
+  )
+}
+
+const deliveryExpressModeMatchesApiRate = (rateService, deliveryMode) => {
+  const normalizedService = normalizeTariffLookupText(rateService)
+  const modeTerms = {
+    puerta_a_puerta: ['puerta a puerta', 'servicio puerta a puerta', 'de puerta a puerta'],
+    puerta_a_ventanilla: ['puerta a ventanilla', 'servicio de puerta a ventanilla'],
+    ventanilla_a_ventanilla: ['ventanilla a ventanilla', 'servicio de ventanilla a ventanilla'],
+  }
+
+  if (!deliveryMode) return true
+  return (modeTerms[deliveryMode] || [deliveryMode.replaceAll('_', ' ')]).some((term) =>
+    normalizedService.includes(normalizeTariffLookupText(term)),
+  )
+}
+
+const deliveryExpressApiRateMatches = ({ rate, originKey, destinationKey, deliveryMode }) => {
+  const rateOrigin = normalizeTariffLookupText(
+    rate.origen?.nombre_origen ??
+      rate.origin_name ??
+      rate.origin_key ??
+      rate.origen ??
+      '',
+  )
+  const rateDestination = normalizeTariffLookupText(
+    rate.destino?.nombre_destino ??
+      rate.destination_name ??
+      rate.destination_key ??
+      rate.destino ??
+      '',
+  )
+  const rateService = normalizeTariffLookupText(
+    rate.servicio_extra?.nombre ??
+      rate.servicio_extra?.descripcion ??
+      rate.service_name ??
+      rate.service_key ??
+      rate.servicio ??
+      '',
+  )
+  const price = Number(getExternalDeliveryExpressPrice(rate))
+
+  return (
+    Number.isFinite(price) &&
+    tariffPlaceMatchesKey(rateOrigin, originKey) &&
+    tariffPlaceMatchesKey(rateDestination, destinationKey) &&
+    deliveryExpressModeMatchesApiRate(rateService, deliveryMode)
+  )
+}
+
+const emsNationalApiRateMatches = ({ rate, weightKg }) => {
+  const minWeight = Number(
+    rate.min_weight_kg ??
+      rate.peso_minimo ??
+      rate.pesoMinimo ??
+      rate.peso?.peso_inicial ??
+      0,
+  )
+  const maxWeight = Number(
+    rate.max_weight_kg ??
+      rate.peso_maximo ??
+      rate.pesoMaximo ??
+      rate.peso?.peso_final ??
+      Number.MAX_SAFE_INTEGER,
+  )
+
+  return Number(weightKg) >= minWeight && Number(weightKg) <= maxWeight
+}
+
+const getExternalEmsNationalServiceName = (rate, fallback = '') =>
+  normalizeTariffDisplayValue(
+    rate.service_name ??
+      rate.servicio?.descripcion ??
+      rate.servicio?.nombre_servicio ??
+      rate.servicio ??
+      fallback,
+  )
+
+const getTariffQuote = async ({ messageBody, recentConversation = '', skipMultipleCheck = false }) => {
+  if (!skipMultipleCheck && isMultipleTariffQuoteRequest(messageBody)) {
+    return {
+      matched: false,
+      missingFields: [],
+      invalidReason: 'multiple_tariff_quote_request',
+      weightKg: null,
+      serviceKey: '',
+      originKey: '',
+      destinationKey: '',
+      deliveryMode: '',
+      effectiveDeliveryMode: '',
+      requestedDeliveryTime: false,
+      isNewPackageQuestion: false,
+    }
+  }
+
+  if (isUnsupportedTariffServiceRequest(messageBody)) {
+    return {
+      matched: false,
+      missingFields: [],
+      invalidReason: 'unsupported_tariff_service',
+      weightKg: null,
+      serviceKey: '',
+      originKey: inferTariffOriginKey(messageBody),
+      destinationKey: inferTariffDestinationKey(messageBody),
+      deliveryMode: '',
+      effectiveDeliveryMode: '',
+      requestedDeliveryTime: false,
+      isNewPackageQuestion: false,
+    }
+  }
+
+  if (isSeniorDiscountQuestion(messageBody)) {
+    return {
+      matched: false,
+      missingFields: [],
+      invalidReason: 'senior_discount_unavailable',
+      weightKg: null,
+      serviceKey: '',
+      originKey: inferTariffOriginKey(messageBody),
+      destinationKey: inferTariffDestinationKey(messageBody),
+      deliveryMode: '',
+      effectiveDeliveryMode: '',
+      requestedDeliveryTime: false,
+      isNewPackageQuestion: false,
+    }
+  }
+
+  const lookupText = [recentConversation, messageBody].filter(Boolean).join('\n')
+  const customerLookupText = [getRecentCustomerConversationText(recentConversation), messageBody]
+    .filter(Boolean)
+    .join('\n')
+  const recentCustomerRouteText = getRecentCustomerTariffRouteText(recentConversation)
+  const routeLookupText = recentCustomerRouteText || messageBody
+  const currentWeightKg = extractTariffWeightKg(messageBody)
+  const recentWeightKg = extractTariffWeightKg(customerLookupText)
+  const currentDeliveryMode = inferDeliveryExpressMode(messageBody)
+  const currentServiceKey = inferTariffServiceKey(messageBody)
+  const recentCustomerServiceKey = inferRecentCustomerTariffServiceKey(recentConversation)
+  const isFreshInternationalShipmentRequest = isEmsInternationalShipmentRequest(messageBody)
+  const recentEmsFollowUpCategory = isEmsTariffFollowUp(messageBody, recentConversation)
+    ? inferEmsCategoryFromPendingPrompt(recentConversation)
+    : ''
+  const needsEmsWeightUnitClarification = isEmsWeightReplyMissingUnit(messageBody, recentConversation)
+  const calculatorText = isFreshInternationalShipmentRequest
+    ? messageBody
+    : [customerLookupText, messageBody].filter(Boolean).join('\n')
+  const emsCalculatorEndpoint = getEmsCalculatorEndpoint()
+  const recentQuotedTariffContext = inferRecentQuotedTariffContext(recentConversation)
+  const recentQuotedDeliveryMode = recentQuotedTariffContext.deliveryMode || inferRecentQuotedDeliveryMode(recentConversation)
+  const requestedDeliveryTime = isTariffDeliveryTimeQuestion(messageBody)
+  const isRouteChangeQuestion = isTariffRouteChangeQuestion(messageBody)
+  const isNewPackageQuestion = isNewPackageTariffQuestion(messageBody)
+  const currentRoutePlaceCount = getTariffPlaceMatchCount(messageBody)
+  const isFreshShipmentRequestWithoutService = isFreshEmsRouteQuoteRequest({
+    text: messageBody,
+    routePlaceCount: currentRoutePlaceCount,
+    hasService: Boolean(currentServiceKey || currentDeliveryMode),
+  })
+  const shouldTreatAsFreshRoute =
+    isFreshInternationalShipmentRequest ||
+    (currentRoutePlaceCount >= 2 && (currentServiceKey || currentDeliveryMode || isTariffInquiryMessage(messageBody)))
+  const weightKg = needsEmsWeightUnitClarification
+    ? null
+    : currentWeightKg || (shouldTreatAsFreshRoute && !isRouteChangeQuestion ? null : recentWeightKg)
+  const deliveryExpressMaxWeightKg = Number(botKnowledge.deliveryExpress?.limits?.maxWeightKg || 5)
+  const hasSelectedEmsCategory =
+    currentServiceKey === 'ems' ||
+    recentCustomerServiceKey === 'ems' ||
+    Boolean(recentEmsFollowUpCategory)
+  const shouldRouteOversizedPackageToEms = shouldForceEmsForWeightLimit({
+    weightKg,
+    maxWeightKg: deliveryExpressMaxWeightKg,
+    emsAlreadySelected: hasSelectedEmsCategory,
+  })
+  const shouldAskServiceForCurrentRoute =
+    isTariffInquiryMessage(messageBody) &&
+    currentRoutePlaceCount >= 2 &&
+    !currentServiceKey &&
+    !currentDeliveryMode &&
+    (!recentCustomerServiceKey || isFreshShipmentRequestWithoutService) &&
+    !requestedDeliveryTime
+  const currentModeNeedsRoute = Boolean(currentDeliveryMode) && !requestedDeliveryTime && currentRoutePlaceCount < 2 && !recentCustomerRouteText
+  const isNewTariffQuestionWithoutService =
+    isTariffInquiryMessage(messageBody) && !currentServiceKey && !currentDeliveryMode
+  const serviceKey =
+    (isFreshInternationalShipmentRequest ? 'ems' : '') ||
+    (recentEmsFollowUpCategory && !isFreshShipmentRequestWithoutService ? 'ems' : '') ||
+    (shouldRouteOversizedPackageToEms ? 'ems' : '') ||
+    currentServiceKey ||
+    (currentDeliveryMode ? 'delivery_express' : '') ||
+    (!isFreshShipmentRequestWithoutService && !shouldAskServiceForCurrentRoute && !isNewPackageQuestion && isRouteChangeQuestion && recentCustomerServiceKey ? recentCustomerServiceKey : '') ||
+    (shouldAskServiceForCurrentRoute || isNewPackageQuestion || isNewTariffQuestionWithoutService ? '' : recentCustomerServiceKey || inferTariffServiceKey(lookupText))
+  const emsCategory = serviceKey === 'ems'
+    ? inferEmsQuoteCategory({
+        messageBody,
+        recentNationalRoute: recentCustomerRouteText,
+        pendingCategory: recentEmsFollowUpCategory,
+        calculatorText,
+        oversizedPackage: shouldRouteOversizedPackageToEms,
+      })
+    : ''
+  const emsInternationalDestination = emsCategory === 'EMS INT'
+    ? inferEmsInternationalDestination(calculatorText)
+    : { destinationCode: '', countryName: '', specificPlace: '' }
+  const emsDimensionsText = isNewPackageQuestion ? messageBody : calculatorText
+  const emsDimensions = extractEmsPackageDimensions(emsDimensionsText)
+  const deliveryMode =
+    serviceKey === 'delivery_express'
+      ? currentDeliveryMode || (currentServiceKey ? '' : inferDeliveryExpressMode(messageBody) || inferDeliveryExpressMode(customerLookupText))
+      : ''
+  const effectiveDeliveryMode =
+    serviceKey === 'delivery_express' && requestedDeliveryTime
+      ? recentQuotedDeliveryMode || deliveryMode
+      : serviceKey === 'delivery_express' && isRouteChangeQuestion
+        ? deliveryMode || recentQuotedDeliveryMode
+      : deliveryMode
+  const effectiveRouteLookupText = requestedDeliveryTime
+    ? recentQuotedTariffContext.text || routeLookupText
+    : isFreshInternationalShipmentRequest || shouldAskServiceForCurrentRoute || isNewPackageQuestion || isRouteChangeQuestion || currentModeNeedsRoute
+      ? messageBody
+      : recentCustomerRouteText || routeLookupText
+  const originKey = requestedDeliveryTime && recentQuotedTariffContext.originKey
+    ? recentQuotedTariffContext.originKey
+    : inferTariffOriginKey(effectiveRouteLookupText)
+  const detectedDestinationKey = requestedDeliveryTime && recentQuotedTariffContext.destinationKey
+    ? recentQuotedTariffContext.destinationKey
+    : inferTariffDestinationKey(effectiveRouteLookupText, serviceKey)
+  const destinationKey = serviceKey === 'ems' && emsCategory === 'EMS INT'
+    ? emsInternationalDestination.countryName
+    : detectedDestinationKey
+  const emsCalculatorDestinationCode = serviceKey === 'ems'
+    ? inferEmsCalculatorDestinationCode({
+        category: emsCategory,
+        text: calculatorText,
+        destinationKey,
+      })
+    : ''
+  const quotedWeightKg = serviceKey === 'delivery_express' ? (weightKg || 1) : weightKg
+  const missingFields = []
+
+  if (serviceKey && !quotedWeightKg) missingFields.push('peso')
+  if (serviceKey !== 'ems' && !originKey) missingFields.push('origen')
+  if (
+    serviceKey !== 'ems' &&
+    !destinationKey
+  ) missingFields.push('destino')
+  if (!serviceKey) missingFields.push('servicio')
+  if (serviceKey === 'ems' && !emsCategory) {
+    missingFields.push('EMS Nacional o EMS Internacional')
+  }
+  if (serviceKey === 'ems' && !emsCalculatorDestinationCode) {
+    missingFields.push(emsCategory === 'EMS INT' ? 'pais de destino' : 'departamento de destino')
+  }
+  if (serviceKey === 'delivery_express' && !effectiveDeliveryMode) missingFields.push('tipo de servicio Delivery Express (puerta a puerta, puerta a ventanilla o ventanilla a ventanilla)')
+
+  if (serviceKey === 'delivery_express' && isDeliveryExpressProvinceDestination(messageBody)) {
+    return {
+      matched: false,
+      missingFields: [],
+      invalidReason: 'delivery_express_province_destination',
+      weightKg,
+      serviceKey,
+      originKey,
+      destinationKey,
+      deliveryMode,
+      effectiveDeliveryMode,
+      requestedDeliveryTime,
+      isNewPackageQuestion: false,
+    }
+  }
+
+  if (serviceKey === 'delivery_express' && Number(weightKg) > deliveryExpressMaxWeightKg) {
+    return {
+      matched: false,
+      missingFields: [],
+      invalidReason: 'delivery_express_weight_exceeded',
+      weightKg,
+      serviceKey,
+      originKey,
+      destinationKey,
+      deliveryMode,
+      effectiveDeliveryMode,
+      requestedDeliveryTime,
+      isNewPackageQuestion: false,
+    }
+  }
+
+  if (serviceKey === 'delivery_express' && hasUnsupportedDeliveryExpressMode(messageBody)) {
+    return {
+      matched: false,
+      missingFields: [],
+      invalidReason: 'unsupported_delivery_express_mode',
+      weightKg,
+      serviceKey,
+      originKey,
+      destinationKey,
+      deliveryMode,
+      effectiveDeliveryMode,
+      requestedDeliveryTime,
+      isNewPackageQuestion: false,
+    }
+  }
+
+  if (serviceKey === 'delivery_express' && isDeliveryExpressDimensionQuestion(messageBody)) {
+    return {
+      matched: false,
+      missingFields: [],
+      invalidReason: 'delivery_express_dimensions_policy',
+      weightKg,
+      serviceKey,
+      originKey,
+      destinationKey,
+      deliveryMode,
+      effectiveDeliveryMode,
+      requestedDeliveryTime,
+      isNewPackageQuestion: false,
+    }
+  }
+
+  if (missingFields.length > 0) {
+    return {
+      matched: false,
+      missingFields,
+      weightKg,
+      serviceKey,
+      originKey,
+      destinationKey,
+      deliveryMode,
+      effectiveDeliveryMode,
+      requestedDeliveryTime,
+      isRouteChangeQuestion,
+      needsEmsWeightUnitClarification,
+      emsCategory,
+      emsCalculatorDestinationCode,
+      isNewPackageQuestion: isNewPackageQuestion || shouldAskServiceForCurrentRoute,
+    }
+  }
+
+  if (serviceKey === 'ems') {
+    try {
+      const calculation = await calculateEmsTariff({
+        category: emsCategory,
+        destination: emsCalculatorDestinationCode,
+        weight: quotedWeightKg,
+        dimensions: emsDimensions ?? undefined,
+        endpoint: emsCalculatorEndpoint,
+      })
+      const emsInternationalZone = emsCategory === 'EMS INT'
+        ? getEmsInternationalZone(emsCalculatorDestinationCode)
+        : ''
+      const notes = [
+        emsInternationalZone ? `Destino clasificado en la zona ${emsInternationalZone}.` : '',
+        'Tarifa referencial; en sucursal verificaran el peso y las medidas reales del paquete.',
+        emsInternationalDestination.specificPlace
+          ? `Para cobertura y entrega en ${emsInternationalDestination.specificPlace}, confirma con el operador postal del pais de destino (${emsInternationalDestination.countryName}).`
+          : '',
+      ].filter(Boolean).join(' ')
+      return {
+        matched: true,
+        missingFields: [],
+        weightKg,
+        serviceKey,
+        deliveryExpressWeightExceeded: shouldRouteOversizedPackageToEms,
+        emsCategory,
+        emsDimensions,
+        emsSpecificPlace: emsInternationalDestination.specificPlace,
+        emsCountryName: emsInternationalDestination.countryName,
+        originKey: originKey || 'Bolivia',
+        destinationKey,
+        deliveryMode: '',
+        requestedDeliveryTime,
+        rate: {
+          service_name: emsCategory === 'EMS INT' ? 'EMS Internacional' : 'EMS Nacional',
+          origin_name: originKey ? originKey.replaceAll('-', ' ') : 'Bolivia',
+          destination_name: destinationKey
+            ? destinationKey.replaceAll('-', ' ')
+            : emsCalculatorDestinationCode.replace(/^dest_a_/, '').replaceAll('_', ' '),
+          price: calculation.tariff,
+          currency: 'BOB',
+          notes,
+        },
+      }
+    } catch (error) {
+      console.warn('No se pudo calcular la tarifa EMS:', error?.code ?? 'unknown_error')
+      return {
+        matched: false,
+        missingFields: [],
+        weightKg,
+        serviceKey,
+        deliveryExpressWeightExceeded: shouldRouteOversizedPackageToEms,
+        emsCategory,
+        originKey: originKey || 'Bolivia',
+        destinationKey,
+        deliveryMode: '',
+        requestedDeliveryTime,
+        invalidReason: 'ems_calculator_error',
+        calculatorErrorCode: error?.code ?? 'unknown_error',
+      }
+    }
+  }
+
+  const externalProfile = getTariffApiProfiles().find((profile) => profile.serviceKey === serviceKey)
+  if (externalProfile?.endpoint && externalProfile.token) {
+    try {
+      const response = await fetch(externalProfile.endpoint, {
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Bearer ${externalProfile.token}`,
+        },
+        signal: AbortSignal.timeout(10000),
+      })
+      if (response.ok) {
+        const payload = await response.json()
+        const externalRates = extractExternalTariffRates(payload)
+        const externalRate = externalRates.find((rate) => {
+          if (serviceKey === 'delivery_express') {
+            return deliveryExpressApiRateMatches({
+              rate,
+              originKey,
+              destinationKey,
+              deliveryMode: effectiveDeliveryMode,
+            })
+          }
+          if (serviceKey === 'ems') {
+            return emsNationalApiRateMatches({ rate, weightKg: quotedWeightKg })
+          }
+
+          const minWeight = Number(rate.min_weight_kg ?? rate.peso_minimo ?? rate.pesoMinimo ?? 0)
+          const maxWeight = Number(rate.max_weight_kg ?? rate.peso_maximo ?? rate.pesoMaximo ?? Number.MAX_SAFE_INTEGER)
+          const rateDestination = normalizeTariffLookupText(
+            rate.destination_key ??
+              rate.destino?.nombre_destino ??
+              rate.destino ??
+              rate.destination?.nombre ??
+              rate.destination ??
+              '',
+          )
+          const rateOrigin = normalizeTariffLookupText(
+            rate.origin_key ??
+              rate.origen?.nombre_origen ??
+              rate.origen ??
+              rate.origin?.nombre ??
+              rate.origin ??
+              '',
+          )
+          const rateService = normalizeTariffLookupText(
+            rate.service_key ??
+              rate.service ??
+              rate.service_name ??
+              rate.tipo_servicio ??
+              rate.servicio_extra?.nombre ??
+              rate.servicio_extra?.descripcion ??
+              '',
+          )
+          const modeMatches = !effectiveDeliveryMode || !rateService || rateService.includes(effectiveDeliveryMode.replaceAll('_', ' ')) || rateService.includes(effectiveDeliveryMode.replaceAll('_', '-'))
+          const originMatches = !originKey || tariffPlaceMatchesKey(rateOrigin, originKey)
+          const destinationMatches = !destinationKey || tariffPlaceMatchesKey(rateDestination, destinationKey)
+          return quotedWeightKg >= minWeight && quotedWeightKg <= maxWeight && modeMatches && originMatches && destinationMatches
+        })
+        if (externalRate) {
+          return {
+            matched: true,
+            missingFields: [],
+            weightKg,
+            serviceKey,
+            originKey,
+            destinationKey,
+            deliveryMode: effectiveDeliveryMode,
+            requestedDeliveryTime,
+            rate: {
+              ...externalRate,
+              service_name:
+                serviceKey === 'ems'
+                  ? getExternalEmsNationalServiceName(externalRate, externalProfile.serviceName)
+                  : getExternalTariffServiceName(
+                      externalRate,
+                      serviceKey,
+                      effectiveDeliveryMode,
+                      externalProfile.serviceName,
+                    ),
+              origin_name:
+                externalRate.origin_name ??
+                externalRate.origen?.nombre_origen ??
+                externalRate.origen ??
+                originKey,
+              destination_name:
+                externalRate.destination_name ??
+                externalRate.destino?.nombre_destino ??
+                externalRate.destino ??
+                destinationKey,
+              price:
+                serviceKey === 'delivery_express'
+                  ? getExternalDeliveryExpressPrice(externalRate)
+                  : externalRate.price ??
+                    externalRate.precio ??
+                    externalRate.amount ??
+                    externalRate.monto ??
+                    externalRate.peso1,
+              currency: externalRate.currency ?? externalRate.moneda ?? 'BOB',
+              notes: externalRate.notes ?? externalRate.observaciones ?? '',
+              delivery_time_hours:
+                externalRate.delivery_time_hours ??
+                externalRate.tiempo_entrega ??
+                externalRate.tiempoEntrega ??
+                externalRate.delivery_time ??
+                externalRate.tiempo,
+            },
+          }
+        }
+      }
+    } catch (error) {
+      console.warn(`No se pudo consultar ${externalProfile.serviceName}:`, error?.message ?? error)
+    }
+  }
+
+  const tariffResult = await pool.query(
+    `
+      select id, service_key, service_name, destination_key, destination_name,
+             min_weight_kg, max_weight_kg, price, currency, notes
+      from tariff_rates
+      where is_active = true
+        and service_key = $1
+        and (
+          destination_key = $2
+          or destination_key = 'nacional'
+          or exists (
+            select 1
+            from jsonb_array_elements_text(destination_aliases) as alias(value)
+            where lower(alias.value) = $2
+          )
+        )
+        and $3::numeric >= min_weight_kg
+        and $3::numeric <= max_weight_kg
+        and (
+          $4::text = ''
+          or service_key <> 'delivery_express'
+          or lower(service_name) like '%' || replace($4::text, '_', ' ') || '%'
+          or lower(service_name) like '%' || replace($4::text, '_', '-') || '%'
+        )
+      order by
+        case when destination_key = $2 then 0 else 1 end,
+        max_weight_kg asc
+      limit 1;
+    `,
+    [serviceKey, destinationKey, quotedWeightKg, effectiveDeliveryMode || ''],
+  )
+
+  return {
+    matched: Boolean(tariffResult.rows[0]),
+    missingFields: [],
+    weightKg,
+    serviceKey,
+    originKey,
+    destinationKey,
+    deliveryMode: effectiveDeliveryMode,
+    requestedDeliveryTime,
+    rate: tariffResult.rows[0] ?? null,
+  }
+}
+
+const formatTariffMoney = (value, currency = 'BOB') => {
+  const amount = Number(value)
+  if (!Number.isFinite(amount)) return ''
+
+  return new Intl.NumberFormat('es-BO', {
+    style: 'currency',
+    currency: normalizeReference(currency) || 'BOB',
+    minimumFractionDigits: amount % 1 === 0 ? 0 : 2,
+    maximumFractionDigits: 2,
+  }).format(amount)
+}
+
+const normalizeTariffDisplayValue = (value) => {
+  if (value && typeof value === 'object') {
+    return normalizeReference(
+      value.nombre ||
+        value.name ||
+        value.descripcion ||
+        value.description ||
+        value.label ||
+        value.value ||
+        '',
+    )
+  }
+  return normalizeReference(value)
+}
+
+const getDeliveryModeLabel = (deliveryMode = '') => {
+  return normalizeReference(botKnowledge.deliveryExpress?.modes?.[deliveryMode]?.label) || 'Delivery Express'
+}
+
+const getResponseTemplate = (key, fallback = '') => normalizeReference(botKnowledge.responses?.tariffs?.[key]) || fallback
+const getResponseLinesTemplate = (key, fallback = []) => {
+  const lines = botKnowledge.responses?.tariffs?.[key]
+  return (Array.isArray(lines) ? lines : fallback).join('\n')
+}
+
+const tariffReplyTemplates = {
+  exactQuote: getResponseTemplate('exactQuote', '{intro} {quote}'),
+  genericMissingFields: getResponseLinesTemplate('genericMissingFields', [
+    'Para darte la tarifa exacta de tu envio, ayudame con el peso del paquete y el servicio que buscas:',
+    '• EMS Nacional e Internacional: Envios dentro y fuera del pais por peso.',
+    '• Delivery Express: Entrega rapida de paquetes a nivel nacional; no aplica para provincia ni para paquetes que excedan los 5 kg. Si supera ese peso, debe enviarse por EMS Nacional.',
+    '¡Dime cual necesitas y te doy el precio de inmediato!',
+  ]),
+  deliveryModeOptions: getResponseLinesTemplate('deliveryModeOptions', [
+    'Perfecto, Delivery Express. Para darte el precio exacto, indicame la modalidad:',
+    '• Puerta a puerta: recogemos el paquete en tu casa y lo llevamos a la casa destino en cualquier departamento.',
+    '• Puerta a ventanilla: recogemos el paquete en tu casa y lo llevamos a ventanilla de cualquier sucursal.',
+    '• Ventanilla a ventanilla: dejas el paquete en una sucursal y lo recogen en ventanilla de cualquier sucursal.',
+  ]),
+}
+
+const renderTextTemplate = (template, values = {}) =>
+  normalizeReference(template).replace(/\{([a-zA-Z0-9_]+)\}/g, (_match, key) =>
+    normalizeReference(values[key]),
+  ).replace(/\s+\./g, '.').replace(/\s+/g, ' ').trim()
+
+const hasHomePickupNeed = (messageBody) => {
+  const normalized = normalizeTariffLookupText(messageBody)
+  return (
+    /\b(no puedo|no podria|no puedo cargar|pesad[oa]|mayor de edad|adulto mayor|persona mayor)\b/.test(normalized) ||
+    /\brecog\w*\b.*\b(casa|domicilio|direccion)\b/.test(normalized)
+  )
+}
+
+const buildPersonalizedTariffIntro = ({ tariffQuote, messageBody = '' }) => {
+  if (tariffQuote?.serviceKey !== 'delivery_express') return ''
+
+  if (tariffQuote.deliveryMode === 'puerta_a_puerta' && hasHomePickupNeed(messageBody)) {
+    return normalizeReference(botKnowledge.responses?.personalizedIntros?.deliveryHomePickupNeed) ||
+      'Claro, para ese caso te conviene Delivery Express puerta a puerta: recogemos el paquete en tu casa y lo entregamos en el domicilio destino.'
+  }
+
+  if (tariffQuote.deliveryMode === 'puerta_a_ventanilla') {
+    return normalizeReference(botKnowledge.responses?.personalizedIntros?.deliveryDoorToCounter) ||
+      'Perfecto, con Delivery Express puerta a ventanilla recogemos el paquete en tu casa y lo dejamos disponible en una sucursal destino.'
+  }
+
+  if (tariffQuote.deliveryMode === 'ventanilla_a_ventanilla') {
+    return normalizeReference(botKnowledge.responses?.personalizedIntros?.deliveryCounterToCounter) ||
+      'Perfecto, con Delivery Express ventanilla a ventanilla dejas el paquete en una sucursal y lo recogen en una sucursal destino.'
+  }
+
+  return ''
+}
+
+const buildTariffReply = async (tariffQuote, { messageBody = '' } = {}) => {
+  if (!tariffQuote) return ''
+
+  if (tariffQuote.missingFields?.length > 0) {
+    if (tariffQuote.serviceKey === 'ems') {
+      if (tariffQuote.missingFields.includes('EMS Nacional o EMS Internacional')) {
+        return 'Claro, ¿quieres cotizar EMS Nacional dentro de Bolivia o EMS Internacional?'
+      }
+      if (tariffQuote.missingFields.includes('pais de destino')) {
+        return 'Para EMS Internacional indícame solo el país de destino y el peso del paquete. Si necesitas entrega en una ciudad o zona específica, la cobertura local se confirma con el operador postal de ese país.'
+      }
+      if (tariffQuote.missingFields.includes('departamento de destino')) {
+        return 'Para EMS Nacional, indícame el departamento de Bolivia y el peso del paquete.'
+      }
+      if (tariffQuote.missingFields.includes('dimensiones aproximadas')) {
+        return 'Para afinar el estimado, ¿me indicas alto, ancho y largo aproximados en cm? En sucursal verificarán el peso y las medidas reales; si no las tienes, dime “cotiza solo con el peso”.'
+      }
+      if (tariffQuote.missingFields.includes('peso')) {
+        if (tariffQuote.needsEmsWeightUnitClarification) {
+          return '¿Ese valor está en kg o gramos? Confírmame la unidad para cotizar el envío correctamente.'
+        }
+        return `Para cotizar ${tariffQuote.emsCategory === 'EMS INT' ? 'EMS Internacional' : 'EMS Nacional'}, indícame el peso del paquete en kg.`
+      }
+      return `Para cotizar ${tariffQuote.emsCategory === 'EMS INT' ? 'EMS Internacional' : 'EMS Nacional'}, indícame el destino y el peso del paquete.`
+    }
+
+    if (
+      tariffQuote.serviceKey === 'delivery_express' &&
+      tariffQuote.deliveryMode &&
+      (tariffQuote.missingFields.includes('origen') || tariffQuote.missingFields.includes('destino'))
+    ) {
+      const modeLabels = {
+        puerta_a_puerta: 'puerta a puerta',
+        puerta_a_ventanilla: 'puerta a ventanilla',
+        ventanilla_a_ventanilla: 'ventanilla a ventanilla',
+      }
+      const modeLabel = modeLabels[tariffQuote.deliveryMode] || 'Delivery Express'
+      return `Perfecto, Delivery Express ${modeLabel}. Para cotizar necesito la ruta completa: ¿desde que ciudad/departamento se envia y a que ciudad/departamento va?`
+    }
+
+    if (
+      tariffQuote.missingFields.includes('servicio') &&
+      tariffQuote.originKey &&
+      tariffQuote.destinationKey
+    ) {
+      if (tariffQuote.isRouteChangeQuestion && tariffQuote.weightKg) {
+        const weight = Number(tariffQuote.weightKg).toLocaleString('es-BO', {
+          minimumFractionDigits: 0,
+          maximumFractionDigits: 3,
+        })
+        const origin = tariffQuote.originKey.replaceAll('-', ' ')
+        const destination = tariffQuote.destinationKey.replaceAll('-', ' ')
+        return `Para la ruta ${origin} a ${destination}, ¿prefieres EMS Nacional o Delivery Express? Puedo cotizar con el peso anterior de ${weight} kg; si eliges Delivery Express, indícame también la modalidad.`
+      }
+      if (tariffQuote.isRouteChangeQuestion) {
+        const origin = tariffQuote.originKey.replaceAll('-', ' ')
+        const destination = tariffQuote.destinationKey.replaceAll('-', ' ')
+        return `Para la ruta ${origin} a ${destination}, ¿prefieres EMS Nacional o Delivery Express? Si eliges Delivery Express, indícame también la modalidad.`
+      }
+      const origin = tariffQuote.originKey.replaceAll('-', ' ')
+      const destination = tariffQuote.destinationKey.replaceAll('-', ' ')
+      return `Para cotizar de ${origin} a ${destination}, ¿prefieres EMS Nacional o Delivery Express?`
+    }
+
+    if (
+      tariffQuote.serviceKey === 'delivery_express' &&
+      tariffQuote.missingFields.length === 1 &&
+      tariffQuote.missingFields.includes('tipo de servicio Delivery Express (puerta a puerta, puerta a ventanilla o ventanilla a ventanilla)')
+    ) {
+      return tariffReplyTemplates.deliveryModeOptions
+    }
+
+    return tariffReplyTemplates.genericMissingFields
+  }
+
+  if (tariffQuote.invalidReason === 'delivery_express_province_destination') {
+    return getResponseTemplate(
+      'deliveryProvinceNotAllowed',
+      'Delivery Express no aplica para envios a provincia o comunidades. Para ese destino corresponde EMS Nacional; te puedo ayudar a cotizarlo por EMS si me confirmas el peso del paquete.',
+    )
+  }
+
+  if (tariffQuote.invalidReason === 'multiple_tariff_quote_request') {
+    return await buildMultipleTariffDraftReply(messageBody)
+  }
+
+  if (tariffQuote.invalidReason === 'unsupported_tariff_service') {
+    return renderTextTemplate(
+      getResponseTemplate(
+        'unsupportedTariffService',
+        'No tengo registrado el servicio "{serviceName}". Los servicios disponibles para cotizar son EMS Nacional e Internacional y Delivery Express. Indicame cual de esos dos deseas usar para continuar.',
+      ),
+      { serviceName: 'Nacional Express' },
+    )
+  }
+
+  if (tariffQuote.invalidReason === 'senior_discount_unavailable') {
+    const route = tariffQuote.originKey && tariffQuote.destinationKey
+      ? `${tariffQuote.originKey.replaceAll('-', ' ')} a ${tariffQuote.destinationKey.replaceAll('-', ' ')}`
+      : 'esa ruta'
+    return renderTextTemplate(
+      getResponseTemplate(
+        'seniorDiscountUnavailable',
+        'Por ahora no tengo registrado un descuento automatico por tercera edad para envios. Para cotizarte {route} con la tarifa vigente, confirmame el peso del paquete y el servicio que deseas usar.',
+      ),
+      { route },
+    )
+  }
+
+  if (tariffQuote.invalidReason === 'ems_calculator_error') {
+    if (tariffQuote.calculatorErrorCode === 'rate_not_found') {
+      return 'No encontré una tarifa EMS vigente para ese peso y destino. Confirma los datos o te derivo con un asesor.'
+    }
+    if (tariffQuote.calculatorErrorCode === 'invalid_destination') {
+      return 'No pude validar ese destino en el tarifario EMS. Confirma la ciudad o país para revisar la cotización.'
+    }
+    if (tariffQuote.calculatorErrorCode === 'ambiguous_rate') {
+      return 'El tarifario EMS devolvió más de una tarifa para esos datos. Para evitar un precio incorrecto, te derivo con un asesor.'
+    }
+    return 'No pude confirmar la tarifa EMS en este momento. No quiero darte un precio incorrecto; puedo derivarte con un asesor.'
+  }
+
+  if (tariffQuote.invalidReason === 'delivery_express_weight_exceeded') {
+    const weight = Number(tariffQuote.weightKg).toLocaleString('es-BO', {
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 3,
+    })
+    return renderTextTemplate(
+      getResponseTemplate(
+        'deliveryWeightExceeded',
+        'Delivery Express solo aplica para paquetes de hasta {maxWeightKg} kg. Para un paquete de {weightKg} kg corresponde cotizarlo por EMS Nacional e Internacional; te puedo ayudar con esa tarifa si confirmas que seguimos por EMS.',
+      ),
+      {
+        maxWeightKg: botKnowledge.deliveryExpress?.limits?.maxWeightKg || 5,
+        weightKg: weight,
+      },
+    )
+  }
+
+  if (tariffQuote.invalidReason === 'unsupported_delivery_express_mode') {
+    return getResponseTemplate(
+      'unsupportedDeliveryMode',
+      'Esa modalidad de Delivery Express no esta registrada. Las modalidades validas son: puerta a puerta, puerta a ventanilla o ventanilla a ventanilla. Confirmame cual corresponde y te cotizo.',
+    )
+  }
+
+  if (tariffQuote.invalidReason === 'delivery_express_dimensions_policy') {
+    const weight = Number(tariffQuote.weightKg || 0).toLocaleString('es-BO', {
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 3,
+    })
+    return renderTextTemplate(
+      getResponseTemplate(
+        'deliveryDimensionsPolicy',
+        'Para Delivery Express la validacion principal de esta cotizacion es el peso: aplica hasta {maxWeightKg} kg. Las medidas alto/ancho/largo no cambian el precio en esta tarifa; si el paquete no supera ese peso, puede continuar por Delivery Express segun cobertura.',
+      ),
+      {
+        maxWeightKg: botKnowledge.deliveryExpress?.limits?.maxWeightKg || 5,
+        weightKg: weight,
+      },
+    )
+  }
+
+  if (!tariffQuote.matched || !tariffQuote.rate) {
+    if (tariffQuote.serviceKey === 'delivery_express' && tariffQuote.deliveryMode) {
+      const modeLabels = {
+        puerta_a_puerta: 'puerta a puerta',
+        puerta_a_ventanilla: 'puerta a ventanilla',
+        ventanilla_a_ventanilla: 'ventanilla a ventanilla',
+      }
+      const modeLabel = modeLabels[tariffQuote.deliveryMode] || 'Delivery Express'
+      return renderTextTemplate(
+        getResponseTemplate(
+          'noActiveDeliveryRate',
+          'Entendido: Delivery Express {modeLabel}. No tengo una tarifa activa para esa ruta en este momento; te derivamos con un asesor para confirmarte el precio exacto.',
+        ),
+        { modeLabel },
+      )
+    }
+
+    return getResponseTemplate(
+      'noActiveGenericRate',
+      'No encontre una tarifa activa para esa combinacion de peso, destino y servicio. Te puedo ayudar si me confirmas esos datos nuevamente.',
+    )
+  }
+
+  const rate = tariffQuote.rate
+  const weight = tariffQuote.serviceKey === 'delivery_express' && !tariffQuote.weightKg
+    ? ''
+    : Number(tariffQuote.weightKg).toLocaleString('es-BO', {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 3,
+      })
+  const price = formatTariffMoney(rate.price, rate.currency)
+  const serviceName = normalizeTariffDisplayValue(rate.service_name) || getDeliveryModeLabel(tariffQuote.deliveryMode) || 'el servicio'
+  const notes = normalizeReference(rate.notes)
+  const originName = normalizeTariffDisplayValue(rate.origin_name)
+  const destinationName = normalizeTariffDisplayValue(rate.destination_name)
+  const deliveryTime = normalizeReference(
+    rate.delivery_time_hours ??
+      rate.tiempo_entrega ??
+      rate.tiempoEntrega ??
+      rate.delivery_time ??
+      rate.tiempo,
+  )
+
+  const routeDescription = originName && destinationName ? `de ${originName} a ${destinationName}` : `a ${destinationName || rate.destination_name}`
+  const packageDescription = weight ? `para ${weight} kg ${routeDescription}` : routeDescription
+  if (tariffQuote.requestedDeliveryTime) {
+    return deliveryTime
+      ? `Para ${serviceName} ${packageDescription}, el tiempo estimado de entrega es de ${deliveryTime} h.`
+      : `Para ${serviceName} ${packageDescription}, no tengo un tiempo de entrega registrado en la tarifa activa.`
+  }
+
+  const personalizedIntro = buildPersonalizedTariffIntro({ tariffQuote, messageBody })
+  const quoteText = `Con los datos que me diste, la tarifa ${packageDescription} por ${serviceName} es ${price}.${notes ? ` ${notes}` : ''}`
+  if (personalizedIntro) {
+    return renderTextTemplate(tariffReplyTemplates.exactQuote, {
+      intro: personalizedIntro,
+      quote: quoteText,
+    })
+  }
+
+  const serviceExplanation = tariffQuote.deliveryExpressWeightExceeded
+    ? `Por ${weight} kg, tu paquete supera el límite de ${botKnowledge.deliveryExpress?.limits?.maxWeightKg || 5} kg de Delivery Express, así que corresponde ${tariffQuote.emsCategory === 'EMS INT' ? 'EMS Internacional' : 'EMS Nacional'}. `
+    : ''
+  return `${serviceExplanation}La tarifa ${packageDescription} por ${serviceName} es ${price}.${notes ? ` ${notes}` : ''}`
 }
 
 const buildGeneralAgentPrompt = ({
@@ -4822,8 +9596,11 @@ const buildGeneralAgentPrompt = ({
     'Prioriza respuestas cortas y fluidas para WhatsApp: 1 o 2 frases, maximo 32 palabras.',
     'No inventes ubicaciones, fechas, tarifas ni promesas.',
     category === 'TARIFAS'
-      ? 'El cliente consulta tarifas o cotizaciones. Si faltan peso, origen o destino, pide solo esos datos minimos.'
+      ? 'El cliente consulta tarifas o cotizaciones para enviar paquetes. Mantente en cotizacion: no pidas numero de guia ni hables de tracking salvo que el cliente lo pida explicitamente. Si faltan servicio, modalidad, origen o destino, pide solo esos datos.'
       : 'El cliente hace una consulta general. Responde solo lo que pregunta y evita desviarte.',
+    category === 'TARIFAS'
+      ? `Base de conocimiento EMS:\n${(botKnowledge.ems?.rules || []).join('\n')}\n\nBase de conocimiento Delivery Express:\n${(botKnowledge.deliveryExpress?.rules || []).join('\n')}`
+      : '',
     'Responde solo en espanol, en 2 o 3 frases como maximo y con no mas de 40 palabras.',
     'Ve directo al punto: evita introducciones largas, listas y explicaciones innecesarias.',
     'Haz una sola pregunta final solo si necesitas aclarar algo.',
@@ -4871,6 +9648,9 @@ const buildTrackingAgentPrompt = ({
     'Si ya hay guia y contexto real, responde con una actualizacion clara, amable y facil de leer.',
     'Si el cliente pregunta donde esta o hacia donde va, menciona estado, destino y sucursal de origen o destino cuando exista.',
     'Si existe una agencia o sucursal en las APIs, usa ese dato exacto y no inventes direcciones ni nombres.',
+    (botKnowledge.tracking?.rules || []).length
+      ? `Base de conocimiento de rastreo:\n${botKnowledge.tracking.rules.join('\n')}`
+      : '',
     'No inventes fechas exactas ni eventos no confirmados.',
     'Responde en espanol, maximo 40 palabras, 1 o 2 frases.',
     '',
@@ -4906,14 +9686,75 @@ const wait = (ms) =>
   })
 
 const AUTO_REPLY_SETTLE_DELAY_MS = Number.parseInt(process.env.WHATSAPP_AUTO_REPLY_SETTLE_DELAY_MS || '2500', 10)
+const WHATSAPP_AUTO_REPLY_MAX_MESSAGE_AGE_MS = Number.parseInt(
+  process.env.WHATSAPP_AUTO_REPLY_MAX_MESSAGE_AGE_MS || String(15 * 60 * 1000),
+  10,
+)
+const WHATSAPP_OFF_TOPIC_WINDOW_MS = Number.parseInt(
+  process.env.WHATSAPP_OFF_TOPIC_WINDOW_MS || String(20 * 60 * 1000),
+  10,
+)
+const WHATSAPP_OFF_TOPIC_COOLDOWN_MS = Number.parseInt(
+  process.env.WHATSAPP_OFF_TOPIC_COOLDOWN_MS || String(4 * 60 * 60 * 1000),
+  10,
+)
+const WHATSAPP_OFF_TOPIC_LIMIT = Number.parseInt(process.env.WHATSAPP_OFF_TOPIC_LIMIT || '2', 10)
 const WHATSAPP_STAGE_WATCHER_ENABLED =
   process.env.WHATSAPP_STAGE_WATCHER_ENABLED == null
     ? true
     : process.env.WHATSAPP_STAGE_WATCHER_ENABLED === 'true'
-const WHATSAPP_STAGE_WATCHER_INTERVAL_MS = Number.parseInt(
-  process.env.WHATSAPP_STAGE_WATCHER_INTERVAL_MS || '30000',
+const PACKAGE_PIPELINE_SYNC_INTERVAL_MS = Number.parseInt(
+  process.env.PACKAGE_PIPELINE_SYNC_INTERVAL_MS || '300000',
   10,
 )
+const PACKAGE_NEW_PACKAGE_WELCOME_INTERVAL_MS = Number.parseInt(
+  process.env.PACKAGE_NEW_PACKAGE_WELCOME_INTERVAL_MS || '300000',
+  10,
+)
+const PACKAGE_NEW_PACKAGE_WELCOME_LOOKBACK_MS = Number.parseInt(
+  process.env.PACKAGE_NEW_PACKAGE_WELCOME_LOOKBACK_MS || String(60 * 60 * 1000),
+  10,
+)
+const PACKAGE_EVENT_CHANGE_SYNC_INTERVAL_MS = Number.parseInt(
+  process.env.PACKAGE_EVENT_CHANGE_SYNC_INTERVAL_MS || String(15 * 60 * 1000),
+  10,
+)
+const PACKAGE_FULL_EVENT_CHANGE_SYNC_INTERVAL_MS = Number.parseInt(
+  process.env.PACKAGE_FULL_EVENT_CHANGE_SYNC_INTERVAL_MS || String(60 * 60 * 1000),
+  10,
+)
+const WHATSAPP_NEW_PACKAGE_WATCHER_ENABLED =
+  process.env.WHATSAPP_NEW_PACKAGE_WATCHER_ENABLED == null
+    ? true
+    : process.env.WHATSAPP_NEW_PACKAGE_WATCHER_ENABLED === 'true'
+const WHATSAPP_NEW_PACKAGE_WELCOME_ENABLED =
+  process.env.WHATSAPP_NEW_PACKAGE_WELCOME_ENABLED === 'true'
+const WHATSAPP_NEW_PACKAGE_WELCOME_RECENT_MS = Number.parseInt(
+  process.env.WHATSAPP_NEW_PACKAGE_WELCOME_RECENT_MS || String(24 * 60 * 60 * 1000),
+  10,
+)
+const WHATSAPP_TEST_MODE_STAGE_UPDATES_ENABLED =
+  process.env.WHATSAPP_TEST_MODE_STAGE_UPDATES_ENABLED === 'true'
+const WHATSAPP_PACKAGE_WATCHER_TEST_MODE_RESTRICTED =
+  process.env.WHATSAPP_PACKAGE_WATCHER_TEST_MODE_RESTRICTED === 'true'
+
+const getWhatsAppMessageReceivedAt = (message) => {
+  const timestampSeconds = Number.parseInt(normalizeReference(message?.timestamp), 10)
+
+  if (!Number.isFinite(timestampSeconds) || timestampSeconds <= 0) {
+    return new Date()
+  }
+
+  return new Date(timestampSeconds * 1000)
+}
+
+const isWhatsAppMessageTooOldForAutoReply = (receivedAt) => {
+  const maxAgeMs = Number.isFinite(WHATSAPP_AUTO_REPLY_MAX_MESSAGE_AGE_MS)
+    ? Math.max(WHATSAPP_AUTO_REPLY_MAX_MESSAGE_AGE_MS, 0)
+    : 15 * 60 * 1000
+
+  return maxAgeMs > 0 && Date.now() - receivedAt.getTime() > maxAgeMs
+}
 
 const shouldSkipAutoReplyBecauseNewerInboundExists = async ({ contactId, sender, inboundMessageId }) => {
   if (!Number.isInteger(inboundMessageId) || inboundMessageId <= 0) {
@@ -4942,6 +9783,164 @@ const shouldSkipAutoReplyBecauseNewerInboundExists = async ({ contactId, sender,
   return Boolean(newerInboundResult.rows[0]?.id)
 }
 
+const getActiveOffTopicAutoReplyPause = async ({ contactId, sender }) => {
+  const pauseResult = await pool.query(
+    `
+      select details
+      from system_logs
+      where event in ('whatsapp_auto_reply_off_topic_pause', 'whatsapp_auto_reply_off_topic_unpause')
+        and (
+          (details->>'contactId')::int = $1
+          or regexp_replace(coalesce(details->>'sender', ''), '[^0-9]', '', 'g') = any($2::text[])
+        )
+      order by created_at desc, id desc
+      limit 1;
+    `,
+    [contactId ?? -1, getWhatsAppNumberCandidates(sender)],
+  )
+
+  const latestPauseEvent = pauseResult.rows[0]?.details ?? null
+  if (!latestPauseEvent?.pausedUntil) return null
+
+  const pausedUntil = new Date(latestPauseEvent.pausedUntil).getTime()
+  return Number.isFinite(pausedUntil) && pausedUntil > Date.now() ? latestPauseEvent : null
+}
+
+const countRecentNonActionableInboundMessages = async ({ contactId, sender, inboundMessageId, currentMessageBody }) => {
+  const windowMs = Number.isFinite(WHATSAPP_OFF_TOPIC_WINDOW_MS) ? Math.max(WHATSAPP_OFF_TOPIC_WINDOW_MS, 60 * 1000) : 20 * 60 * 1000
+  const recentInboundResult = await pool.query(
+    `
+      select id, message_text
+      from message_logs
+      where channel = 'WhatsApp'
+        and direction = 'inbound'
+        and created_at >= now() - ($1::text)::interval
+        and ($2::bigint is null or id <= $2::bigint)
+        and (
+          contact_id = $3
+          or regexp_replace(coalesce(recipient_reference, ''), '[^0-9]', '', 'g') = any($4::text[])
+        )
+      order by created_at desc, id desc
+      limit 6;
+    `,
+    [`${windowMs} milliseconds`, inboundMessageId ?? null, contactId ?? -1, getWhatsAppNumberCandidates(sender)],
+  )
+
+  const recentMessages = recentInboundResult.rows.map((row) => normalizeReference(row.message_text))
+  const currentMessage = normalizeReference(currentMessageBody)
+  if (currentMessage && !recentMessages.includes(currentMessage)) {
+    recentMessages.unshift(currentMessage)
+  }
+
+  let count = 0
+  for (const messageText of recentMessages) {
+    if (!isNonActionableCustomerMessage(messageText)) break
+    count += 1
+  }
+
+  return count
+}
+
+const registerOffTopicAutoReplyPause = async ({ contactId, sender, messageBody, count }) => {
+  const cooldownMs = Number.isFinite(WHATSAPP_OFF_TOPIC_COOLDOWN_MS)
+    ? Math.max(WHATSAPP_OFF_TOPIC_COOLDOWN_MS, 60 * 60 * 1000)
+    : 4 * 60 * 60 * 1000
+  const pausedUntil = new Date(Date.now() + cooldownMs).toISOString()
+
+  await writeSystemLog({
+    event: 'whatsapp_auto_reply_off_topic_pause',
+    statusCode: 200,
+    details: {
+      contactId: contactId ?? null,
+      sender: normalizePhoneNumber(sender),
+      reason: '2 mensajes seguidos fuera de tema o sin sentido; agente pausado para evitar gasto innecesario.',
+      observation: 'Pausa automatica de 4 horas. El equipo puede responder manualmente desde el CRM.',
+      lastMessage: normalizeReference(messageBody),
+      count,
+      pausedUntil,
+      cooldownMs,
+    },
+  })
+
+  return pausedUntil
+}
+
+const buildProactivePackageUpdateMessage = ({ contact, packageContext }) => {
+  if (!packageContext?.matched) return ''
+
+  const contactName = normalizeReference(contact?.name)
+  const customerName = contactName ? `, ${contactName}` : ''
+  const packageCode = normalizeReference(packageContext.currentPackageCode)
+  const destination =
+    normalizeReference(packageContext.currentDestinationDepartment) ||
+    normalizeReference(packageContext.currentDestinationLabel) ||
+    normalizeReference(packageContext.currentDestinationAddress) ||
+    'destino'
+  const origin =
+    normalizeReference(packageContext.currentOriginDepartment) ||
+    normalizeReference(packageContext.currentOriginLabel) ||
+    'origen'
+
+  if (hasVentanillaPackageContext(packageContext)) {
+    return buildVentanillaPickupMessage({
+      packageCode,
+      branch: getPackageDestinationBranch(packageContext) || getPackageOriginBranch(packageContext),
+    })
+  }
+
+  if (packageContext.stage === 'received') {
+    return `ðŸ“¦ Tu paquete *${packageCode}* fue recibido en *${origin}* y va con destino a *${destination}*.\nðŸšš Te avisaremos apenas salga a ruta. Gracias por preferir Correos de Bolivia ðŸ˜Š.`
+  }
+
+  if (packageContext.stage === 'transit') {
+    return `ðŸšš Tu paquete *${packageCode}* ya estÃ¡ en trÃ¡nsito hacia *${destination}*.\nðŸ“ Seguiremos monitoreando el recorrido y te notificaremos cuando registre un nuevo movimiento ðŸ“².`
+  }
+
+  if (packageContext.stage === 'regional') {
+    const branchText = formatBranchText(getPackageDestinationBranch(packageContext))
+    return `ðŸ¤ Â¡Buenas noticias! Tu paquete *${packageCode}* ya llegÃ³ a la sucursal de destino en *${destination}*${branchText ? ` ðŸ“ (${branchText})` : ''}.\nðŸš´â€â™‚ï¸ El siguiente paso es reparto o disponibilidad para recojo segÃºn el proceso de la regional.`
+  }
+
+  if (packageContext.stage === 'courier') {
+    return `ðŸš´â€â™‚ï¸ Tu paquete *${packageCode}* ya estÃ¡ con cartero y saliÃ³ a reparto en *${destination}*.\nâœ… Te avisaremos cuando se confirme la entrega.`
+  }
+
+  if (packageContext.stage === 'delivered') {
+    return `âœ… Tu paquete *${packageCode}* figura como entregado con Ã©xito en *${destination}*.\nGracias por preferir Correos de Bolivia ðŸ˜Š.`
+  }
+
+  if (packageContext.stage === 'cancelled') {
+    return `âŒ Tu paquete *${packageCode}* figura como cancelado o devuelto en *${origin}*.\nðŸ’¡ Si necesitas revisar el motivo, escribe *RECLAMO*.`
+  }
+
+  if (packageContext.stage === 'regional') {
+    const branchText = formatBranchText(getPackageDestinationBranch(packageContext))
+    return `Tu paquete ${packageCode} ya llego a la sucursal de destino en ${destination}${branchText ? ` (${branchText})` : ''}. El siguiente paso es reparto o disponibilidad segun el proceso de la regional.`
+  }
+
+  if (packageContext.stage === 'courier') {
+    return `Tu paquete ${packageCode} ya estÃ¡ con cartero y saliÃ³ a reparto en ${destination}. Te avisaremos cuando se confirme la entrega.`
+  }
+
+  if (packageContext.stage === 'delivered') {
+    return `Tu paquete ${packageCode} figura como entregado en ${destination}. Gracias por preferir Correos de Bolivia.`
+  }
+
+  if (packageContext.stage === 'regional') {
+    return `Tu paquete ${packageCode} ya llegÃ³ a destino en ${destination}. Puedes estar atento a la siguiente actualizaciÃ³n.`
+  }
+
+  if (packageContext.stage === 'transit') {
+    return `Tu paquete ${packageCode} estÃ¡ en trÃ¡nsito hacia ${destination}. Te notificaremos cuando registre un nuevo movimiento.`
+  }
+
+  if (packageContext.stage === 'cancelled') {
+    return `Tu paquete ${packageCode} figura como cancelado o devuelto en ${origin}. Si necesitas ayuda, escribe RECLAMO.`
+  }
+
+  return `Tu paquete ${packageCode} fue recibido en ${origin} con destino a ${destination}. Te avisaremos cuando sea despachado.`
+}
+
 const buildInitialPackageOutreachMessage = ({ contactName, packageContext }) => {
   const safeName = normalizeReference(contactName)
   const greeting = getBoliviaDayGreeting()
@@ -4952,10 +9951,146 @@ const buildInitialPackageOutreachMessage = ({ contactName, packageContext }) => 
   })
 
   if (proactiveUpdate) {
-    return `¡Hola${customerName}! ${greeting}. Soy Jaimito, de Correos de Bolivia. ${proactiveUpdate}`
+    return `Â¡Hola${customerName}! ${greeting}. Soy Jaimito, de Correos de Bolivia. ${proactiveUpdate}`
   }
 
-  return `¡Hola${customerName}! ${greeting}. Soy Jaimito, de Correos de Bolivia.`
+  return `Â¡Hola${customerName}! ${greeting}. Soy Jaimito, de Correos de Bolivia.`
+}
+
+const buildNewPackageWelcomeMessage = ({ contactName, entry = null }) => {
+  const safeName = normalizeReference(contactName)
+  const customerName = safeName && !/^paquete\s+ems$/i.test(safeName) ? `, ${safeName}` : ''
+  const greeting = getBoliviaDayGreeting()
+  const packageCode = normalizeReference(entry?.code)
+  const destination = normalizeReference(entry?.destinationLabel) || 'su destino'
+
+  if (packageCode && isVentanillaText(entry?.latestEventLabel)) {
+    return buildVentanillaPickupMessage({
+      packageCode,
+      branch: getBoliviaBranchLocation(destination),
+    })
+  }
+
+  if (['received', 'transit', 'regional', 'courier', 'delivered'].includes(entry?.stage) && packageCode) {
+    const origin = normalizeReference(entry?.originLabel) || 'origen'
+    const baseGreeting = `Â¡Hola${customerName}! ðŸ‘‹ ${greeting}. Soy Jaimito de Correos de Bolivia âœ‰ï¸.`
+
+    if (entry.stage === 'received') {
+      return `${baseGreeting}\n\nðŸ“¦ Tu paquete *${packageCode}* fue recibido en *${origin}* y va con destino a *${destination}*.\nðŸšš Te avisaremos apenas salga a ruta.\nðŸ’¬ Gracias por preferirnos. Puedes escribirnos a este mismo nÃºmero para consultar por tu paquete ðŸ˜Š.`
+    }
+
+    if (entry.stage === 'transit') {
+      return `${baseGreeting}\n\nðŸšš Tu paquete *${packageCode}* ya estÃ¡ en trÃ¡nsito hacia *${destination}*.\nðŸ“² Te notificaremos cuando registre un nuevo movimiento.\nðŸ’¬ Gracias por preferirnos. Puedes escribirnos a este mismo nÃºmero para consultar por tu paquete ðŸ˜Š.`
+    }
+
+    if (entry.stage === 'regional') {
+      const branchText = formatBranchText(getBoliviaBranchLocation(destination))
+      return `${baseGreeting}\n\nðŸ¤ Tu paquete *${packageCode}* ya llegÃ³ a la sucursal de destino en *${destination}*${branchText ? ` ðŸ“ (${branchText})` : ''}.\nðŸš´â€â™‚ï¸ El siguiente paso es reparto o disponibilidad para recojo.\nðŸ’¬ Gracias por preferirnos. Puedes escribirnos a este mismo nÃºmero para consultar por tu paquete ðŸ˜Š.`
+    }
+
+    if (entry.stage === 'courier') {
+      return `${baseGreeting}\n\nðŸš´â€â™‚ï¸ Tu paquete *${packageCode}* ya estÃ¡ con cartero para entrega en *${destination}*.\nâœ… Te avisaremos cuando se confirme la entrega.\nðŸ’¬ Gracias por preferirnos. Puedes escribirnos a este mismo nÃºmero para consultar por tu paquete ðŸ˜Š.`
+    }
+
+    return `${baseGreeting}\n\nâœ… Tu paquete *${packageCode}* figura entregado con Ã©xito en *${destination}*.\nGracias por preferirnos ðŸ˜Š.`
+  }
+
+  if (entry?.stage === 'received' && packageCode) {
+    const origin = normalizeReference(entry?.originLabel) || 'origen'
+    return `Â¡Hola${customerName}! ðŸ‘‹ ${greeting}. Soy Jaimito de Correos de Bolivia âœ‰ï¸.\n\nðŸ“¦ Tu paquete *${packageCode}* fue recibido en *${origin}* y va con destino a *${destination}*.\nðŸšš Te avisaremos apenas salga a ruta.\nðŸ’¬ Gracias por preferirnos. Puedes escribirnos a este mismo nÃºmero para consultar por tu paquete ðŸ˜Š.`
+  }
+
+  if (entry?.stage === 'transit' && packageCode) {
+    return `Â¡Hola${customerName}! ðŸ‘‹ ${greeting}. Soy Jaimito de Correos de Bolivia âœ‰ï¸.\n\nðŸšš Tu paquete *${packageCode}* ya estÃ¡ en trÃ¡nsito hacia *${destination}*.\nðŸ“² Te notificaremos cuando registre un nuevo movimiento.\nðŸ’¬ Gracias por preferirnos. Puedes escribirnos a este mismo nÃºmero para consultar por tu paquete ðŸ˜Š.`
+  }
+
+  if (entry?.stage === 'regional' && packageCode) {
+    const branchText = formatBranchText(getBoliviaBranchLocation(destination))
+    return `Â¡Hola${customerName}! ðŸ‘‹ ${greeting}. Soy Jaimito de Correos de Bolivia âœ‰ï¸.\n\nðŸ¤ Tu paquete *${packageCode}* ya llegÃ³ a la sucursal de destino en *${destination}*${branchText ? ` ðŸ“ (${branchText})` : ''}.\nðŸš´â€â™‚ï¸ El siguiente paso es reparto o disponibilidad para recojo.\nðŸ’¬ Gracias por preferirnos. Puedes escribirnos a este mismo nÃºmero para consultar por tu paquete ðŸ˜Š.`
+  }
+
+  if (entry?.stage === 'courier' && packageCode) {
+    return `Â¡Hola${customerName}! ðŸ‘‹ ${greeting}. Soy Jaimito de Correos de Bolivia âœ‰ï¸.\n\nðŸš´â€â™‚ï¸ Tu paquete *${packageCode}* ya estÃ¡ con cartero para entrega en *${destination}*.\nâœ… Te avisaremos cuando se confirme la entrega.\nðŸ’¬ Gracias por preferirnos. Puedes escribirnos a este mismo nÃºmero para consultar por tu paquete ðŸ˜Š.`
+  }
+
+  if (entry?.stage === 'delivered' && packageCode) {
+    return `Â¡Hola${customerName}! ðŸ‘‹ ${greeting}. Soy Jaimito de Correos de Bolivia âœ‰ï¸.\n\nâœ… Tu paquete *${packageCode}* figura entregado con Ã©xito en *${destination}*.\nGracias por preferirnos ðŸ˜Š.`
+  }
+
+  if (entry?.stage === 'transit' && packageCode) {
+    return `Â¡Hola${customerName}! ${greeting}, mucho gusto. Soy Jaimito de Correos de Bolivia. Tu paquete ${packageCode} estÃ¡ en trÃ¡nsito hacia ${destination}. Gracias por preferirnos; cualquier consulta estamos para ayudarte.`
+  }
+
+  if (packageCode && isVentanillaText(entry?.latestEventLabel)) {
+    return buildVentanillaPickupMessage({
+      packageCode,
+      branch: getBoliviaBranchLocation(destination),
+    })
+  }
+
+  if (entry?.stage === 'regional' && packageCode) {
+    const branchText = formatBranchText(getBoliviaBranchLocation(destination))
+    return `Hola${customerName}. ${greeting}, mucho gusto. Soy Jaimito de Correos de Bolivia. Tu paquete ${packageCode} ya llego a la sucursal de destino en ${destination}${branchText ? ` (${branchText})` : ''}. Gracias por preferirnos; cualquier consulta estamos para ayudarte.`
+  }
+
+  if (entry?.stage === 'courier' && packageCode) {
+    return `Â¡Hola${customerName}! ${greeting}, mucho gusto. Soy Jaimito de Correos de Bolivia. Tu paquete ${packageCode} estÃ¡ con cartero para entrega en ${destination}. Gracias por preferirnos; cualquier consulta estamos para ayudarte.`
+  }
+
+  if (entry?.stage === 'delivered' && packageCode) {
+    return `Â¡Hola${customerName}! ${greeting}, mucho gusto. Soy Jaimito de Correos de Bolivia. Tu paquete ${packageCode} figura entregado en ${destination}. Gracias por preferirnos; cualquier consulta estamos para ayudarte.`
+  }
+
+  return `Â¡Hola${customerName}! ${greeting}, mucho gusto. Soy Jaimito de Correos de Bolivia. Gracias por preferirnos; cualquier consulta estamos para ayudarte.`
+}
+
+const isAllowedNewPackageOutreachRecipient = (config, targetPhone) => {
+  const normalizedTarget = normalizePhoneNumber(targetPhone)
+  if (!normalizedTarget) return false
+
+  const testModeEnabled = normalizeBoolean(config.testModeEnabled, whatsappDefaults.testModeEnabled)
+  if (!testModeEnabled) return true
+
+  const testNumbers = getConfiguredWhatsAppTestNumbers(config)
+    .map(normalizePhoneNumber)
+    .filter(Boolean)
+
+  return testNumbers.includes(normalizedTarget)
+}
+
+const isWhatsAppRecipientAllowedByTestMode = (config, targetPhone) => {
+  const normalizedTarget = normalizeBoliviaTestNumber(targetPhone)
+  if (!normalizedTarget) return false
+
+  const testModeEnabled = normalizeBoolean(config.testModeEnabled, whatsappDefaults.testModeEnabled)
+  if (!testModeEnabled) return true
+
+  const targetCandidates = new Set(getBoliviaTestNumberCandidates(normalizedTarget))
+  return getConfiguredWhatsAppTestNumbers(config).some((number) =>
+    getBoliviaTestNumberCandidates(number).some((candidate) => targetCandidates.has(candidate)),
+  )
+}
+
+const isValidWhatsAppRecipientNumber = (targetPhone) => {
+  const normalizedTarget = normalizeBoliviaTestNumber(targetPhone)
+  if (!normalizedTarget) return false
+
+  if (normalizedTarget.startsWith('591')) {
+    return /^591[67]\d{7}$/.test(normalizedTarget)
+  }
+
+  return /^\d{10,15}$/.test(normalizedTarget)
+}
+
+const getAllowedTestModeFallbackRecipients = (config) => {
+  const testModeEnabled = normalizeBoolean(config?.testModeEnabled, whatsappDefaults.testModeEnabled)
+  if (!testModeEnabled) return []
+
+  return getConfiguredWhatsAppTestNumbers(config)
+    .map(normalizeBoliviaTestNumber)
+    .filter(Boolean)
+    .filter(isValidWhatsAppRecipientNumber)
+    .filter((phone, index, phones) => phones.indexOf(phone) === index)
 }
 
 const maybeStartTestModeConversation = async (request = null) => {
@@ -5281,57 +10416,730 @@ const maybeSendTestModeStageUpdate = async (request = null) => {
 }
 
 let whatsappStageWatcherRunning = false
+const WHATSAPP_WATCHER_ADVISORY_LOCK_ID = 9403001
 
 const runWhatsAppStageWatcher = async () => {
   if (whatsappStageWatcherRunning) {
+    console.log('Watcher WhatsApp: ciclo omitido porque el anterior sigue en ejecucion.')
     return
   }
 
   whatsappStageWatcherRunning = true
+  let watcherLockClient = null
+  let watcherLockAcquired = false
+  console.log(`Watcher WhatsApp: revisando paquetes nuevos y eventos (${new Date().toISOString()}).`)
 
   try {
-    await maybeStartTestModeConversation().catch(async (error) => {
-      await writeSystemLog({
-        level: 'error',
-        event: 'whatsapp_stage_watcher_auto_start_failed',
-        statusCode: 500,
-        details: {
-          error: error instanceof Error ? error.message : 'Error desconocido.',
-        },
-      }).catch(() => {})
-    })
+    watcherLockClient = await pool.connect()
+    const lockResult = await watcherLockClient.query('select pg_try_advisory_lock($1) as locked', [
+      WHATSAPP_WATCHER_ADVISORY_LOCK_ID,
+    ])
+    watcherLockAcquired = Boolean(lockResult.rows[0]?.locked)
 
-    await maybeSendTestModeStageUpdate().catch(async (error) => {
+    if (!watcherLockAcquired) {
+      console.log('Watcher WhatsApp: otro proceso ya esta revisando paquetes.')
+      return
+    }
+
+    await writeSystemLog({
+      event: 'whatsapp_new_package_check_started',
+      statusCode: 200,
+      details: {
+        startedAt: new Date().toISOString(),
+        newPackageWatcherEnabled: WHATSAPP_NEW_PACKAGE_WATCHER_ENABLED,
+        stageWatcherEnabled: WHATSAPP_STAGE_WATCHER_ENABLED,
+      },
+    }).catch(() => {})
+
+    if (WHATSAPP_TEST_MODE_STAGE_UPDATES_ENABLED) {
+      await maybeSendTestModeStageUpdate().catch(async (error) => {
+        await writeSystemLog({
+          level: 'error',
+          event: 'whatsapp_stage_watcher_stage_update_failed',
+          statusCode: 500,
+          details: {
+            error: error instanceof Error ? error.message : 'Error desconocido.',
+          },
+        }).catch(() => {})
+      })
+    }
+
+    const automationConfig = await getStoredAutomationConfig()
+    const welcomeIntervalMs = normalizeAutomationIntervalMs(
+      automationConfig.welcomeResponseIntervalMs,
+      PACKAGE_NEW_PACKAGE_WELCOME_INTERVAL_MS,
+      { minMs: 60 * 1000, maxMs: 6 * 60 * 60 * 1000 },
+    )
+    const recentEventIntervalMs = normalizeAutomationIntervalMs(
+      automationConfig.eventChangeResponseIntervalMs,
+      PACKAGE_EVENT_CHANGE_SYNC_INTERVAL_MS,
+      { minMs: 60 * 1000, maxMs: 24 * 60 * 60 * 1000 },
+    )
+    const reconciliationIntervalMs = normalizeAutomationIntervalMs(
+      automationConfig.reconciliationIntervalMs,
+      DEFAULT_PACKAGE_RECONCILIATION_INTERVAL_MS,
+      { minMs: 15 * 60 * 1000, maxMs: 24 * 60 * 60 * 1000 },
+    )
+    const shouldRunReconciliation =
+      automationConfig.automaticReconciliation &&
+      (lastPackageReconciliationCheckAt === 0 ||
+        Date.now() - lastPackageReconciliationCheckAt >= reconciliationIntervalMs)
+    const shouldRunWelcomeSync =
+      automationConfig.automaticWelcome &&
+      (lastNewPackageWelcomeCheckAt === 0 || Date.now() - lastNewPackageWelcomeCheckAt >= welcomeIntervalMs)
+    const shouldRunRecentEventSync =
+      WHATSAPP_STAGE_WATCHER_ENABLED &&
+      automationConfig.automaticStatusUpdates &&
+      (lastRecentPackageEventCheckAt === 0 || Date.now() - lastRecentPackageEventCheckAt >= recentEventIntervalMs)
+    console.log(
+      `Watcher WhatsApp: bienvenidas automaticas ${automationConfig.automaticWelcome ? 'activas' : 'desactivadas'}; ` +
+        `intervalo configurado ${Math.ceil(welcomeIntervalMs / 60000)} min.`,
+    )
+
+    if (shouldRunWelcomeSync || shouldRunRecentEventSync) {
+      if (shouldRunWelcomeSync) {
+        lastNewPackageWelcomeCheckAt = Date.now()
+      }
+      if (shouldRunRecentEventSync) {
+        lastRecentPackageEventCheckAt = Date.now()
+      }
+
+      await syncRecentPackageAutomations({
+        sendWelcome: shouldRunWelcomeSync,
+        sendEvents: shouldRunRecentEventSync,
+      })
+        .then(async (result) => {
+          console.log(
+            `Watcher WhatsApp rapido: API consultadas: Paquetes-Contactos ${result?.packageCountsBySource?.contact ?? 0}, Tracking ${result?.packageCountsBySource?.tracking ?? 0}; ` +
+              `${result?.total ?? 0} paquete(s) reciente(s) revisado(s), ${result?.createdCount ?? 0} registro(s) nuevo(s) en CRM, ` +
+              `bienvenida ${result?.newPackageWelcome?.sent ?? 0} enviada(s), ${result?.newPackageWelcome?.skipped ?? 0} omitida(s) ` +
+              `(${JSON.stringify(result?.newPackageWelcome?.skippedByReason ?? {})})` +
+              `${result?.newPackageWelcome?.reason ? ` (${result.newPackageWelcome.reason})` : ''}; ` +
+              `eventos ${result?.eventNotifications?.sent ?? 0} enviado(s), omitidos ${result?.eventNotifications?.skipped ?? 0} ` +
+              `(${JSON.stringify(result?.eventNotifications?.skippedByReason ?? {})}).`,
+          )
+          for (const detail of result?.eventNotifications?.sentDetails ?? []) {
+            console.log(
+              `[${detail.packageCode}] Confirmacion de envio.\n` +
+                `  Numero: ${detail.recipient}\n` +
+                `  Texto enviado:\n${detail.message}`,
+            )
+          }
+          await writeSystemLog({
+            event: 'whatsapp_new_package_fast_check_completed',
+            statusCode: 200,
+            details: {
+              totalPackages: result?.total ?? 0,
+              newPackages: result?.createdCount ?? 0,
+              packageCountsBySource: result?.packageCountsBySource ?? {},
+              packageSourceFailures: result?.packageSourceFailures ?? [],
+              welcomeSent: result?.newPackageWelcome?.sent ?? 0,
+              welcomeSkipped: result?.newPackageWelcome?.skipped ?? 0,
+              welcomeSkippedByReason: result?.newPackageWelcome?.skippedByReason ?? {},
+              eventSent: result?.eventNotifications?.sent ?? 0,
+              eventSkipped: result?.eventNotifications?.skipped ?? 0,
+              eventSkippedByReason: result?.eventNotifications?.skippedByReason ?? {},
+              checkedAt: result?.syncedAt ?? new Date().toISOString(),
+              lookbackMs: PACKAGE_NEW_PACKAGE_WELCOME_LOOKBACK_MS,
+              welcomeIntervalMs,
+              eventIntervalMs: recentEventIntervalMs,
+            },
+          }).catch(() => {})
+        })
+        .catch(async (error) => {
+          console.error(
+            `Watcher WhatsApp rapido: fallo al revisar paquetes recientes: ${error instanceof Error ? error.message : 'Error desconocido.'}`,
+          )
+          await writeSystemLog({
+            level: 'error',
+            event: 'whatsapp_new_package_fast_check_failed',
+            statusCode: 500,
+            details: {
+              error: error instanceof Error ? error.message : 'Error desconocido.',
+            },
+          }).catch(() => {})
+        })
+    } else if (
+      !shouldRunReconciliation &&
+      (
+        automationConfig.automaticWelcome ||
+        (WHATSAPP_STAGE_WATCHER_ENABLED && automationConfig.automaticStatusUpdates) ||
+        automationConfig.automaticReconciliation
+      )
+    ) {
+      const nextWelcomeMinutes = lastNewPackageWelcomeCheckAt > 0
+        ? Math.max(0, Math.ceil((welcomeIntervalMs - (Date.now() - lastNewPackageWelcomeCheckAt)) / 60000))
+        : 0
+      const nextEventMinutes = lastRecentPackageEventCheckAt > 0
+        ? Math.max(0, Math.ceil((recentEventIntervalMs - (Date.now() - lastRecentPackageEventCheckAt)) / 60000))
+        : 0
+      const whatsappConfig = await getStoredWhatsAppConfig()
+      console.log(
+        `Watcher WhatsApp rapido: omitido; bienvenida ~${nextWelcomeMinutes} min, ` +
+          `eventos recientes ~${nextEventMinutes} min; ` +
+          `numeros configurados: ${(whatsappConfig.testModeNumbers ?? []).join(', ') || 'ninguno'}.`,
+      )
+    }
+
+    const fullEventSyncIntervalMs = normalizeAutomationIntervalMs(
+      PACKAGE_FULL_EVENT_CHANGE_SYNC_INTERVAL_MS,
+      60 * 60 * 1000,
+      { minMs: 15 * 60 * 1000, maxMs: 24 * 60 * 60 * 1000 },
+    )
+    const shouldRunFullEventSync =
+      !shouldRunReconciliation &&
+      WHATSAPP_STAGE_WATCHER_ENABLED &&
+      automationConfig.automaticStatusUpdates &&
+      (lastPackageEventChangeSyncAt === 0 || Date.now() - lastPackageEventChangeSyncAt >= fullEventSyncIntervalMs)
+
+    if (shouldRunFullEventSync) {
+      lastPackageEventChangeSyncAt = Date.now()
+      await ensurePackagePipelineSync({ force: true })
+        .then(async (result) => {
+          console.log(
+            `Watcher WhatsApp pesado: ${result?.createdCount ?? 0} nuevo(s), ${result?.updatedCount ?? 0} actualizado(s), ${result?.total ?? 0} total.`,
+          )
+          await writeSystemLog({
+            event: 'whatsapp_new_package_check_completed',
+            statusCode: 200,
+            details: {
+              totalPackages: result?.total ?? 0,
+              newPackages: result?.createdCount ?? 0,
+              updatedPackages: result?.updatedCount ?? 0,
+              checkedAt: result?.syncedAt ?? new Date().toISOString(),
+              intervalMs: fullEventSyncIntervalMs,
+            },
+          }).catch(() => {})
+        })
+        .catch(async (error) => {
+          console.error(
+            `Watcher WhatsApp pesado: fallo al sincronizar paquetes: ${error instanceof Error ? error.message : 'Error desconocido.'}`,
+          )
+          await writeSystemLog({
+            level: 'error',
+            event: 'whatsapp_new_package_watcher_sync_failed',
+            statusCode: 500,
+            details: {
+              error: error instanceof Error ? error.message : 'Error desconocido.',
+            },
+          }).catch(() => {})
+        })
+    } else if (
+      !shouldRunReconciliation &&
+      WHATSAPP_STAGE_WATCHER_ENABLED &&
+      automationConfig.automaticStatusUpdates
+    ) {
+      const nextFullMinutes = lastPackageEventChangeSyncAt > 0
+        ? Math.max(0, Math.ceil((fullEventSyncIntervalMs - (Date.now() - lastPackageEventChangeSyncAt)) / 60000))
+        : 0
+      console.log(`Watcher WhatsApp pesado: omitido; proximo ciclo en ~${nextFullMinutes} min.`)
+    }
+
+    if (shouldRunReconciliation) {
+      const reconciliationStartedAt = new Date().toISOString()
+      lastPackageReconciliationCheckAt = Date.now()
+      console.log(
+        `Comprobador WhatsApp: iniciando carga completa y conciliacion de paquetes (${reconciliationStartedAt}).`,
+      )
       await writeSystemLog({
-        level: 'error',
-        event: 'whatsapp_stage_watcher_stage_update_failed',
-        statusCode: 500,
+        event: 'whatsapp_package_reconciliation_started',
+        statusCode: 102,
         details: {
-          error: error instanceof Error ? error.message : 'Error desconocido.',
+          startedAt: reconciliationStartedAt,
+          intervalMs: reconciliationIntervalMs,
         },
       }).catch(() => {})
-    })
+      try {
+        const result = await ensurePackagePipelineSync({ force: true, reconciliation: true })
+        const welcomeResult = result?.newPackageWelcome ?? {}
+        const eventResult = result?.eventNotifications ?? {}
+        const checkedAt = new Date().toISOString()
+        const sentTotal = (Number(welcomeResult.sent) || 0) + (Number(eventResult.sent) || 0)
+        const sourceFailures = Array.isArray(result?.packageSourceFailures)
+          ? result.packageSourceFailures
+          : []
+        const notificationFailures = [
+          welcomeResult.error ? 'welcome-send-failed' : null,
+          eventResult.error ? 'event-send-failed' : null,
+        ].filter(Boolean)
+        const details = {
+          startedAt: reconciliationStartedAt,
+          checkedAt,
+          catalogSyncedAt: result?.syncedAt ?? null,
+          intervalMs: reconciliationIntervalMs,
+          totalPackages: Number(result?.total) || 0,
+          packageCountsBySource: result?.packageCountsBySource ?? {},
+          createdPackages: Number(result?.createdCount) || 0,
+          updatedPackages: Number(result?.updatedCount) || 0,
+          sentTotal,
+          welcomeSent: Number(welcomeResult.sent) || 0,
+          welcomeSkipped: Number(welcomeResult.skipped) || 0,
+          welcomeSkippedByReason: welcomeResult.skippedByReason ?? {},
+          welcomeReason: welcomeResult.reason ?? welcomeResult.error ?? null,
+          eventSent: Number(eventResult.sent) || 0,
+          eventSkipped: Number(eventResult.skipped) || 0,
+          eventSkippedByReason: eventResult.skippedByReason ?? {},
+          eventReason: eventResult.reason ?? eventResult.error ?? null,
+          sourceFailures,
+          notificationFailures,
+          automaticWelcome: automationConfig.automaticWelcome,
+          automaticStatusUpdates: automationConfig.automaticStatusUpdates,
+        }
+        await writeSystemLog({
+          event: 'whatsapp_package_reconciliation_completed',
+          statusCode: sourceFailures.length > 0 || notificationFailures.length > 0 ? 206 : 200,
+          details,
+        })
+        lastPackageReconciliationCheckAt = Date.now()
+        lastNewPackageWelcomeCheckAt = Date.now()
+        lastRecentPackageEventCheckAt = Date.now()
+        lastPackageEventChangeSyncAt = Date.now()
+        console.log(
+          `Comprobador WhatsApp: ${details.totalPackages} paquete(s), ${sentTotal} mensaje(s) enviado(s), ` +
+            `${details.welcomeSkipped + details.eventSkipped} omitido(s).`,
+        )
+      } catch (error) {
+        lastPackageReconciliationCheckAt =
+          Date.now() - reconciliationIntervalMs + 2 * 60 * 1000
+        console.error(
+          `Comprobador WhatsApp: fallo la carga/conciliacion: ${error instanceof Error ? error.message : 'Error desconocido.'}`,
+        )
+        await writeSystemLog({
+          level: 'error',
+          event: 'whatsapp_package_reconciliation_failed',
+          statusCode: 500,
+          details: {
+            startedAt: reconciliationStartedAt,
+            checkedAt: new Date().toISOString(),
+            intervalMs: reconciliationIntervalMs,
+            error: error instanceof Error ? error.message : 'Error desconocido.',
+          },
+        }).catch(() => {})
+      }
+    }
   } finally {
+    if (watcherLockClient) {
+      if (watcherLockAcquired) {
+        await watcherLockClient.query('select pg_advisory_unlock($1)', [
+          WHATSAPP_WATCHER_ADVISORY_LOCK_ID,
+        ]).catch(() => {})
+      }
+      watcherLockClient.release()
+    }
     whatsappStageWatcherRunning = false
   }
 }
 
 const startWhatsAppStageWatcher = () => {
-  if (!WHATSAPP_STAGE_WATCHER_ENABLED) {
-    console.log('Watcher de etapas WhatsApp deshabilitado por configuracion.')
-    return
+  const defaultIntervalMs = Number.isFinite(PACKAGE_PIPELINE_SYNC_INTERVAL_MS)
+    ? Math.max(PACKAGE_PIPELINE_SYNC_INTERVAL_MS, 2 * 60 * 1000)
+    : 300000
+
+  const getWatcherIntervalMs = async () => {
+    const automationConfig = await getStoredAutomationConfig()
+    const fullEventSyncIntervalMs = normalizeAutomationIntervalMs(
+      PACKAGE_FULL_EVENT_CHANGE_SYNC_INTERVAL_MS,
+      60 * 60 * 1000,
+      { minMs: 15 * 60 * 1000, maxMs: 24 * 60 * 60 * 1000 },
+    )
+    const reconciliationIntervalMs = normalizeAutomationIntervalMs(
+      automationConfig.reconciliationIntervalMs,
+      DEFAULT_PACKAGE_RECONCILIATION_INTERVAL_MS,
+      { minMs: 15 * 60 * 1000, maxMs: 24 * 60 * 60 * 1000 },
+    )
+    return getPackageAutomationNextDelayMs({
+      defaultIntervalMs,
+      now: Date.now(),
+      welcomeEnabled: automationConfig.automaticWelcome,
+      welcomeIntervalMs: automationConfig.welcomeResponseIntervalMs,
+      lastWelcomeCheckAt: lastNewPackageWelcomeCheckAt,
+      eventUpdatesEnabled: WHATSAPP_STAGE_WATCHER_ENABLED && automationConfig.automaticStatusUpdates,
+      eventChangeIntervalMs: automationConfig.eventChangeResponseIntervalMs,
+      lastEventCheckAt: lastRecentPackageEventCheckAt,
+      fullEventSyncEnabled: WHATSAPP_STAGE_WATCHER_ENABLED && automationConfig.automaticStatusUpdates,
+      fullEventSyncIntervalMs,
+      lastFullEventSyncAt: lastPackageEventChangeSyncAt,
+      reconciliationEnabled: automationConfig.automaticReconciliation,
+      reconciliationIntervalMs,
+      lastReconciliationCheckAt: lastPackageReconciliationCheckAt,
+    })
   }
 
-  const intervalMs = Number.isFinite(WHATSAPP_STAGE_WATCHER_INTERVAL_MS)
-    ? Math.max(WHATSAPP_STAGE_WATCHER_INTERVAL_MS, 10000)
-    : 30000
+  const scheduleNextRun = () => {
+    void (async () => {
+      let intervalMs = defaultIntervalMs
+      try {
+        intervalMs = await getWatcherIntervalMs()
+      } catch (error) {
+        console.warn(
+          `Watcher WhatsApp: no se pudo leer el intervalo de automatizacion; se usara el intervalo base: ${error instanceof Error ? error.message : 'Error desconocido.'}`,
+        )
+      }
 
-  void runWhatsAppStageWatcher()
-  setInterval(() => {
-    void runWhatsAppStageWatcher()
-  }, intervalMs)
+      console.log(
+        `Watcher WhatsApp: proxima comprobacion automatica en ~${Math.ceil(intervalMs / 60000)} min.`,
+      )
+      setTimeout(
+        () => void runAndReschedule({
+          run: runWhatsAppStageWatcher,
+          schedule: scheduleNextRun,
+          onError: async (error) => {
+            console.error(
+              `Watcher WhatsApp: fallo el ciclo; se volvera a intentar en el siguiente intervalo: ${error instanceof Error ? error.message : 'Error desconocido.'}`,
+            )
+            await writeSystemLog({
+              level: 'error',
+              event: 'whatsapp_stage_watcher_cycle_failed',
+              statusCode: 500,
+              details: {
+                error: error instanceof Error ? error.message : 'Error desconocido.',
+              },
+            }).catch(() => {})
+          },
+        }),
+        intervalMs,
+      )
+    })()
+  }
 
-  console.log(`Watcher de etapas WhatsApp activo cada ${intervalMs} ms.`)
+  void runAndReschedule({
+    run: runWhatsAppStageWatcher,
+    schedule: scheduleNextRun,
+    onError: async (error) => {
+      console.error(
+        `Watcher WhatsApp: fallo la primera revision; se volvera a intentar en el siguiente intervalo: ${error instanceof Error ? error.message : 'Error desconocido.'}`,
+      )
+      await writeSystemLog({
+        level: 'error',
+        event: 'whatsapp_stage_watcher_initial_cycle_failed',
+        statusCode: 500,
+        details: {
+          error: error instanceof Error ? error.message : 'Error desconocido.',
+        },
+      }).catch(() => {})
+    },
+  })
+
+  console.log(
+    `Watcher WhatsApp automatico activo; intervalo base ${Math.ceil(defaultIntervalMs / 60000)} min.`,
+  )
+}
+
+const WHATSAPP_TRACKING_RETRY_ADVISORY_LOCK_ID = 9403017
+const WHATSAPP_TRACKING_RETRY_BATCH_SIZE = 5
+const WHATSAPP_TRACKING_RETRY_STALE_PROCESSING_MS = 30 * 60 * 1000
+
+const buildWhatsAppTrackingRetryReply = (packageCode, packageContext) => {
+  const events = Array.isArray(packageContext.packageEvents) ? packageContext.packageEvents : []
+  const latestEvent = events
+    .slice()
+    .sort((firstEvent, secondEvent) => getPackageEventTimestampValue(secondEvent) - getPackageEventTimestampValue(firstEvent))[0]
+  const status =
+    normalizeReference(packageContext.currentStatusLabel) ||
+    ({
+      delivered: 'Entregado',
+      cancelled: 'Cancelado o devuelto',
+      courier: 'En reparto',
+      regional: 'Recibido en destino',
+      transit: 'En tránsito',
+      received: 'Recibido en origen',
+    }[packageContext.stage] ?? '')
+  const latestEventLabel =
+    normalizeReference(packageContext.currentLatestEventLabel) ||
+    getPackageEventTitle(latestEvent)
+  const latestEventLocation =
+    normalizeReference(packageContext.currentLatestEventLocation) ||
+    getPackageEventLocation(latestEvent)
+  const destination =
+    normalizeReference(packageContext.currentDestinationDepartment) ||
+    normalizeReference(packageContext.currentDestinationLabel) ||
+    normalizeReference(packageContext.currentDestinationAddress)
+
+  return [
+    `Ya pude consultar la guía ${packageCode}.`,
+    status ? `Estado actual: ${status}.` : '',
+    latestEventLabel
+      ? `Último movimiento: ${latestEventLabel}${latestEventLocation ? `, en ${latestEventLocation}` : ''}.`
+      : '',
+    destination ? `Destino registrado: ${destination}.` : '',
+  ]
+    .filter(Boolean)
+    .join(' ')
+}
+
+const processWhatsAppTrackingRetry = async (job) => {
+  const packageCode = normalizePackageCodeForLookup(job.package_code)
+  const cacheKey = `${normalizePhoneNumber(job.sender)}::${packageCode}`
+  packageContextCache.delete(cacheKey)
+
+  let packageContext = await fetchMatchingPackageContext(job.sender, packageCode)
+  let trackingScanUnavailable = false
+  if (
+    !packageContext.matched &&
+    !packageContext.trackingLookupUnavailable &&
+    packageContext.trackingApiLookupUrl
+  ) {
+    const trackingDefaults = getTrackingApiDefaults()
+    const scan = await findPackageCodeInPaginatedApi({
+      url: new URL(packageContext.trackingApiLookupUrl),
+      headers: {
+        Authorization: `Bearer ${trackingDefaults.token}`,
+        Accept: 'application/json',
+      },
+      source: 'tracking',
+      code: packageCode,
+      perPage: 200,
+      maxPages: 100,
+      startPage: Math.max(1, Number.parseInt(String(job.tracking_scan_page || 1), 10) || 1),
+      timeoutMs: 8000,
+    })
+
+    trackingScanUnavailable = Boolean(scan.error)
+    if (scan.found && scan.record) {
+      await persistInternationalTrackingCatalog([scan.record])
+      packageContextCache.delete(cacheKey)
+      packageContext = await fetchMatchingPackageContext(job.sender, packageCode)
+    } else {
+      await pool.query(
+        `
+          update whatsapp_tracking_retry_queue
+          set tracking_scan_page = $2,
+              updated_at = now()
+          where id = $1;
+        `,
+        [job.id, scan.complete ? 1 : scan.nextPage],
+      )
+    }
+  }
+
+  if (!packageContext.matched) {
+    const expired = Date.parse(job.expires_at) <= Date.now() + WHATSAPP_TRACKING_RETRY_INTERVAL_MS
+    const sourceUnavailable = packageContext.lookupUnavailable || trackingScanUnavailable
+    const retryReason = sourceUnavailable ? 'tracking-source-unavailable' : 'package-not-found'
+    await pool.query(
+      `
+        update whatsapp_tracking_retry_queue
+        set status = $2,
+            next_attempt_at = case
+              when $2 = 'pending' then now() + interval '15 minutes'
+              else next_attempt_at
+            end,
+            processing_started_at = null,
+            last_error = $3,
+            updated_at = now()
+        where id = $1;
+      `,
+      [
+        job.id,
+        expired ? 'expired' : 'pending',
+        retryReason,
+      ],
+    )
+    await writeSystemLog({
+      level: sourceUnavailable ? 'warn' : 'info',
+      event: 'whatsapp_tracking_retry_checked',
+      statusCode: sourceUnavailable ? 502 : 404,
+      details: {
+        retryId: job.id,
+        packageCode,
+        attemptCount: job.attempt_count,
+        result: expired ? 'expired' : 'pending',
+        reason: retryReason,
+      },
+    })
+    return false
+  }
+
+  const whatsappConfig = await getStoredWhatsAppConfig()
+  if (!normalizeReference(whatsappConfig.accessToken) || !normalizeReference(whatsappConfig.phoneNumberId)) {
+    throw new Error('WhatsApp Meta no tiene credenciales de envio configuradas.')
+  }
+
+  const body = buildWhatsAppTrackingRetryReply(packageCode, packageContext)
+  const response = await sendWhatsAppCloudMessage({
+    accessToken: whatsappConfig.accessToken,
+    apiVersion: whatsappConfig.apiVersion,
+    phoneNumberId: whatsappConfig.phoneNumberId,
+    to: normalizePhoneNumber(job.sender),
+    body,
+  })
+  const providerMessageId = response?.messages?.[0]?.id ?? response?.message_id ?? null
+
+  await pool.query(
+    `
+      update whatsapp_tracking_retry_queue
+      set status = 'sent',
+          provider_message_id = $2,
+          processing_started_at = null,
+          sent_at = now(),
+          updated_at = now(),
+          last_error = null
+      where id = $1;
+    `,
+    [job.id, providerMessageId],
+  )
+  await pool.query(
+    `
+      insert into message_logs (
+        contact_id, channel, direction, recipient_reference, message_text,
+        provider_name, provider_message_id, status
+      )
+      values ($1, 'WhatsApp', 'outbound', $2, $3, 'Meta Cloud API', $4, 'sent');
+    `,
+    [job.contact_id, normalizePhoneNumber(job.sender), body, providerMessageId],
+  )
+  await writeSystemLog({
+    event: 'whatsapp_tracking_retry_sent',
+    statusCode: 200,
+    details: {
+      contactId: job.contact_id ?? null,
+      packageCode,
+      retryId: job.id,
+      attemptCount: job.attempt_count,
+      providerMessageId,
+    },
+  })
+  return true
+}
+
+const runWhatsAppTrackingRetryQueue = async () => {
+  await ensureDatabaseReady()
+  const lockClient = await pool.connect()
+  let lockAcquired = false
+
+  try {
+    const lockResult = await lockClient.query('select pg_try_advisory_lock($1) as locked', [
+      WHATSAPP_TRACKING_RETRY_ADVISORY_LOCK_ID,
+    ])
+    lockAcquired = Boolean(lockResult.rows[0]?.locked)
+    if (!lockAcquired) return
+
+    await pool.query(
+      `
+        update whatsapp_tracking_retry_queue
+        set status = 'expired', processing_started_at = null, updated_at = now()
+        where status in ('pending', 'processing')
+          and expires_at <= now();
+      `,
+    )
+
+    const claimedJobs = await pool.query(
+      `
+        with due_jobs as (
+          select id
+          from whatsapp_tracking_retry_queue
+          where expires_at > now()
+            and (
+              (status = 'pending' and next_attempt_at <= now())
+              or (
+                status = 'processing'
+                and processing_started_at <= now() - ($2 * interval '1 millisecond')
+              )
+            )
+          order by next_attempt_at, id
+          limit $1
+          for update skip locked
+        )
+        update whatsapp_tracking_retry_queue queue
+        set status = 'processing',
+            attempt_count = queue.attempt_count + 1,
+            processing_started_at = now(),
+            updated_at = now()
+        from due_jobs
+        where queue.id = due_jobs.id
+        returning queue.*;
+      `,
+      [WHATSAPP_TRACKING_RETRY_BATCH_SIZE, WHATSAPP_TRACKING_RETRY_STALE_PROCESSING_MS],
+    )
+
+    for (const job of claimedJobs.rows) {
+      try {
+        await processWhatsAppTrackingRetry(job)
+      } catch (error) {
+        const expired = Date.parse(job.expires_at) <= Date.now() + WHATSAPP_TRACKING_RETRY_INTERVAL_MS
+        await pool.query(
+          `
+            update whatsapp_tracking_retry_queue
+            set status = $2,
+                next_attempt_at = case
+                  when $2 = 'pending' then now() + interval '15 minutes'
+                  else next_attempt_at
+                end,
+                processing_started_at = null,
+                last_error = $3,
+                updated_at = now()
+            where id = $1;
+          `,
+          [
+            job.id,
+            expired ? 'expired' : 'pending',
+            error instanceof Error ? error.name : 'UnknownError',
+          ],
+        )
+        await writeSystemLog({
+          level: 'warn',
+          event: 'whatsapp_tracking_retry_failed',
+          statusCode: 502,
+          details: {
+            retryId: job.id,
+            packageCode: job.package_code,
+            attemptCount: job.attempt_count,
+            errorName: error instanceof Error ? error.name : 'UnknownError',
+          },
+        })
+      }
+    }
+  } finally {
+    if (lockAcquired) {
+      await lockClient.query('select pg_advisory_unlock($1)', [
+        WHATSAPP_TRACKING_RETRY_ADVISORY_LOCK_ID,
+      ]).catch(() => {})
+    }
+    lockClient.release()
+  }
+}
+
+const startWhatsAppTrackingRetryWatcher = () => {
+  const scheduleNextRun = () => {
+    setTimeout(() => {
+      void runAndReschedule({
+        run: runWhatsAppTrackingRetryQueue,
+        schedule: scheduleNextRun,
+        onError: async (error) => {
+          console.error(
+            `Reintento de tracking WhatsApp fallido: ${error instanceof Error ? error.name : 'Error desconocido.'}`,
+          )
+          await writeSystemLog({
+            level: 'error',
+            event: 'whatsapp_tracking_retry_cycle_failed',
+            statusCode: 500,
+            details: {
+              errorName: error instanceof Error ? error.name : 'UnknownError',
+            },
+          }).catch(() => {})
+        },
+      })
+    }, WHATSAPP_TRACKING_RETRY_POLL_INTERVAL_MS)
+  }
+
+  void runAndReschedule({
+    run: runWhatsAppTrackingRetryQueue,
+    schedule: scheduleNextRun,
+    onError: async (error) => {
+      console.error(
+        `No se pudo iniciar el reintento de tracking WhatsApp: ${error instanceof Error ? error.name : 'Error desconocido.'}`,
+      )
+      await writeSystemLog({
+        level: 'error',
+        event: 'whatsapp_tracking_retry_initial_cycle_failed',
+        statusCode: 500,
+        details: {
+          errorName: error instanceof Error ? error.name : 'UnknownError',
+        },
+      }).catch(() => {})
+    },
+  })
+  console.log('Reintento de tracking WhatsApp activo; cola revisada cada minuto y cada guia consultada cada 15 minutos.')
 }
 
 const callOllamaGenerate = async ({ prompt, model = '', fallbackModels = [], system = '', timeoutMs = 12000, options = {} }) => {
@@ -5355,41 +11163,57 @@ const callOllamaGenerate = async ({ prompt, model = '', fallbackModels = [], sys
     throw new Error('No hay un modelo de IA disponible en Ollama.')
   }
 
-  const response = await fetchJsonWithTimeout(
-    endpoint,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: resolvedModel,
-        prompt,
-        system: normalizeReference(system) || config.systemPrompt,
-        options,
-        stream: false,
-      }),
-    },
-    timeoutMs,
-  )
+  const maxAttempts = Math.max(1, Number.parseInt(process.env.AI_GENERATE_RETRY_ATTEMPTS || '2', 10))
+  let lastError = null
 
-  const raw = await response.text()
-  let payload = null
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const response = await fetchJsonWithTimeout(
+        endpoint,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: resolvedModel,
+            prompt,
+            system: normalizeReference(system) || config.systemPrompt,
+            options,
+            stream: false,
+          }),
+        },
+        timeoutMs,
+      )
 
-  try {
-    payload = raw ? JSON.parse(raw) : null
-  } catch {
-    payload = raw ? { raw } : null
+      const raw = await response.text()
+      let payload = null
+
+      try {
+        payload = raw ? JSON.parse(raw) : null
+      } catch {
+        payload = raw ? { raw } : null
+      }
+
+      if (!response.ok) {
+        throw new Error(payload?.error || payload?.raw || 'La IA local no respondio correctamente.')
+      }
+
+      return {
+        model: payload?.model || resolvedModel,
+        response: normalizeReference(payload?.response),
+      }
+    } catch (error) {
+      lastError = error
+      aiHealthCache.delete(`${normalizeReference(config.baseUrl)}::${Math.min(timeoutMs, 1500)}`)
+
+      if (attempt < maxAttempts) {
+        await sleep(Math.min(1000, 250 * attempt))
+      }
+    }
   }
 
-  if (!response.ok) {
-    throw new Error(payload?.error || payload?.raw || 'La IA local no respondio correctamente.')
-  }
-
-  return {
-    model: payload?.model || resolvedModel,
-    response: normalizeReference(payload?.response),
-  }
+  throw lastError || new Error('La IA local no respondio correctamente.')
 }
 
 const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody, inboundMessageId }) => {
@@ -5405,6 +11229,7 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
         reason: 'disabled',
         contactId: contactId ?? null,
         sender: normalizePhoneNumber(sender),
+        inboundMessageId: inboundMessageId ?? null,
       },
     })
     return null
@@ -5431,12 +11256,112 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
       return null
     }
 
+    let isPendingEmsWeightReply = false
+    let isPendingEmsWeightReplyMissingUnit = false
+    let pendingEmsConversation = ''
+    if (
+      (/^\d+(?:[.,]\d+)?$/.test(normalizeReference(messageBody)) || extractTariffWeightKg(messageBody)) &&
+      Number.isInteger(inboundMessageId)
+    ) {
+      const pendingConversationResult = await pool.query(
+        `
+          select direction, message_text
+          from message_logs
+          where channel = 'WhatsApp'
+            and id < $1
+            and created_at >= now() - interval '30 minutes'
+            and (
+              contact_id = $2
+              or regexp_replace(coalesce(recipient_reference, ''), '[^0-9]', '', 'g') = any($3::text[])
+            )
+          order by id desc
+          limit 16;
+        `,
+        [inboundMessageId, contactId ?? -1, getWhatsAppNumberCandidates(sender)],
+      )
+      pendingEmsConversation = pendingConversationResult.rows
+        .slice()
+        .reverse()
+        .map((row) => `${row.direction === 'inbound' ? 'Cliente' : 'Equipo'}: ${normalizeReference(row.message_text)}`)
+        .filter(Boolean)
+        .join('\n')
+      isPendingEmsWeightReplyMissingUnit =
+        isEmsWeightReplyMissingUnit(messageBody, pendingEmsConversation)
+      isPendingEmsWeightReply =
+        isEmsWeightReply(messageBody, pendingEmsConversation) ||
+        isPendingEmsWeightReplyMissingUnit
+    }
+
+    const activeOffTopicPause = await getActiveOffTopicAutoReplyPause({ contactId, sender })
+    if (activeOffTopicPause && isNonActionableCustomerMessage(messageBody) && !isPendingEmsWeightReply) {
+      await writeSystemLog({
+        event: 'whatsapp_auto_reply_skipped',
+        statusCode: 200,
+        details: {
+          reason: 'off-topic-pause-active',
+          contactId: contactId ?? null,
+          sender: normalizePhoneNumber(sender),
+          inboundMessageId: inboundMessageId ?? null,
+          pausedUntil: activeOffTopicPause.pausedUntil ?? null,
+          observation: 'El agente no respondio porque el contacto esta en pausa automatica por mensajes fuera de tema.',
+        },
+      })
+      return null
+    }
+
+    if (activeOffTopicPause) {
+      await writeSystemLog({
+        event: 'whatsapp_auto_reply_resumed',
+        statusCode: 200,
+        details: {
+          reason: 'actionable-message-during-off-topic-pause',
+          contactId: contactId ?? null,
+          sender: normalizePhoneNumber(sender),
+          inboundMessageId: inboundMessageId ?? null,
+          pausedUntil: activeOffTopicPause.pausedUntil ?? null,
+        },
+      }).catch(() => {})
+    }
+
+    if (isNonActionableCustomerMessage(messageBody) && !isPendingEmsWeightReply) {
+      const nonActionableCount = await countRecentNonActionableInboundMessages({
+        contactId,
+        sender,
+        inboundMessageId,
+        currentMessageBody: messageBody,
+      })
+
+      if (nonActionableCount >= WHATSAPP_OFF_TOPIC_LIMIT) {
+        const pausedUntil = await registerOffTopicAutoReplyPause({
+          contactId,
+          sender,
+          messageBody,
+          count: nonActionableCount,
+        })
+
+        await writeSystemLog({
+          event: 'whatsapp_auto_reply_skipped',
+          statusCode: 200,
+          details: {
+            reason: 'off-topic-pause-created',
+            contactId: contactId ?? null,
+            sender: normalizePhoneNumber(sender),
+            inboundMessageId: inboundMessageId ?? null,
+            pausedUntil,
+            observation: 'Pausa automatica registrada; responder manualmente desde CRM si corresponde.',
+          },
+        })
+        return null
+      }
+    }
+
     await writeSystemLog({
       event: 'whatsapp_auto_reply_started',
       statusCode: 200,
       details: {
         contactId: contactId ?? null,
         sender: normalizePhoneNumber(sender),
+        inboundMessageId: inboundMessageId ?? null,
       },
     })
 
@@ -5445,6 +11370,32 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
     const phoneNumberId = normalizeReference(config.phoneNumberId)
 
     if (!accessToken || !phoneNumberId) {
+      await writeSystemLog({
+        event: 'whatsapp_auto_reply_skipped',
+        statusCode: 503,
+        details: {
+          reason: 'whatsapp-config-incomplete',
+          contactId: contactId ?? null,
+          inboundMessageId: inboundMessageId ?? null,
+        },
+      }).catch(() => {})
+      return null
+    }
+
+    if (!isWhatsAppRecipientAllowedByTestMode(config, sender)) {
+      await writeSystemLog({
+        event: 'whatsapp_auto_reply_skipped',
+        statusCode: 200,
+        details: {
+          reason: 'test-mode-recipient-not-allowed',
+          contactId: contactId ?? null,
+          sender: normalizePhoneNumber(sender),
+          inboundMessageId: inboundMessageId ?? null,
+        },
+      }).catch(() => {})
+      console.log(
+        `[IA] Respuesta omitida para ${normalizePhoneNumber(sender)} porque no estÃ¡ autorizado por WHATSAPP_TEST_MODE.`,
+      )
       return null
     }
 
@@ -5469,7 +11420,7 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
           where contact_id = $1
             and ($2::bigint is null or id <= $2::bigint)
           order by created_at desc, id desc
-          limit 8;
+          limit 16;
         `,
         [contactId || -1, inboundMessageId ?? null],
       ),
@@ -5502,14 +11453,36 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
       .map((row) => `${row.direction === 'inbound' ? 'Cliente' : 'Equipo'}: ${normalizeReference(row.message_text)}`)
       .filter(Boolean)
       .join('\n')
+    const tariffQuoteConversation = isPendingEmsWeightReply
+      ? pendingEmsConversation
+      : recentConversation
 
     const isInjectionAttempt = isPromptInjectionAttempt(messageBody)
+    const needsEmsWeightUnitClarification =
+      !isInjectionAttempt &&
+      (isPendingEmsWeightReplyMissingUnit || isEmsWeightReplyMissingUnit(messageBody, recentConversation))
+    const pendingEmsCategory = needsEmsWeightUnitClarification
+      ? inferEmsCategoryFromPendingPrompt(tariffQuoteConversation)
+      : ''
     const isGreetingOnly = !isInjectionAttempt && isGreetingMessage(messageBody)
+    const isOpenAssistanceOnly = !isInjectionAttempt && isOpenAssistanceMessage(messageBody)
     const isGratitudeOnly = isGratitudeOnlyMessage(messageBody)
     const packageCodes = extractPackageCodeCandidates(messageBody)
     const packageCode = packageCodes[0] || ''
-    const hasPackageInquiry = !isInjectionAttempt && (isPackageInquiryMessage(messageBody) || Boolean(packageCode))
+    const isExplicitPackageTrackingRequest = isPackageTrackingRequest({
+      messageBody,
+      packageCode,
+    })
+    const inferredIntent = await routeCustomerIntent({
+      messageBody,
+      recentConversation,
+    })
+    const routedIntent = isExplicitPackageTrackingRequest
+      ? { ...inferredIntent, category: 'TRACKING', source: 'explicit-package-tracking' }
+      : inferredIntent
+    const hasPackageInquiry = !isInjectionAttempt && routedIntent.category !== 'TARIFAS' && (isPackageInquiryMessage(messageBody) || Boolean(packageCode))
     const isPackageInquiryWithoutCode = hasPackageInquiry && !hasPackageCode(messageBody)
+    const isPackageDispute = !isInjectionAttempt && Boolean(packageCode) && isPackageDisputeMessage(messageBody)
     const packageContext =
       isGreetingOnly || isGratitudeOnly || !hasPackageInquiry
         ? getEmptyPackageContext()
@@ -5524,27 +11497,70 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
           )
         : []
     const packageCodeNotFound = Boolean(packageCode) && !packageContext.matched
-    const routedIntent = await routeCustomerIntent({
-      messageBody,
-      recentConversation,
-    })
+    const packageLookupUnavailable = Boolean(packageCode) && packageContext.lookupUnavailable
+    let packageRetryScheduled = false
+    if (isExplicitPackageTrackingRequest && packageCodeNotFound) {
+      try {
+        packageRetryScheduled = await scheduleWhatsAppTrackingRetry({
+          contactId,
+          sender,
+          packageCode,
+          inboundMessageId,
+        })
+        if (packageRetryScheduled) {
+          await writeSystemLog({
+            event: 'whatsapp_tracking_retry_scheduled',
+            statusCode: 202,
+            details: {
+              contactId: contactId ?? null,
+              inboundMessageId: inboundMessageId ?? null,
+              packageCode: normalizePackageCodeForLookup(packageCode),
+            },
+          })
+        }
+      } catch (error) {
+        console.error(
+          `No se pudo programar el reintento de tracking: ${error instanceof Error ? error.name : 'Error desconocido.'}`,
+        )
+        await writeSystemLog({
+          level: 'error',
+          event: 'whatsapp_tracking_retry_schedule_failed',
+          statusCode: 500,
+          details: {
+            contactId: contactId ?? null,
+            inboundMessageId: inboundMessageId ?? null,
+            packageCode: normalizePackageCodeForLookup(packageCode),
+            errorName: error instanceof Error ? error.name : 'UnknownError',
+          },
+        }).catch(() => {})
+      }
+    }
+    const emsTariffFollowUp =
+      !isInjectionAttempt &&
+      (isEmsTariffFollowUp(messageBody, recentConversation) || isPendingEmsWeightReply)
+    const tariffQuote =
+      !isInjectionAttempt &&
+      !isExplicitPackageTrackingRequest &&
+      (routedIntent.category === 'TARIFAS' || emsTariffFollowUp)
+        ? await getTariffQuote({ messageBody, recentConversation: tariffQuoteConversation })
+        : null
 
     const prompt = [
       'Responde como una persona real, con tono cercano y natural.',
       'Prioriza respuestas cortas y fluidas para WhatsApp: 1 o 2 frases, maximo 32 palabras.',
-      'Si el cliente saluda o inicia la conversacion, responde primero con un saludo cordial y cercano, por ejemplo: "¡Hola! Buenas tardes. Soy Jaimito, de Correos de Bolivia. ¿En qué te puedo ayudar hoy?".',
+      'Si el cliente saluda o inicia la conversacion, responde primero con un saludo cordial y cercano, por ejemplo: "Â¡Hola! Buenas tardes. Soy Jaimito, de Correos de Bolivia. Â¿En quÃ© te puedo ayudar hoy?".',
       'No menciones el paquete, su estado ni su ubicacion si el cliente solo esta saludando o no ha preguntado por el envio.',
       'Si pregunta por un paquete, envio, seguimiento o ubicacion y no proporciona un codigo de seguimiento, pide primero ese codigo. No consultes ni informes otro paquete por el numero de telefono.',
       'Si el cliente pregunta donde esta el paquete o hacia donde va, responde primero con el estado actual y luego con el destino o direccion disponible.',
       'Usa frases naturales como "tu paquete esta en transito", "va hacia..." o "tiene destino en...".',
-      'Ejemplo bueno: "¡Buenas noticias! Tu paquete ya llegó y está listo para que lo pases a recoger en nuestra sucursal de Santa Cruz. ¡Te esperamos! ✨"',
+      'Ejemplo bueno: "Â¡Buenas noticias! Tu paquete ya llegÃ³ y estÃ¡ listo para que lo pases a recoger en nuestra sucursal de Santa Cruz. Â¡Te esperamos! âœ¨"',
       'Ejemplo malo: "Gracias por escribirnos. Seguimos monitoreando el avance para avisarte el siguiente movimiento confirmado."',
       'Eres un agente de soporte y ventas para CRM Omnicanal.',
-      'Primero ya se clasificó el contacto en EMS; ahora debes responder el mensaje con naturalidad.',
+      'Primero ya se clasificÃ³ el contacto en EMS; ahora debes responder el mensaje con naturalidad.',
       'Tu tarea es responder mensajes de WhatsApp de forma breve, natural y profesional.',
-      'Responde solo en español, en 2 o 3 frases como máximo y con no más de 40 palabras.',
+      'Responde solo en espaÃ±ol, en 2 o 3 frases como mÃ¡ximo y con no mÃ¡s de 40 palabras.',
       'Ve directo al punto: evita introducciones largas, listas y explicaciones innecesarias, pero conserva un saludo formal cuando corresponda.',
-      'Responde únicamente lo que pregunta el cliente. Haz una sola pregunta final solo si necesitas aclarar algo.',
+      'Responde Ãºnicamente lo que pregunta el cliente. Haz una sola pregunta final solo si necesitas aclarar algo.',
       '',
       contact
         ? `Contacto: ${contact.name || 'Sin nombre'}\nEmpresa: ${contact.company || 'No registrada'}\nSegmento: ${contact.segment || 'Sin segmento'}\nEstado: ${contact.status || 'Sin estado'}`
@@ -5564,17 +11580,54 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
     ].join('\n')
 
     let finalReply = isGreetingOnly
-      ? `¡Hola! 👋 ${getBoliviaDayGreeting()}. Te habla Jaimito de Correos de Bolivia ✉️. ¿Cómo te puedo colaborar hoy? 😊`
+      ? `Â¡Hola! ${getBoliviaDayGreeting()}, soy Jaimito de Correos de Bolivia. Puedo ayudarte a encontrar tu paquete y cotizar el costo de envÃ­o. Â¿QuÃ© necesitas?`
+      : isExplicitPackageTrackingRequest
+        ? packageRetryScheduled
+          ? 'No pude confirmar ahora el estado de esa guía. Dejé programada una revisión automática cada 15 minutos durante 24 horas; te escribiré por aquí cuando encuentre información.'
+          : packageLookupUnavailable
+          ? 'No pude consultar el sistema de rastreo en este momento, así que no puedo confirmar el estado de esa guía. Inténtalo nuevamente en unos minutos, por favor.'
+          : packageCodeNotFound
+          ? renderTextTemplate(
+              normalizeReference(botKnowledge.responses?.tracking?.notFound) ||
+                'No pude localizar el paquete {packageCode}. Verifica el codigo e intentalo nuevamente, por favor.',
+              { packageCode },
+            )
+          : packageContext.matched
+            ? isPackageHistoryQuestion(messageBody)
+              ? formatPackageHistoryReply(packageContext) ||
+                buildFallbackAgentReply({ contact, messageBody, currentStatus: contact?.status ?? 'Nuevo', packageContext })
+              : buildFallbackAgentReply({ contact, messageBody, currentStatus: contact?.status ?? 'Nuevo', packageContext })
+            : normalizeReference(botKnowledge.responses?.tracking?.notFound) ||
+              `No pude localizar el paquete ${packageCode}. Verifica el codigo e intentalo nuevamente, por favor.`
+      : needsEmsWeightUnitClarification
+        ? buildEmsWeightSpecificationsPrompt(messageBody, pendingEmsCategory)
+        : tariffQuote
+        ? await buildTariffReply(tariffQuote, { messageBody })
       : isPackageInquiryWithoutCode
-        ? '¡Perfecto! 👍 Déjame tu número de guía y lo revisamos de inmediato 📦.'
-        : packageCodeNotFound
-          ? `No pude localizar el paquete ${packageCode} 🔎. Verifica el código e inténtalo nuevamente, por favor 📦.`
-          : packageCode && packageContext.matched
-            ? buildFallbackAgentReply({ contact, messageBody, currentStatus: contact?.status ?? 'Nuevo', packageContext })
+        ? normalizeReference(botKnowledge.responses?.tracking?.missingCode) || '¡Perfecto! Dejame tu numero de guia y lo revisamos de inmediato.'
+        : packageLookupUnavailable
+          ? 'No pude consultar el sistema de rastreo en este momento, así que no puedo confirmar el estado de esa guía. Inténtalo nuevamente en unos minutos, por favor.'
+          : packageCodeNotFound
+          ? renderTextTemplate(
+              normalizeReference(botKnowledge.responses?.tracking?.notFound) ||
+                'No pude localizar el paquete {packageCode}. Verifica el codigo e intentalo nuevamente, por favor.',
+              { packageCode },
+            )
+          : isPackageDispute
+            ? `Entiendo la inconsistencia con la guia ${packageCode}. Para revisar ese caso con detalle y validar el registro, comunicate al ${supportContactNumber}; ahi pueden confirmar la informacion del sistema y corregir si corresponde.`
+          : packageCode && packageContext.matched && isPackageHistoryQuestion(messageBody)
+            ? formatPackageHistoryReply(packageContext) ||
+              buildFallbackAgentReply({ contact, messageBody, currentStatus: contact?.status ?? 'Nuevo', packageContext })
+            : packageCode && packageContext.matched
+              ? buildFallbackAgentReply({ contact, messageBody, currentStatus: contact?.status ?? 'Nuevo', packageContext })
         : ''
 
     if (multiPackageResults.length > 1) {
       finalReply = buildMultiPackageContextReply(multiPackageResults)
+    }
+
+    if (!finalReply && isOpenAssistanceOnly) {
+      finalReply = `Â¡Claro! ${getBoliviaDayGreeting()}. CuÃ©ntame tu consulta y con gusto te ayudo.`
     }
 
     if (isInjectionAttempt) {
@@ -5582,13 +11635,14 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
     }
 
     if (!isInjectionAttempt && isGratitudeOnly) {
-      finalReply = '¡Con gusto! 😊 Seguimos atentos a cualquier nuevo movimiento de tu paquete y te avisaremos apenas haya una actualización 📲.'
+      finalReply = 'Â¡Con gusto! ðŸ˜Š Seguimos atentos a cualquier nuevo movimiento de tu paquete y te avisaremos apenas haya una actualizaciÃ³n ðŸ“².'
     }
 
     const shouldCallAiForReply =
       !finalReply &&
       !packageContext.matched &&
       !isGreetingOnly &&
+      !isOpenAssistanceOnly &&
       !isGratitudeOnly &&
       !isPackageInquiryWithoutCode &&
       !packageCodeNotFound
@@ -5634,6 +11688,7 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
         details: {
           contactId: contactId ?? null,
           sender: normalizePhoneNumber(sender),
+          inboundMessageId: inboundMessageId ?? null,
           reason: error.message,
           routedCategory: routedIntent.category,
           routedBy: routedIntent.source,
@@ -5653,6 +11708,8 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
     if (!finalReply) {
       return null
     }
+
+    finalReply = repairMojibakeText(finalReply)
 
     const response = await sendWhatsAppCloudMessage({
       accessToken,
@@ -5690,14 +11747,16 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
     await writeSystemLog({
       event: 'whatsapp_auto_reply_sent',
       statusCode: 200,
-      details: {
-        contactId: contactId ?? null,
-        sender: normalizePhoneNumber(sender),
-        providerMessageId,
-        routedCategory: routedIntent.category,
-        routedBy: routedIntent.source,
-      },
-    })
+        details: {
+          contactId: contactId ?? null,
+          sender: normalizePhoneNumber(sender),
+          inboundMessageId: inboundMessageId ?? null,
+          providerMessageId,
+          routedCategory: routedIntent.category,
+          routedBy: routedIntent.source,
+          tariffRateId: tariffQuote?.rate?.id ?? null,
+        },
+      })
 
     return { providerMessageId, response: finalReply }
   } catch (error) {
@@ -5708,6 +11767,7 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
       details: {
         contactId: contactId ?? null,
         sender: normalizePhoneNumber(sender),
+        inboundMessageId: inboundMessageId ?? null,
         error: error.message,
       },
     })
@@ -5720,8 +11780,20 @@ let autoReplyQueue = Promise.resolve()
 const enqueueAutoReply = (job) => {
   const queuedJob = autoReplyQueue.then(() => autoReplyInboundWhatsAppMessage(job))
 
-  autoReplyQueue = queuedJob.catch((error) => {
-    console.error('Fallo un trabajo de la cola de respuestas IA:', error.message)
+  autoReplyQueue = queuedJob.catch(async (error) => {
+    console.error(
+      `Fallo un trabajo de la cola de respuestas IA: ${error instanceof Error ? error.name : 'Error desconocido.'}`,
+    )
+    await writeSystemLog({
+      level: 'error',
+      event: 'whatsapp_auto_reply_queue_failed',
+      statusCode: 500,
+      details: {
+        contactId: job.contactId ?? null,
+        inboundMessageId: job.inboundMessageId ?? null,
+        errorName: error instanceof Error ? error.name : 'UnknownError',
+      },
+    }).catch(() => {})
     return null
   })
 
@@ -5796,6 +11868,7 @@ const persistInboundWhatsAppWebhook = async (payload) => {
         const providerMessageId = normalizeReference(message?.id)
         const messageBody = getWebhookMessageBody(message)
         const mediaDescriptor = getWebhookMediaDescriptor(message)
+        const receivedAt = getWhatsAppMessageReceivedAt(message)
 
         if (!from || !providerMessageId || !messageBody) {
           continue
@@ -5856,9 +11929,10 @@ const persistInboundWhatsAppWebhook = async (payload) => {
             media_path,
             media_kind,
             media_mime_type,
-            media_filename
+            media_filename,
+            created_at
           )
-          values ($1, 'WhatsApp', 'inbound', $2, $3, 'Meta Cloud API', $4, 'received', $5, $6, $7, $8)
+          values ($1, 'WhatsApp', 'inbound', $2, $3, 'Meta Cloud API', $4, 'received', $5, $6, $7, $8, $9)
           returning id;
           `,
           [
@@ -5870,6 +11944,7 @@ const persistInboundWhatsAppWebhook = async (payload) => {
             mediaDescriptor?.kind ?? null,
             mediaDescriptor?.mimeType || mediaDetails?.mimeType || null,
             mediaDetails?.filename ?? null,
+            receivedAt,
           ],
         )
 
@@ -5881,16 +11956,32 @@ const persistInboundWhatsAppWebhook = async (payload) => {
             sender: normalizePhoneNumber(from),
             inboundMessageId: inboundLogResult.rows[0]?.id ?? null,
             providerMessageId,
+            receivedAt: receivedAt.toISOString(),
             preview: normalizeReference(messageBody).slice(0, 80),
           },
         }).catch(() => {})
 
-        void enqueueAutoReply({
-          contactId: matchedContact?.id ?? null,
-          sender: from,
-          messageBody,
-          inboundMessageId: inboundLogResult.rows[0]?.id ?? null,
-        })
+        if (isWhatsAppMessageTooOldForAutoReply(receivedAt)) {
+          await writeSystemLog({
+            event: 'whatsapp_auto_reply_skipped',
+            statusCode: 200,
+            details: {
+              reason: 'stale-inbound-message',
+              contactId: matchedContact?.id ?? null,
+              sender: normalizePhoneNumber(from),
+              inboundMessageId: inboundLogResult.rows[0]?.id ?? null,
+              providerMessageId,
+              receivedAt: receivedAt.toISOString(),
+            },
+          }).catch(() => {})
+        } else {
+          void enqueueAutoReply({
+            contactId: matchedContact?.id ?? null,
+            sender: from,
+            messageBody,
+            inboundMessageId: inboundLogResult.rows[0]?.id ?? null,
+          })
+        }
 
         await syncContactEmsStatus({
           contactId: matchedContact?.id ?? null,
@@ -5903,19 +11994,21 @@ const persistInboundWhatsAppWebhook = async (payload) => {
 
 const seedData = async () => {
   const client = await pool.connect()
+  const seedAdminEmail = normalizeReference(process.env.SEED_ADMIN_EMAIL).toLowerCase()
+  const seedAdminName = normalizeReference(process.env.SEED_ADMIN_NAME) || 'Administrador'
+  const seedAdminPassword = normalizeReference(process.env.SEED_ADMIN_PASSWORD)
 
   try {
-    await client.query(`
-      insert into users (full_name, email, password_hash, role_name)
-      values
-        ('Gonzalo Fabris', 'gonzalo.fabris@correos.gob.bo', '${hashPassword('123456')}', 'Administradores'),
-        ('Admin General', 'admin', '${hashPassword('admin')}', 'Administradores')
-      on conflict (email) do update
-      set
-        full_name = excluded.full_name,
-        password_hash = excluded.password_hash,
-        role_name = excluded.role_name;
-    `)
+    if (seedAdminEmail && seedAdminPassword) {
+      await client.query(
+        `
+          insert into users (full_name, email, password_hash, role_name)
+          values ($1, $2, $3, 'Administradores')
+          on conflict (email) do nothing;
+        `,
+        [seedAdminName, seedAdminEmail, hashPassword(seedAdminPassword)],
+      )
+    }
 
     await client.query(`
       insert into integration_settings (integration_key, settings)
@@ -5963,8 +12056,6 @@ const formatRelativeDate = (dateString) => {
   return `Hace ${Math.round(diffMinutes / 1440)} d`
 }
 
-app.use(cors())
-app.use(express.json())
 app.use('/api', (_request, response, next) => {
   response.set({
     'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
@@ -6140,9 +12231,15 @@ app.post('/api/auth/login', async (request, response) => {
 
     const user = result.rows[0]
 
-    if (!user || user.password_hash !== hashPassword(password)) {
+    if (!user || !verifyPassword(password, user.password_hash)) {
       response.status(401).json({ message: 'Credenciales invalidas.' })
       return
+    }
+
+    if (!String(user.password_hash).startsWith('scrypt$')) {
+      await pool
+        .query('update users set password_hash = $1 where id = $2;', [hashPassword(password), user.id])
+        .catch(() => {})
     }
 
     const token = createSession(user)
@@ -6153,6 +12250,18 @@ app.post('/api/auth/login', async (request, response) => {
 })
 
 app.post('/api/auth/demo', async (_request, response) => {
+  if (process.env.ENABLE_DEMO_LOGIN !== 'true') {
+    response.status(404).json({ message: 'Inicio de sesion demo no disponible.' })
+    return
+  }
+
+  const demoEmail = normalizeReference(process.env.DEMO_USER_EMAIL || process.env.SEED_ADMIN_EMAIL).toLowerCase()
+
+  if (!demoEmail) {
+    response.status(400).json({ message: 'Configura DEMO_USER_EMAIL para habilitar el demo.' })
+    return
+  }
+
   try {
     await ensureDatabaseReady()
 
@@ -6163,7 +12272,7 @@ app.post('/api/auth/demo', async (_request, response) => {
         where lower(email) = lower($1)
         limit 1;
       `,
-      ['gonzalo.fabris@correos.gob.bo'],
+      [demoEmail],
     )
 
     const user = result.rows[0]
@@ -6339,18 +12448,6 @@ app.delete('/api/users/:id', authMiddleware, async (request, response) => {
 app.get('/api/dashboard', authMiddleware, async (request, response) => {
   try {
     await ensureDatabaseReady()
-    await maybeStartTestModeConversation(request).catch(async (error) => {
-      await writeSystemLog({
-        level: 'error',
-        event: 'whatsapp_test_mode_auto_start_failed',
-        request,
-        statusCode: 500,
-        details: {
-          error: error instanceof Error ? error.message : 'Error desconocido.',
-        },
-      }).catch(() => {})
-    })
-
     const [
       contactsResult,
       dealsResult,
@@ -6360,6 +12457,7 @@ app.get('/api/dashboard', authMiddleware, async (request, response) => {
       contactGroups,
       prontsConfig,
       pipelineConfig,
+      autoReplyPausesResult,
     ] = await Promise.all([
       pool.query(`
         select
@@ -6427,7 +12525,40 @@ app.get('/api/dashboard', authMiddleware, async (request, response) => {
       getContactGroups(),
       getStoredProntsConfig(),
       getStoredPipelineConfig(),
+      pool.query(`
+        with latest_pause_events as (
+          select distinct on (details->>'contactId')
+            event,
+            nullif(details->>'contactId', '')::int as contact_id,
+            details->>'sender' as sender,
+            details->>'pausedUntil' as paused_until,
+            details->>'reason' as reason
+          from system_logs
+          where event in ('whatsapp_auto_reply_off_topic_pause', 'whatsapp_auto_reply_off_topic_unpause')
+            and created_at >= now() - interval '8 hours'
+            and nullif(details->>'contactId', '') is not null
+          order by details->>'contactId', created_at desc, id desc
+        )
+        select contact_id, sender, paused_until, reason
+        from latest_pause_events
+        where event = 'whatsapp_auto_reply_off_topic_pause'
+          and paused_until is not null
+          and paused_until::timestamptz > now();
+      `),
     ])
+
+    const autoReplyPauseByContactId = new Map(
+      autoReplyPausesResult.rows
+        .filter((row) => Number.isInteger(Number(row.contact_id)))
+        .map((row) => [
+          Number(row.contact_id),
+          {
+            isPaused: true,
+            pausedUntil: row.paused_until,
+            reason: row.reason,
+          },
+        ]),
+    )
 
     const contacts = contactsResult.rows.map((row) => ({
       id: row.id,
@@ -6442,6 +12573,11 @@ app.get('/api/dashboard', authMiddleware, async (request, response) => {
       updatedAt: formatRelativeDate(row.updated_at),
       lastMessageText: row.last_message_text,
       lastMessageDirection: row.last_message_direction,
+      autoReplyPause: autoReplyPauseByContactId.get(Number(row.id)) ?? {
+        isPaused: false,
+        pausedUntil: null,
+        reason: null,
+      },
       whatsappConnection: {
         isConnected:
           Boolean(row.last_message_at) &&
@@ -6497,16 +12633,48 @@ app.get('/api/dashboard', authMiddleware, async (request, response) => {
 app.get('/api/ems/pipeline', authMiddleware, async (request, response) => {
   const scope = normalizeReference(request.query.scope).toLowerCase()
   const query = normalizeReference(request.query.query).toLowerCase()
-  const month = normalizeReference(request.query.month).toLowerCase() || 'all'
+  const department = normalizeReference(request.query.department).toLowerCase() || 'all'
+  const validDepartments = new Set(['all', 'la-paz', 'cochabamba', 'santa-cruz', 'oruro', 'potosi', 'tarija', 'chuquisaca', 'beni', 'pando'])
+  const todayKey = getBoliviaDateKey(new Date().toISOString())
+  const defaultEndDate = new Date(`${todayKey}T00:00:00Z`)
+  const defaultStartDate = new Date(defaultEndDate)
+  defaultStartDate.setUTCDate(defaultStartDate.getUTCDate() - 29)
+  const defaultStartKey = defaultStartDate.toISOString().slice(0, 10)
+  const dateStart = normalizeReference(request.query.date_start) || defaultStartKey
+  const dateEnd = normalizeReference(request.query.date_end) || todayKey
+  const isValidDateKey = (value) => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false
+    const parsed = Date.parse(`${value}T00:00:00Z`)
+    return Number.isFinite(parsed) && new Date(parsed).toISOString().slice(0, 10) === value
+  }
+  const dateRangeDays = (Date.parse(`${dateEnd}T00:00:00Z`) - Date.parse(`${dateStart}T00:00:00Z`)) / 86400000
   const page = Math.max(1, Number.parseInt(String(request.query.page ?? '1'), 10) || 1)
   const perPage = Math.max(1, Number.parseInt(String(request.query.per_page ?? '20'), 10) || 20)
+
+  if (
+    !isValidDateKey(dateStart) ||
+    !isValidDateKey(dateEnd) ||
+    dateStart > todayKey ||
+    dateEnd > todayKey ||
+    dateRangeDays < 0 ||
+    dateRangeDays > 29
+  ) {
+    response.status(400).json({ message: 'Selecciona fechas pasadas o actuales en un rango maximo de 30 dias.' })
+    return
+  }
+  if (!validDepartments.has(department)) {
+    response.status(400).json({ message: 'El departamento seleccionado no es valido.' })
+    return
+  }
 
   try {
     const { cards, customColumns } = await buildEmsPipelineCards()
     const customColumn = customColumns.find((column) => column.id === scope)
 
     const filteredCards = cards.filter((card) => {
-      const matchesMonth = month === 'all' || getEmsPipelineMonthKey(card.updatedAt) === month
+      const dateKey = getBoliviaDateKey(card.updatedAt)
+      const matchesDate = Boolean(dateKey) && dateKey >= dateStart && dateKey <= dateEnd
+      const matchesDepartment = department === 'all' || card.department === department
       const matchesScope =
         !scope ||
         scope === 'all' ||
@@ -6530,7 +12698,7 @@ app.get('/api/ems/pipeline', authMiddleware, async (request, response) => {
           card.status,
         ].some((value) => normalizeReference(value).toLowerCase().includes(query))
 
-      return matchesMonth && matchesScope && matchesQuery
+      return matchesDate && matchesDepartment && matchesScope && matchesQuery
     })
     const totalItems = filteredCards.length
     const totalPages = Math.max(1, Math.ceil(totalItems / perPage))
@@ -6539,6 +12707,9 @@ app.get('/api/ems/pipeline', authMiddleware, async (request, response) => {
 
     response.json({
       scope: scope || 'all',
+      date_start: dateStart,
+      date_end: dateEnd,
+      department,
       page: currentPage,
       per_page: perPage,
       total: totalItems,
@@ -6556,6 +12727,357 @@ app.get('/api/ems/pipeline', authMiddleware, async (request, response) => {
     response.status(502).json({
       message: 'No se pudo cargar la paginacion del pipeline EMS.',
       error: error instanceof Error ? error.message : 'Error desconocido.',
+    })
+  }
+})
+
+app.get('/api/internacionales/import-status', authMiddleware, async (_request, response) => {
+  await ensureDatabaseReady()
+  const countResult = await pool.query('select count(*)::integer as total from international_tracking_packages;')
+  response.json({ ...ipsImportStatus, total: Number(countResult.rows[0]?.total ?? 0) })
+})
+
+app.post('/api/internacionales/sync', authMiddleware, async (request, response) => {
+  try {
+    const forceRefresh = String(request.query.force ?? '') === '1'
+    const catalog = await fetchAllTrackingPackagesCatalog({ forceRefresh })
+    const countResult = await pool.query('select count(*)::integer as total from international_tracking_packages;')
+    response.json({
+      ok: true,
+      fetched: Number(catalog?.total ?? 0),
+      total: Number(countResult.rows[0]?.total ?? 0),
+      source: 'tracking-api',
+      syncedAt: new Date().toISOString(),
+    })
+  } catch (error) {
+    response.status(502).json({
+      ok: false,
+      message: 'No se pudo sincronizar el catalogo completo desde SITRA.',
+      error: error instanceof Error ? error.message : 'Error desconocido.',
+    })
+  }
+})
+
+app.post(
+  '/api/internacionales/import',
+  authMiddleware,
+  ipsImportUpload.single('file'),
+  async (request, response) => {
+    if (!request.file) {
+      response.status(400).json({ message: 'Selecciona un archivo JSON o NDJSON.' })
+      return
+    }
+    if (ipsImportStatus.state === 'running') {
+      await rm(request.file.path, { force: true }).catch(() => {})
+      response.status(409).json({ message: 'Ya existe una importacion IPS en proceso.' })
+      return
+    }
+
+    ipsImportStatus = {
+      state: 'running',
+      filename: request.file.originalname,
+      total: ipsImportStatus.total,
+      message: 'Importando y clasificando paquetes IPS...',
+      startedAt: new Date().toISOString(),
+      completedAt: null,
+    }
+    const importer = spawn(process.execPath, [path.join(__dirname, 'scripts', 'import-ips-packages.mjs'), request.file.path], {
+      cwd: __dirname,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let output = ''
+    let errorOutput = ''
+    importer.stdout.on('data', (chunk) => { output = `${output}${chunk}`.slice(-2000) })
+    importer.stderr.on('data', (chunk) => { errorOutput = `${errorOutput}${chunk}`.slice(-2000) })
+    importer.on('close', async (exitCode) => {
+      await rm(request.file.path, { force: true }).catch(() => {})
+      const countResult = await pool.query('select count(*)::integer as total from international_tracking_packages;').catch(() => null)
+      const total = Number(countResult?.rows?.[0]?.total ?? 0)
+      ipsImportStatus = {
+        state: exitCode === 0 ? 'complete' : 'error',
+        filename: request.file.originalname,
+        total,
+        message: exitCode === 0
+          ? `Importacion completa: ${total} paquetes disponibles.`
+          : errorOutput.trim() || output.trim() || 'La importacion IPS fallo.',
+        startedAt: ipsImportStatus.startedAt,
+        completedAt: new Date().toISOString(),
+      }
+    })
+
+    response.status(202).json({ ok: true, ...ipsImportStatus })
+  },
+)
+
+const internationalPipelinePeriodCache = new Map()
+
+app.get('/api/internacionales/pipeline', authMiddleware, async (request, response) => {
+  const scope = normalizeReference(request.query.scope).toLowerCase()
+  const query = normalizeReference(request.query.query).toLowerCase()
+  const sortOrder = normalizeReference(request.query.sort).toLowerCase() === 'oldest' ? 'asc' : 'desc'
+  const department = normalizeReference(request.query.department).toLowerCase() || 'all'
+  const validDepartments = new Set(['all', 'la-paz', 'cochabamba', 'santa-cruz', 'oruro', 'potosi', 'tarija', 'chuquisaca', 'beni', 'pando'])
+  const todayKey = getBoliviaDateKey(new Date().toISOString())
+  const defaultEndDate = new Date(`${todayKey}T00:00:00Z`)
+  const defaultStartDate = new Date(defaultEndDate)
+  defaultStartDate.setUTCDate(defaultStartDate.getUTCDate() - 29)
+  const dateStart = normalizeReference(request.query.date_start) || defaultStartDate.toISOString().slice(0, 10)
+  const dateEnd = normalizeReference(request.query.date_end) || todayKey
+  const isValidDateKey = (value) => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false
+    const parsed = Date.parse(`${value}T00:00:00Z`)
+    return Number.isFinite(parsed) && new Date(parsed).toISOString().slice(0, 10) === value
+  }
+  const dateRangeDays = (Date.parse(`${dateEnd}T00:00:00Z`) - Date.parse(`${dateStart}T00:00:00Z`)) / 86400000
+  const page = Math.max(1, Number.parseInt(String(request.query.page ?? '1'), 10) || 1)
+  const perPage = Math.min(100, Math.max(1, Number.parseInt(String(request.query.per_page ?? '6'), 10) || 6))
+
+  if (!pipelineStageKeys.includes(scope)) {
+    response.status(400).json({ message: 'La etapa del pipeline internacional no es valida.' })
+    return
+  }
+  if (
+    !isValidDateKey(dateStart) ||
+    !isValidDateKey(dateEnd) ||
+    dateStart > todayKey ||
+    dateEnd > todayKey ||
+    dateRangeDays < 0 ||
+    dateRangeDays > 30
+  ) {
+    response.status(400).json({ message: 'Selecciona fechas pasadas o actuales en un rango maximo de 31 dias.' })
+    return
+  }
+  if (!validDepartments.has(department)) {
+    response.status(400).json({ message: 'El departamento seleccionado no es valido.' })
+    return
+  }
+
+  try {
+    await ensureDatabaseReady()
+    const cacheKey = `${dateStart}:${dateEnd}:${scope}`
+    let rangeCache = internationalPipelinePeriodCache.get(cacheKey)
+    if (!rangeCache || rangeCache.expiresAt <= Date.now()) {
+      const nextRangeCache = { expiresAt: Number.POSITIVE_INFINITY, promise: null }
+      const rangePromise = pool.query(
+        `
+          select package_code, stage_key, latest_event_code, latest_event_name,
+            latest_event_at, search_text, payload
+          from international_tracking_packages
+          where stage_key = $1
+            and latest_event_at >= (($2::date)::timestamp at time zone 'America/La_Paz')
+            and latest_event_at < ((($3::date + 1)::timestamp) at time zone 'America/La_Paz')
+          order by latest_event_at desc nulls last, package_code;
+        `,
+        [scope, dateStart, dateEnd],
+      )
+        .then((stageResult) => {
+          const data = stageResult.rows.map((row) => {
+            const latestEvent = getTrackingLatestEvent(row.payload) ?? {}
+            const eventTimestamp = new Date(row.latest_event_at).toISOString()
+            const normalizedEvent = {
+              ...latestEvent,
+              fecha: latestEvent?.event_gmt_dt ||
+                latestEvent?.event_date ||
+                latestEvent?.fecha_evento ||
+                latestEvent?.fecha ||
+                eventTimestamp,
+              evento_id: latestEvent?.evento_id ??
+                latestEvent?.event_code ??
+                latestEvent?.event_type_cd ??
+                latestEvent?.event_id ??
+                row.latest_event_code,
+              codigo_evento: latestEvent?.codigo_evento ??
+                latestEvent?.event_code ??
+                latestEvent?.event_type_cd ??
+                latestEvent?.event_id ??
+                row.latest_event_code,
+              nombre: latestEvent?.nombre ||
+                latestEvent?.evento_api ||
+                latestEvent?.evento_original ||
+                latestEvent?.event_name ||
+                row.latest_event_name,
+              oficina: latestEvent?.oficina || latestEvent?.office_name || latestEvent?.off_name || '',
+            }
+
+            return {
+              ...row.payload,
+              codigo_s10: row.package_code,
+              codigo: row.package_code,
+              fecha_registro: eventTimestamp,
+              eventos: [normalizedEvent],
+            }
+          })
+          const eventCatalog = {
+            data,
+            total: data.length,
+            source: 'local-db',
+          }
+          const packageResult = {
+            rows: stageResult.rows.map(({ payload }) => ({ payload })),
+          }
+
+          return [eventCatalog, packageResult]
+        })
+        .then(([eventCatalog, packageResult]) => {
+          const storedPackages = packageResult.rows.map(({ payload }) => payload)
+          const packageDetailsByCode = new Map()
+          storedPackages.forEach((payload) => {
+            const code = getPackageCodeFromItem(payload)
+            if (code) packageDetailsByCode.set(code, payload)
+          })
+
+          const latestEventsByCode = new Map()
+          eventCatalog.data.forEach((entry) => {
+            const eventRows = Array.isArray(entry?.eventos)
+              ? entry.eventos.filter(Boolean)
+              : [
+                  eventCatalog.source === 'ips-events-api' && entry?.evento && typeof entry.evento === 'object'
+                    ? { ...entry, ...entry.evento }
+                    : eventCatalog.source === 'ips-events-api' && entry?.event && typeof entry.event === 'object'
+                      ? { ...entry, ...entry.event }
+                      : eventCatalog.source === 'ips-events-api'
+                        ? entry
+                        : null,
+                ]
+              .filter(Boolean)
+            const packageCode = getPackageCodeFromItem(entry) ||
+              normalizePackageCodeForLookup(
+                entry?.mailitm_fid ??
+                entry?.paquete?.mailitm_fid ??
+                entry?.evento?.mailitm_fid ??
+                entry?.event?.mailitm_fid ??
+                entry?.package_code ??
+                entry?.tracking_code,
+              )
+            if (!packageCode) return
+
+            eventRows.forEach((event) => {
+              const timestamp = getPackageEventTimestampValue(event)
+              if (!timestamp) return
+              const dateKey = getBoliviaDateKey(timestamp)
+              if (dateKey < dateStart || dateKey > dateEnd) return
+
+              const current = latestEventsByCode.get(packageCode)
+              if (current && current.timestamp >= timestamp) return
+              const normalizedEvent = {
+                ...event,
+                fecha: event?.event_gmt_dt || event?.event_date || event?.fecha_evento || event?.fecha || '',
+                evento_id: event?.evento_id ?? event?.event_code ?? event?.event_type_cd ?? event?.event_id,
+                codigo_evento: event?.codigo_evento ?? event?.event_code ?? event?.event_type_cd ?? event?.event_id,
+                nombre: event?.nombre || event?.evento_api || event?.evento_original || event?.event_name || '',
+                oficina: event?.oficina || event?.office_name || event?.off_name || '',
+              }
+              latestEventsByCode.set(packageCode, { event: normalizedEvent, timestamp, entry })
+            })
+          })
+
+          const items = [...latestEventsByCode.entries()].map(([packageCode, latest]) => {
+            const packageDetails = packageDetailsByCode.get(packageCode) ?? {}
+            const item = {
+              ...latest.entry,
+              ...packageDetails,
+              codigo_s10: packageCode,
+              codigo: packageCode,
+              fecha_registro: normalizeReference(
+                latest.event?.event_gmt_dt ||
+                latest.event?.event_date ||
+                latest.event?.fecha ||
+                latest.event?.fecha_evento,
+              ),
+              eventos: [latest.event],
+            }
+            const eventLocation = getPackageEventLocation(latest.event) ||
+              normalizeReference(item?.ubicacion || item?.oficina || item?.regional || item?.departamento)
+
+            return {
+              item,
+              stage: getInternationalIpsStageFromEvent(latest.event) ?? inferTrackingPackageStage(item),
+              eventTimestamp: latest.timestamp,
+              eventLocation,
+              searchText: JSON.stringify({ ...latest.entry, ...latest.event, ...packageDetails }).toLowerCase(),
+            }
+          })
+
+          if (eventCatalog.source === 'tracking-api' && items.length === 0) {
+            throw new Error('La API de Tracking no devolvió historiales de movimientos para los paquetes.')
+          }
+
+          return {
+            items,
+            total: items.length,
+            source: eventCatalog.source,
+            warning: eventCatalog.warning ?? null,
+          }
+        })
+        .then((catalog) => {
+          nextRangeCache.expiresAt = Date.now() + 15000
+          return catalog
+        })
+        .catch((error) => {
+          internationalPipelinePeriodCache.delete(cacheKey)
+          throw error
+        })
+      nextRangeCache.promise = rangePromise
+      rangeCache = nextRangeCache
+      internationalPipelinePeriodCache.set(cacheKey, rangeCache)
+      while (internationalPipelinePeriodCache.size > 18) {
+        internationalPipelinePeriodCache.delete(internationalPipelinePeriodCache.keys().next().value)
+      }
+    }
+
+    const rangeCatalog = await rangeCache.promise
+    const filteredItems = rangeCatalog.items
+      .filter((candidate) => {
+        if (candidate.stage !== scope) return false
+        if (department !== 'all' && getBolivianDepartmentKey(candidate.eventLocation) !== department) return false
+        return !query ||
+          String(getPackageCodeFromItem(candidate.item)).toLowerCase().includes(query) ||
+          candidate.searchText.includes(query)
+      })
+      .sort((first, second) => {
+        const timeDifference = first.eventTimestamp - second.eventTimestamp
+        if (timeDifference) return sortOrder === 'asc' ? timeDifference : -timeDifference
+        return String(getPackageCodeFromItem(first.item)).localeCompare(String(getPackageCodeFromItem(second.item)))
+      })
+    const totalItems = filteredItems.length
+    const totalPages = Math.max(1, Math.ceil(totalItems / perPage))
+    const currentPage = Math.min(page, totalPages)
+    const fromIndex = (currentPage - 1) * perPage
+
+    response.json({
+      scope,
+      date_start: dateStart,
+      date_end: dateEnd,
+      department,
+      page: currentPage,
+      per_page: perPage,
+      total: totalItems,
+      total_pages: totalPages,
+      catalog_total: rangeCatalog.total,
+      source: rangeCatalog.source,
+      warning: rangeCatalog.warning,
+      data: filteredItems.slice(fromIndex, fromIndex + perPage).map((candidate) => candidate.item),
+      pagination: {
+        page: currentPage,
+        per_page: perPage,
+        total_items: totalItems,
+        total_pages: totalPages,
+        has_more: currentPage < totalPages,
+      },
+    })
+
+  } catch (error) {
+    console.error('No se pudo consultar el pipeline internacional.', error)
+    const rateLimited = error?.code === 'UPSTREAM_RATE_LIMIT'
+    response.status(rateLimited ? 429 : 502).json({
+      message: rateLimited
+        ? 'SITRA está limitando las consultas. La carga esperará y reintentará para completar el catálogo; no se muestran resultados parciales.'
+        : error instanceof Error && error.message.includes('no devolvió historiales')
+          ? 'La API de Tracking respondió, pero no incluyó los movimientos necesarios para llenar el pipeline.'
+          : error instanceof Error && error.message.startsWith('La API externa respondió HTTP')
+            ? 'La API de Tracking rechazó la carga del catálogo. Revisa la autorización y vuelve a intentar.'
+            : 'No se pudieron consultar los movimientos de paquetes del periodo seleccionado.',
     })
   }
 })
@@ -7334,12 +13856,31 @@ app.get('/api/integrations/whatsapp/webhook', async (request, response) => {
 })
 
 app.post('/api/integrations/whatsapp/webhook', async (request, response) => {
-  console.log('Webhook de WhatsApp recibido:', JSON.stringify(request.body))
+  const entries = Array.isArray(request.body?.entry) ? request.body.entry : []
+  const webhookSummary = entries.reduce(
+    (summary, entry) => {
+      for (const change of Array.isArray(entry?.changes) ? entry.changes : []) {
+        summary.inboundMessages += Array.isArray(change?.value?.messages) ? change.value.messages.length : 0
+        summary.statusUpdates += Array.isArray(change?.value?.statuses) ? change.value.statuses.length : 0
+      }
+      return summary
+    },
+    { entries: entries.length, inboundMessages: 0, statusUpdates: 0 },
+  )
+  console.log(
+    `Webhook WhatsApp recibido: ${webhookSummary.entries} entrada(s), ` +
+      `${webhookSummary.inboundMessages} mensaje(s) entrante(s), ${webhookSummary.statusUpdates} estado(s).`,
+  )
   try {
     await ensureDatabaseReady()
     await persistInboundWhatsAppWebhook(request.body)
   } catch (error) {
     console.error('No se pudo guardar el webhook de WhatsApp:', error.message)
+    response.status(500).json({
+      received: false,
+      message: 'No se pudo procesar el webhook de WhatsApp.',
+    })
+    return
   }
   response.status(200).json({ received: true })
 })
@@ -7447,18 +13988,6 @@ app.post('/api/messages/whatsapp/send', authMiddleware, upload.single('attachmen
         return
       }
 
-      const availableTestNumber = (
-        await Promise.all(
-          testModeNumbers.map(async (number) => ((await isTestModeNumberListedInApis(number)) ? number : null)),
-        )
-      ).find(Boolean)
-
-      if (!availableTestNumber) {
-        response.status(403).json({
-          message: 'El modo prueba esta activo, pero ninguno de los numeros autorizados aparece en las APIs de Internacionales o Paquetes.',
-        })
-        return
-      }
     }
 
     const storedAttachment = attachment
@@ -7526,19 +14055,6 @@ app.post('/api/messages/whatsapp/send', authMiddleware, upload.single('attachmen
 
     await syncContactEmsStatus({
       contactId: targetContactId,
-    })
-
-    await maybeSendTestModeStageUpdate(request).catch(async (error) => {
-      await writeSystemLog({
-        level: 'error',
-        event: 'whatsapp_test_mode_stage_update_failed',
-        request,
-        statusCode: 500,
-        details: {
-          trigger: 'manual-whatsapp-send',
-          error: error instanceof Error ? error.message : 'Error desconocido.',
-        },
-      }).catch(() => {})
     })
 
     response.json({
@@ -7697,7 +14213,7 @@ app.post('/api/ai/pronts-simulate-send', authMiddleware, async (request, respons
   const whatsappReference = normalizeReference(request.body?.contact?.reference)
   const systemPrompt = normalizeReference(request.body?.systemPrompt)
   const userPrompt = normalizeReference(request.body?.userPrompt)
-  const action = normalizeReference(request.body?.action) || 'Simulación'
+  const action = normalizeReference(request.body?.action) || 'SimulaciÃ³n'
   const columnLabel = normalizeReference(request.body?.columnLabel) || 'Columna'
   const temperature = Number(request.body?.temperature)
 
@@ -7866,6 +14382,122 @@ app.post('/api/ai/pronts-simulate-send', authMiddleware, async (request, respons
   }
 })
 
+app.post('/api/contacts/:id/auto-reply-unpause', authMiddleware, async (request, response) => {
+  const contactId = Number(request.params.id)
+
+  if (!Number.isInteger(contactId) || contactId <= 0) {
+    response.status(400).json({ message: 'El identificador del contacto no es valido.' })
+    return
+  }
+
+  try {
+    await ensureDatabaseReady()
+
+    const contactResult = await pool.query(
+      `
+        select id, social_profiles
+        from contacts
+        where id = $1
+        limit 1;
+      `,
+      [contactId],
+    )
+    const contact = contactResult.rows[0] ?? null
+
+    if (!contact) {
+      response.status(404).json({ message: 'No se encontro el contacto solicitado.' })
+      return
+    }
+
+    const sender = resolveWhatsAppReference(contact)
+
+    await writeSystemLog({
+      event: 'whatsapp_auto_reply_off_topic_unpause',
+      request,
+      statusCode: 200,
+      details: {
+        contactId,
+        sender: normalizePhoneNumber(sender),
+        reason: 'Pausa automatica levantada manualmente desde CRM.',
+      },
+    })
+
+    response.json({
+      ok: true,
+      contactId,
+      message: 'Baneo de IA desactivado. El agente puede responder nuevamente.',
+    })
+  } catch (error) {
+    response.status(500).json({
+      message: 'No se pudo desactivar el baneo de IA.',
+      error: error instanceof Error ? error.message : 'Error desconocido.',
+    })
+  }
+})
+
+app.post('/api/contacts/:id/auto-reply-retry', authMiddleware, async (request, response) => {
+  const contactId = Number(request.params.id)
+
+  if (!Number.isInteger(contactId) || contactId <= 0) {
+    response.status(400).json({ message: 'El identificador del contacto no es valido.' })
+    return
+  }
+
+  try {
+    await ensureDatabaseReady()
+
+    const inboundResult = await pool.query(
+      `
+        select id, recipient_reference, message_text
+        from message_logs
+        where contact_id = $1
+          and channel = 'WhatsApp'
+          and direction = 'inbound'
+        order by created_at desc, id desc
+        limit 1;
+      `,
+      [contactId],
+    )
+
+    const inboundMessage = inboundResult.rows[0] ?? null
+
+    if (!inboundMessage) {
+      response.status(404).json({ message: 'No hay mensajes entrantes para reintentar.' })
+      return
+    }
+
+    const retryResult = await autoReplyInboundWhatsAppMessage({
+      contactId,
+      sender: inboundMessage.recipient_reference,
+      messageBody: inboundMessage.message_text,
+      inboundMessageId: inboundMessage.id,
+    })
+
+    if (!retryResult) {
+      response.status(202).json({
+        ok: false,
+        contactId,
+        inboundMessageId: inboundMessage.id,
+        message: 'El reintento no genero respuesta. Revisa logs de auto-respuesta.',
+      })
+      return
+    }
+
+    response.json({
+      ok: true,
+      contactId,
+      inboundMessageId: inboundMessage.id,
+      reply: retryResult.response,
+      providerMessageId: retryResult.providerMessageId,
+    })
+  } catch (error) {
+    response.status(500).json({
+      message: 'No se pudo reintentar la respuesta automatica.',
+      error: error instanceof Error ? error.message : 'Error desconocido.',
+    })
+  }
+})
+
 app.post('/api/ai/suggest-reply', authMiddleware, async (request, response) => {
   const contactId = Number(request.body?.contactId)
   const customInstruction = normalizeReference(request.body?.instruction)
@@ -7944,9 +14576,9 @@ app.post('/api/ai/suggest-reply', authMiddleware, async (request, response) => {
       '',
       customInstruction
         ? `Instruccion adicional: ${customInstruction}`
-        : 'Instruccion adicional: redacta una respuesta de 2 o 3 frases, máximo 40 palabras, cordial y lista para enviar por WhatsApp.',
+        : 'Instruccion adicional: redacta una respuesta de 2 o 3 frases, mÃ¡ximo 40 palabras, cordial y lista para enviar por WhatsApp.',
       '',
-      'Devuelve solo el texto sugerido, sin comillas ni explicaciones. Usa máximo 40 palabras y 3 frases.',
+      'Devuelve solo el texto sugerido, sin comillas ni explicaciones. Usa mÃ¡ximo 40 palabras y 3 frases.',
     ].join('\n')
 
     const aiResult = await callOllamaGenerate({ prompt })
@@ -8325,5 +14957,5 @@ app.listen(port, () => {
     : ''
   console.log(`CRM API disponible en http://localhost:${port}${frontendMessage}`)
   startWhatsAppStageWatcher()
+  startWhatsAppTrackingRetryWatcher()
 })
-

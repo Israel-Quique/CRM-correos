@@ -104,6 +104,56 @@ create index if not exists whatsapp_auto_reply_queue_status_id_idx
 create index if not exists whatsapp_auto_reply_queue_enqueued_at_idx
   on whatsapp_auto_reply_queue (enqueued_at, id);
 
+create table if not exists whatsapp_tracking_retry_queue (
+  id bigserial primary key,
+  contact_id integer references contacts (id) on delete set null,
+  sender text not null,
+  package_code text not null,
+  inbound_message_id bigint,
+  status text not null default 'pending',
+  attempt_count integer not null default 0,
+  tracking_scan_page integer not null default 1,
+  next_attempt_at timestamptz not null,
+  expires_at timestamptz not null,
+  processing_started_at timestamptz,
+  provider_message_id text,
+  last_error text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  sent_at timestamptz
+);
+
+alter table whatsapp_tracking_retry_queue
+  add column if not exists tracking_scan_page integer not null default 1;
+
+create unique index if not exists whatsapp_tracking_retry_queue_active_idx
+  on whatsapp_tracking_retry_queue (sender, package_code)
+  where status in ('pending', 'processing');
+
+create index if not exists whatsapp_tracking_retry_queue_due_idx
+  on whatsapp_tracking_retry_queue (status, next_attempt_at, expires_at);
+
+create table if not exists tariff_rates (
+  id serial primary key,
+  service_key text not null,
+  service_name text not null,
+  destination_key text not null,
+  destination_name text not null,
+  destination_aliases jsonb not null default '[]'::jsonb,
+  min_weight_kg numeric(10, 3) not null default 0,
+  max_weight_kg numeric(10, 3) not null,
+  price numeric(12, 2) not null,
+  currency text not null default 'BOB',
+  notes text not null default '',
+  is_active boolean not null default true,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique (service_key, destination_key, min_weight_kg, max_weight_kg)
+);
+
+create index if not exists tariff_rates_lookup_idx
+  on tariff_rates (is_active, service_key, destination_key, min_weight_kg, max_weight_kg);
+
 create table if not exists system_logs (
   id bigserial primary key,
   level text not null default 'info',
@@ -173,6 +223,24 @@ alter table if exists pipeline_states
 create index if not exists pipeline_states_pipeline_order_idx
   on pipeline_states (pipeline_key, stage_order, id);
 
+create table if not exists international_tracking_packages (
+  package_code text primary key,
+  stage_key text not null,
+  latest_event_code integer,
+  latest_event_name text not null default '',
+  latest_event_at timestamptz,
+  search_text text not null default '',
+  payload jsonb not null,
+  imported_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists international_tracking_packages_stage_idx
+  on international_tracking_packages (stage_key, latest_event_at desc nulls last, package_code);
+
+create index if not exists international_tracking_packages_search_idx
+  on international_tracking_packages using gin (to_tsvector('simple', search_text));
+
 insert into pipeline_states (pipeline_key, state_key, title, helper, stage_order, is_system)
 values
   ('ems', 'received', 'Recibido Origen', 'Ingresados o en recepción inicial', 1, true),
@@ -181,6 +249,31 @@ values
   ('ems', 'courier', 'Cartero', 'Paquetes asignados a reparto', 4, true),
   ('ems', 'delivered', 'Entregado', 'Entregas confirmadas o cerradas', 5, true)
 on conflict (pipeline_key, state_key) do nothing;
+
+insert into tariff_rates (
+  service_key,
+  service_name,
+  destination_key,
+  destination_name,
+  destination_aliases,
+  min_weight_kg,
+  max_weight_kg,
+  price,
+  currency,
+  notes
+)
+values
+  ('nacional', 'Envio nacional estandar', 'la-paz', 'La Paz', '["lapaz", "lp", "el alto"]'::jsonb, 0, 1, 20, 'BOB', 'Tarifa base editable.'),
+  ('nacional', 'Envio nacional estandar', 'la-paz', 'La Paz', '["lapaz", "lp", "el alto"]'::jsonb, 1.001, 5, 35, 'BOB', 'Tarifa base editable.'),
+  ('nacional', 'Envio nacional estandar', 'cochabamba', 'Cochabamba', '["cbba", "cocha"]'::jsonb, 0, 1, 25, 'BOB', 'Tarifa base editable.'),
+  ('nacional', 'Envio nacional estandar', 'cochabamba', 'Cochabamba', '["cbba", "cocha"]'::jsonb, 1.001, 5, 45, 'BOB', 'Tarifa base editable.'),
+  ('nacional', 'Envio nacional estandar', 'santa-cruz', 'Santa Cruz', '["santacruz", "scz", "santa cruz de la sierra"]'::jsonb, 0, 1, 25, 'BOB', 'Tarifa base editable.'),
+  ('nacional', 'Envio nacional estandar', 'santa-cruz', 'Santa Cruz', '["santacruz", "scz", "santa cruz de la sierra"]'::jsonb, 1.001, 5, 45, 'BOB', 'Tarifa base editable.'),
+  ('ems', 'EMS prioritario', 'nacional', 'Bolivia nacional', '["bolivia", "nacional", "interdepartamental"]'::jsonb, 0, 1, 40, 'BOB', 'Tarifa base editable.'),
+  ('ems', 'EMS prioritario', 'nacional', 'Bolivia nacional', '["bolivia", "nacional", "interdepartamental"]'::jsonb, 1.001, 5, 70, 'BOB', 'Tarifa base editable.'),
+  ('internacional', 'Envio internacional', 'internacional', 'Internacional', '["exterior", "internacional", "afuera", "otro pais"]'::jsonb, 0, 0.5, 180, 'BOB', 'Tarifa referencial editable.'),
+  ('internacional', 'Envio internacional', 'internacional', 'Internacional', '["exterior", "internacional", "afuera", "otro pais"]'::jsonb, 0.501, 2, 320, 'BOB', 'Tarifa referencial editable.')
+on conflict (service_key, destination_key, min_weight_kg, max_weight_kg) do nothing;
 
 update pipeline_states as pipeline
 set

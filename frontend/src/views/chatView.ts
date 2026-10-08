@@ -1,5 +1,7 @@
 ﻿// @ts-nocheck
 
+import { renderChatConversationPanel } from './chatConversationPanel'
+
 export const renderChatView = (ctx: any) => {
   const {
     state,
@@ -27,6 +29,7 @@ export const renderChatView = (ctx: any) => {
     getChatPhaseDescription,
     getEmsPhaseDescription,
     getChatContacts,
+    formatAutoReplyPauseRemaining,
     isAutoCreatedChatContact,
     getConversationMessagesChronological,
     renderConversationMessageMedia,
@@ -85,6 +88,7 @@ export const renderChatView = (ctx: any) => {
   const activePhaseDescription = activeContact
     ? getChatPhaseDescription(activeContact)
     : 'Selecciona una conversación para ver su seguimiento.'
+  const activePauseRemaining = activeContact ? formatAutoReplyPauseRemaining(activeContact) : ''
   const chatPaginationVisible = chatPagination.totalItems > chatPagination.pageSize
 
   return `
@@ -114,6 +118,10 @@ export const renderChatView = (ctx: any) => {
           <button class="ems-status-chip ${state.emsStatusFilter === 'all' ? 'is-active' : ''}" data-ems-status-filter="all" type="button">
             <span class="ems-status-dot is-all"></span>
             Todos los Chats (${statusCounts.all.length})
+          </button>
+          <button class="ems-status-chip ${state.emsStatusFilter === 'paused' ? 'is-active' : ''}" data-ems-status-filter="paused" type="button">
+            <span class="ems-status-dot is-paused"></span>
+            Baneados 4h (${statusCounts.paused.length})
           </button>
           <button class="ems-status-chip ${state.emsStatusFilter === 'received' ? 'is-active' : ''}" data-ems-status-filter="received" type="button">
             <span class="ems-status-dot is-received"></span>
@@ -150,9 +158,7 @@ export const renderChatView = (ctx: any) => {
                 <strong>Hilos de conversación</strong>
                 <span>${activeConversationCount} chat(s) con WhatsApp</span>
               </div>
-              <button class="ems-filter-icon" data-clear-ems-filters type="button" aria-label="Limpiar filtros" title="Limpiar filtros">
-                â·
-              </button>
+              
             </div>
             <label class="ems-search">
               <input
@@ -169,9 +175,10 @@ export const renderChatView = (ctx: any) => {
                       .map((contact) => {
                         const statusKey = getEmsStatusKey(contact)
                         const statusLabel = getChatStatusLabel(contact)
+                        const isPaused = Boolean(contact.autoReplyPause?.isPaused && contact.autoReplyPause?.pausedUntil && new Date(contact.autoReplyPause.pausedUntil).getTime() > Date.now())
                         return `
                           <button
-                            class="ems-chat-card ${contact.id === conversation.contact.id ? 'is-active' : ''}"
+                            class="ems-chat-card ${contact.id === conversation.contact.id ? 'is-active' : ''} ${isPaused ? 'is-paused' : ''}"
                             data-open-chat="${contact.id}"
                             type="button"
                             aria-label="Abrir chat de ${escapeHtml(contact.name)}"
@@ -189,6 +196,11 @@ export const renderChatView = (ctx: any) => {
                                   <span class="contact-connection-dot" aria-hidden="true"></span>
                                   ${escapeHtml(getContactConnectionLabel(contact))}
                                 </span>
+                                ${
+                                  isPaused
+                                    ? `<span class="ems-chat-status is-paused">Baneado 4h</span>`
+                                    : ''
+                                }
                                 <span class="ems-chat-status ${getEmsStatusToneClass(statusKey)}">${escapeHtml(statusLabel)}</span>
                               </div>
                             </div>
@@ -235,158 +247,16 @@ export const renderChatView = (ctx: any) => {
             }
           </aside>
 
-          <section class="ems-conversation-panel">
-            <div class="ems-conversation-main">
-              <div class="ems-conversation-header">
-                <button
-                  class="ems-conversation-profile"
-                  data-open-contact-profile="${activeContact?.id ?? ''}"
-                  type="button"
-                  ${activeContact ? '' : 'disabled'}
-                >
-                  <div class="conversation-contact-avatar conversation-contact-avatar-lg">
-                    ${escapeHtml((conversation.contact.name || 'C').slice(0, 1))}
-                  </div>
-                  <div>
-                    <div class="ems-conversation-name-row">
-                      <h4>${escapeHtml(conversation.contact.name || 'Selecciona una conversacion')}</h4>
-                      <span class="ems-conversation-state">${escapeHtml(activePhaseLabel.replace('Fase ', ''))}</span>
-                    </div>
-                    <small>${escapeHtml(activeReference || conversation.contact.company || 'Sin referencia disponible')}</small>
-                  </div>
-                </button>
-                <div class="ems-conversation-actions">
-                  <button
-                    class="primary-btn ems-ai-btn"
-                    data-ai-suggest-reply
-                    type="button"
-                    ${!activeContact || state.conversationState === 'loading' ? 'disabled' : ''}
-                  >
-                    Sugerir Respuesta IA
-                  </button>
-                  ${
-                    shouldShowAddContact
-                      ? `
-                        <button
-                          class="secondary-btn conversation-add-contact-btn"
-                          data-add-chat-contact="${activeContact?.id ?? ''}"
-                          type="button"
-                        >
-                          Agregar contacto
-                        </button>
-                      `
-                      : ''
-                  }
-                </div>
-              </div>
-
-              <div class="ems-phase-strip">
-                <strong>${escapeHtml(activePhaseLabel)}:</strong>
-                <span>${escapeHtml(activePhaseDescription)}</span>
-              </div>
-
-              <div class="ems-meta-row">
-                <div class="ems-meta-card">
-                  <span>Empresa</span>
-                  <strong>${escapeHtml(activeContact?.company || 'No registrada')}</strong>
-                </div>
-                <div class="ems-meta-card">
-                  <span>Owner</span>
-                  <strong>${escapeHtml(activeContact?.owner || 'Sin asignar')}</strong>
-                </div>
-                <div class="ems-meta-card">
-                  <span>Segmento</span>
-                  <strong>${escapeHtml(activeContact?.segment || 'Sin segmento')}</strong>
-                </div>
-                <div class="ems-meta-card">
-                  <span>Estado</span>
-                  <strong>${escapeHtml(activeContact ? getChatStatusLabel(activeContact) : 'Sin estado')}</strong>
-                </div>
-                <div class="ems-meta-card">
-                  <span>Canal</span>
-                  <strong>WhatsApp Meta</strong>
-                </div>
-                <div class="ems-meta-card ems-ai-card">
-                  <div class="ai-toggle-header">
-                    <span>Atención por IA</span>
-                    <span class="ai-toggle-badge ${isAiAssistedConversation(conversation.contact.id) ? 'is-on' : ''}">
-                      ${isAiAssistedConversation(conversation.contact.id) ? 'AI activo' : 'Manual'}
-                    </span>
-                  </div>
-                  <label class="ai-switch" aria-label="Activar atención por IA para esta conversación">
-                    <input
-                      type="checkbox"
-                      data-ai-toggle-conversation="${conversation.contact.id}"
-                      ${isAiAssistedConversation(conversation.contact.id) ? 'checked' : ''}
-                    />
-                    <span class="ai-slider"></span>
-                  </label>
-                </div>
-              </div>
-
-              <div class="ems-thread-shell">
-                ${
-                  state.conversationError
-                    ? `<div class="form-error">${escapeHtml(state.conversationError)}</div>`
-                    : ''
-                }
-                ${
-                  state.conversationState === 'loading'
-                    ? `<div class="empty-state loading-state">Cargando conversacion...</div>`
-                    : conversation.contact.id === 0
-                      ? `<div class="empty-state">Selecciona un contacto de la bandeja izquierda para abrir el chat.</div>`
-                      : sortedMessages.length > 0
-                        ? `
-                          <div class="ems-thread conversation-thread">
-                            ${sortedMessages
-                              .map(
-                                (message) => `
-                                  <article class="conversation-bubble ${
-                                    message.direction === 'inbound' ? 'is-inbound' : 'is-outbound'
-                                  }">
-                                    <div class="conversation-meta">
-                                      <strong>${message.direction === 'inbound' ? 'Cliente' : 'Equipo CRM'}</strong>
-                                      <span>${escapeHtml(formatConversationTimestamp(message.createdAt))}</span>
-                                    </div>
-                                    ${renderConversationMessageMedia(message)}
-                                    <div class="conversation-status">
-                                      <span>${escapeHtml(message.status)}</span>
-                                      <small>${escapeHtml(message.provider)}</small>
-                                    </div>
-                                  </article>
-                                `,
-                              )
-                              .join('')}
-                          </div>
-                        `
-                        : `
-                          <div class="empty-state">
-                            Aun no hay mensajes guardados para este cliente. Cuando envies mensajes por WhatsApp desde el CRM, apareceran aqui.
-                          </div>
-                        `
-                }
-              </div>
-            </div>
-
-            <form class="conversation-composer ems-composer ems-composer-panel" id="chat-composer-form">
-              <button class="conversation-composer-addon" type="button" aria-label="Adjuntar" disabled>+</button>
-              <textarea
-                id="chat-composer-input"
-                name="message"
-                rows="1"
-                placeholder="Escribe un mensaje"
-                ${activeContact ? '' : 'disabled'}
-              >${escapeHtml(state.sendMessageForm.contactId === activeContact?.id ? state.sendMessageForm.message : '')}</textarea>
-              <button
-                class="conversation-composer-send ems-send-btn"
-                type="submit"
-                ${!activeContact || state.sendMessageState === 'submitting' ? 'disabled' : ''}
-              >
-                ${state.sendMessageState === 'submitting' ? 'Enviando...' : 'Enviar'}
-              </button>
-            </form>
-          </section>
-        </div>
+          ${renderChatConversationPanel(ctx, {
+            conversation,
+            sortedMessages,
+            activeContact,
+            activeReference,
+            shouldShowAddContact,
+            activePhaseLabel,
+            activePhaseDescription,
+            activePauseRemaining,
+          })}        </div>
       </div>
     </section>
   `

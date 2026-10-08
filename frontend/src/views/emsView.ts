@@ -7,7 +7,6 @@ export const renderEmsView = (ctx: any) => {
     formatConversationTimestamp,
     getEmsStatusToneClass,
     getEmsSearchQueryForColumn,
-    getEmsMonthOptions,
     findContactByReferenceValue,
     getWhatsAppReference,
     getEmsReferenceChannelState,
@@ -18,7 +17,24 @@ export const renderEmsView = (ctx: any) => {
   const isSyncingEmsPipeline = state.emsPipelineSyncState === 'loading'
   const isEmsSyncError = state.emsPipelineSyncState === 'error' && Boolean(state.emsPipelineSyncError)
   const syncSummary = state.emsPipelineSyncSummary
-  const monthOptions = getEmsMonthOptions()
+  const todayParts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/La_Paz',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date())
+  const today = `${todayParts.find((part: any) => part.type === 'year')?.value}-${todayParts.find((part: any) => part.type === 'month')?.value}-${todayParts.find((part: any) => part.type === 'day')?.value}`
+  const departments = [
+    ['la-paz', 'La Paz'],
+    ['cochabamba', 'Cochabamba'],
+    ['santa-cruz', 'Santa Cruz'],
+    ['oruro', 'Oruro'],
+    ['potosi', 'Potosí'],
+    ['tarija', 'Tarija'],
+    ['chuquisaca', 'Chuquisaca'],
+    ['beni', 'Beni'],
+    ['pando', 'Pando'],
+  ]
 
   const getCardReferenceLabel = (reference: string) => {
     if (!reference || reference === 'Sin referencia') {
@@ -147,19 +163,33 @@ export const renderEmsView = (ctx: any) => {
         <div class="ems-control-header">
           <div class="ems-control-copy">
             <p class="section-kicker">Flujo y agrupacion de envios EMS por estados</p>
-            <h2>Tablero de Control EMS: De Recibido a Entregado</h2>
-            <p class="ems-control-subtitle">Organiza el flujo operativo, detecta cuellos de botella y da seguimiento visual a cada envio desde origen hasta entrega.</p>
+            <h2>Tablero de Control EMS</h2>
           </div>
           <div class="ems-control-actions">
-            <label class="ems-month-filter">
-              <span>Mes</span>
-              <select data-ems-month-filter>
-                <option value="all"${state.emsMonthFilter === 'all' ? ' selected' : ''}>Todos los meses</option>
-                ${monthOptions
-                  .map(
-                    (option: any) =>
-                      `<option value="${escapeHtml(option.value)}"${state.emsMonthFilter === option.value ? ' selected' : ''}>${escapeHtml(option.label)}</option>`,
-                  )
+            <label class="ems-date-filter">
+              <span>Desde</span>
+              <input
+                type="date"
+                data-ems-pipeline-date-start
+                value="${escapeHtml(state.emsPipelineDateStart)}"
+                max="${today}"
+              />
+            </label>
+            <label class="ems-date-filter">
+              <span>Hasta</span>
+              <input
+                type="date"
+                data-ems-pipeline-date-end
+                value="${escapeHtml(state.emsPipelineDateEnd)}"
+                max="${today}"
+              />
+            </label>
+            <label class="ems-date-filter ems-department-filter">
+              <span>Departamento del último movimiento</span>
+              <select data-ems-pipeline-department>
+                <option value="all"${state.emsPipelineDepartment === 'all' ? ' selected' : ''}>Todos los departamentos</option>
+                ${departments
+                  .map(([value, label]) => `<option value="${value}"${state.emsPipelineDepartment === value ? ' selected' : ''}>${label}</option>`)
                   .join('')}
               </select>
             </label>
