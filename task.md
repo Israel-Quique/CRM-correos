@@ -134,6 +134,33 @@ Meta Cloud API ──webhook──► Express (backend/index.js) ──► persi
   - **Archivos tocados:** `backend/index.js`, `task.md`.
   - **Resultado:** Cambio aplicado; falta levantar/verificar Ollama para prueba conversacional end-to-end.
 
+- **[2026-10-08] Agente:** GitHub Copilot
+  - **Acción:** Se ampliaron los tiempos máximos predeterminados de generación para dar al modelo general hasta 120 segundos y al modelo de tracking hasta 90 segundos antes de usar la respuesta de respaldo.
+  - **Configuración:** `AI_GENERAL_TIMEOUT_MS` y `AI_TRACKING_TIMEOUT_MS` siguen permitiendo ajustes; no estaban definidas en `.env` al realizar el cambio.
+  - **Archivos tocados:** `backend/index.js`, `task.md`.
+  - **Verificación:** `node --check backend/index.js` exitoso.
+  - **Resultado:** Aplicado; el backend debe reiniciarse para usar los nuevos tiempos.
+
+- **[2026-10-08] Agente:** GitHub Copilot
+  - **Acción:** Se corrigió el filtro de pausa por mensajes fuera de tema: los mensajes reconocidos como consultas de tarifas/envíos ya no se cuentan como no accionables aunque no mencionen explícitamente Correos, paquete o guía. Esto evita que solicitudes como enviar un paquete a China queden bloqueadas antes de llegar al flujo de cotización/IA.
+  - **Diagnóstico:** El mensaje recibido a las 18:42 fue omitido por `off-topic-pause-created`; el sistema creó una pausa de cuatro horas al contar dos mensajes seguidos como fuera de tema. No llegó a Ollama.
+  - **Archivos tocados:** `backend/index.js`, `task.md`.
+  - **Verificación:** `node --check backend/index.js` exitoso; la prueba de clasificación reconoció “mandar un paqute a china” como consulta de tarifa y no accionable-falso.
+  - **Resultado:** Aplicado; reiniciar el backend para activar la corrección.
+
+- **[2026-10-08] Agente:** GitHub Copilot
+  - **Acción:** Se corrigió la cotización internacional a China: como China no está en el catálogo EMS configurado, el bot ya no interpreta La Paz (el origen) como destino ni ofrece servicios nacionales; responde que no puede confirmar automáticamente la tarifa y recomienda verificarla con un asesor. También reconoce el texto `china4` enviado en el mensaje de prueba.
+  - **Diagnóstico:** La entrada se registró como consulta TARIFAS, pero el destino China no existía en `ems-destinations.json`; el parser reutilizó la única ciudad boliviana reconocida (La Paz) como origen y destino.
+  - **Archivos tocados:** `backend/index.js`, `backend/services/ems-calculator.js`, `backend/tests/ems-calculator.test.js`, `task.md`.
+  - **Verificación:** `node --check backend/index.js`, `node --check backend/services/ems-calculator.js`, `node --test backend/tests/ems-calculator.test.js` (25/25) y `git diff --check` exitosos. Prueba unitaria confirma `China4` como solicitud de envío internacional no cotizable automáticamente.
+  - **Resultado:** Aplicado; reiniciar el backend para activar el cambio.
+
+- **[2026-10-08] Agente:** GitHub Copilot
+  - **Acción:** Se prepara una alternativa para destinos internacionales no configurados: para China, el bot puede ofrecer revisar una cotización EMS hasta Rusia, que sí está en el catálogo. La respuesta aclara que Rusia es un destino distinto y que no incluye reenvío a China. Si el cliente acepta esa oferta, la lógica reutiliza el destino Rusia y sigue el flujo real de cotización EMS, solicitando el peso si falta.
+  - **Archivos tocados:** `backend/index.js`, `backend/services/ems-calculator.js`, `backend/tests/ems-calculator.test.js`, `task.md`.
+  - **Verificación:** `node --check backend/index.js`, `node --check backend/services/ems-calculator.js`, `node --test backend/tests/ems-calculator.test.js` (27/27) y `git diff --check` exitosos. Se confirmó que la API EMS calcula una cotización a Rusia con peso de prueba; no se guardó ni mostró el importe.
+  - **Resultado:** Aplicado; reiniciar backend para activar la oferta y su flujo de confirmación/cotización.
+
 ---
 
 ## 5. Intentos Fallidos y Soluciones Prohibidas (Memory Anti-Loop)
@@ -164,7 +191,7 @@ Meta Cloud API ──webhook──► Express (backend/index.js) ──► persi
 - `PORT=3001`, `VITE_API_URL=http://localhost:3001`, `CORS_ORIGIN`, `JSON_BODY_LIMIT=1mb`
 - Seed opcional: `SEED_ADMIN_NAME`, `SEED_ADMIN_EMAIL`, `SEED_ADMIN_PASSWORD`, `ENABLE_DEMO_LOGIN`, `DEMO_USER_EMAIL`
 - **WhatsApp Meta**: `WHATSAPP_META_ACCESS_TOKEN`, `WHATSAPP_META_PHONE_NUMBER_ID`, `WHATSAPP_META_BUSINESS_ACCOUNT_ID`, `WHATSAPP_META_API_VERSION=v23.0`, `WHATSAPP_META_SENDER_NUMBER`, `WHATSAPP_META_WEBHOOK_VERIFY_TOKEN`
-- **IA (Ollama)**: `AI_BASE_URL=http://localhost:11434`, `AI_MODEL`/`AI_GENERAL_MODEL=qwen2.5:7b`, `AI_ROUTER_MODEL=qwen2.5:0.5b`, `AI_TRACKING_MODEL=llama3.2:3b`, `AI_AUTO_REPLY=true`
+- **IA (Ollama)**: `AI_BASE_URL=http://localhost:11434`, `AI_MODEL`/`AI_GENERAL_MODEL=qwen2.5:7b`, `AI_ROUTER_MODEL=qwen2.5:0.5b`, `AI_TRACKING_MODEL=llama3.2:3b`, `AI_GENERAL_TIMEOUT_MS` (predeterminado 120000), `AI_TRACKING_TIMEOUT_MS` (predeterminado 90000), `AI_AUTO_REPLY=true`
 - **Modo prueba/automatización**: `WHATSAPP_TEST_MODE`, `WHATSAPP_TEST_MODE_NUMBER`, `WHATSAPP_AUTO_START_ON_DASHBOARD`, `WHATSAPP_STAGE_WATCHER_ENABLED`, `WHATSAPP_NEW_PACKAGE_WATCHER_ENABLED`, `WHATSAPP_NEW_PACKAGE_WELCOME_ENABLED`, `PACKAGE_PIPELINE_SYNC_INTERVAL_MS`, `PACKAGE_NEW_PACKAGE_WELCOME_INTERVAL_MS`, `PACKAGE_EVENT_CHANGE_SYNC_INTERVAL_MS`, `PACKAGE_FULL_EVENT_CHANGE_SYNC_INTERVAL_MS`
 - **APIs Correos**: `TRACKING_SQLSERVER_TOKEN`, `TRACKING_API_URL=https://dev.correos.gob.bo:18100`, `PAQUETES_CONTACTOS_API_URL`/`_TOKEN`, `PAQUETES_EVENTOS_API_URL`/`_TOKEN`, `DELIVERY_EXPRESS_TARIFF_API_URL`/`_TOKEN`, `EMS_NATIONAL_TARIFF_API_URL`/`_TOKEN`
 

@@ -15,6 +15,10 @@ import {
   inferEmsInternationalDestination,
   isFreshEmsRouteQuoteRequest,
   isEmsInternationalShipmentRequest,
+  isUnsupportedEmsInternationalShipmentRequest,
+  getAcceptedEmsAlternativeDestination,
+  getNearestConfiguredEmsDestination,
+  isEmsAlternativeDestinationAcceptance,
   isEmsWeightReply,
   isEmsWeightReplyMissingUnit,
   shouldForceEmsForWeightLimit,
@@ -439,6 +443,37 @@ test('detecta una solicitud nueva de envio internacional por pais', () => {
   assert.equal(isEmsInternationalShipmentRequest('Quiero mandar una encomienda a Estados Unidos'), true)
   assert.equal(isEmsInternationalShipmentRequest('Quisiera enviar un paquete a un lugar desconocido'), false)
   assert.equal(isEmsInternationalShipmentRequest('España'), false)
+})
+
+test('reconoce China como destino internacional sin tarifa EMS configurada', () => {
+  assert.equal(isUnsupportedEmsInternationalShipmentRequest('Buenas noches, quisiera mandar un paquete de La Paz a China4'), true)
+  assert.equal(isUnsupportedEmsInternationalShipmentRequest('Quiero enviar una encomienda a China'), true)
+  assert.equal(isUnsupportedEmsInternationalShipmentRequest('Quiero conversar sobre China'), false)
+})
+
+test('ofrece Rusia como alternativa configurada para una solicitud a China', () => {
+  assert.deepEqual(getNearestConfiguredEmsDestination('Quisiera mandar un paquete a China4'), {
+    name: 'Rusia',
+    code: 'dest_d_rusia',
+  })
+  assert.equal(getNearestConfiguredEmsDestination('Quisiera enviar a Japón'), null)
+})
+
+test('acepta confirmar la cotización EMS a Rusia solo después de ofrecerla', () => {
+  const conversation = [
+    'Cliente: Quiero mandar un paquete de La Paz a China',
+    'Equipo: China no figura en el tarifario EMS disponible. Rusia es una alternativa distinta que puedo revisar; cotizar hasta Rusia no incluye reenvío a China. ¿Quieres que cotice EMS hasta Rusia?',
+  ].join('\n')
+
+  assert.equal(isEmsAlternativeDestinationAcceptance({ text: 'Sí, por favor', conversation, destinationName: 'Rusia' }), true)
+  assert.equal(isEmsAlternativeDestinationAcceptance({ text: 'sí', conversation: 'Equipo: ¿Quieres cotizar EMS Internacional?', destinationName: 'Rusia' }), false)
+  assert.equal(isEmsAlternativeDestinationAcceptance({ text: 'no', conversation, destinationName: 'Rusia' }), false)
+  assert.deepEqual(getAcceptedEmsAlternativeDestination([
+    'Cliente: Quiero enviar un paquete a China',
+    'Equipo: China no figura en el tarifario EMS disponible. Rusia es una alternativa distinta que puedo revisar; cotizar hasta Rusia no incluye reenvío a China. ¿Quieres que cotice EMS hasta Rusia?',
+    'Cliente: Sí, por favor',
+    'Equipo: Para cotizar EMS Internacional, indícame el peso del paquete en kg.',
+  ].join('\n')), { name: 'Rusia', code: 'dest_d_rusia' })
 })
 
 test('resuelve una localidad internacional conocida a su país postal', () => {

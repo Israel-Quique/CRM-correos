@@ -22,8 +22,12 @@ import {
   inferEmsCalculatorDestinationCode,
   inferEmsInternationalDestination,
   inferEmsQuoteCategory,
+  getAcceptedEmsAlternativeDestination,
+  getNearestConfiguredEmsDestination,
+  isEmsAlternativeDestinationAcceptance,
   isFreshEmsRouteQuoteRequest,
   isEmsInternationalShipmentRequest,
+  isUnsupportedEmsInternationalShipmentRequest,
   isEmsWeightReply,
   isEmsWeightReplyMissingUnit,
   shouldForceEmsForWeightLimit,
@@ -336,8 +340,8 @@ const aiDefaults = {
   routerModel: process.env.AI_ROUTER_MODEL?.trim() ?? 'qwen2.5:0.5b',
   trackingModel: process.env.AI_TRACKING_MODEL?.trim() ?? 'llama3.2:3b',
   routerTimeoutMs: Number.parseInt(process.env.AI_ROUTER_TIMEOUT_MS || '2500', 10),
-  generalTimeoutMs: Number.parseInt(process.env.AI_GENERAL_TIMEOUT_MS || '6000', 10),
-  trackingTimeoutMs: Number.parseInt(process.env.AI_TRACKING_TIMEOUT_MS || '5000', 10),
+  generalTimeoutMs: Number.parseInt(process.env.AI_GENERAL_TIMEOUT_MS || '120000', 10),
+  trackingTimeoutMs: Number.parseInt(process.env.AI_TRACKING_TIMEOUT_MS || '90000', 10),
   systemPrompt:
     process.env.AI_SYSTEM_PROMPT?.trim() ??
     [
@@ -7698,6 +7702,7 @@ const isCorreosRelatedMessage = (messageBody) => {
 
 const isNonActionableCustomerMessage = (messageBody) =>
   !isGreetingMessage(messageBody) &&
+  !isTariffInquiryMessage(messageBody) &&
   (isLowSignalMessage(messageBody) || (!isCorreosRelatedMessage(messageBody) && !hasPackageCode(messageBody)))
 
 const getEditDistance = (firstValue, secondValue) => {
@@ -8785,6 +8790,19 @@ const getExternalEmsNationalServiceName = (rate, fallback = '') =>
   )
 
 const getTariffQuote = async ({ messageBody, recentConversation = '', skipMultipleCheck = false }) => {
+  const nearestDestinationAlternative =
+    getNearestConfiguredEmsDestination(messageBody) ||
+    getNearestConfiguredEmsDestination(getRecentCustomerConversationText(recentConversation))
+  const acceptedDestinationAlternative = nearestDestinationAlternative &&
+    isEmsAlternativeDestinationAcceptance({
+      text: messageBody,
+      conversation: recentConversation,
+      destinationName: nearestDestinationAlternative.name,
+    })
+  const selectedDestinationAlternative = acceptedDestinationAlternative
+    ? nearestDestinationAlternative
+    : getAcceptedEmsAlternativeDestination(recentConversation)
+
   if (!skipMultipleCheck && isMultipleTariffQuoteRequest(messageBody)) {
     return {
       matched: false,
@@ -8794,6 +8812,24 @@ const getTariffQuote = async ({ messageBody, recentConversation = '', skipMultip
       serviceKey: '',
       originKey: '',
       destinationKey: '',
+      deliveryMode: '',
+      effectiveDeliveryMode: '',
+      requestedDeliveryTime: false,
+      isNewPackageQuestion: false,
+    }
+  }
+
+  if (isUnsupportedEmsInternationalShipmentRequest(messageBody) && !acceptedDestinationAlternative) {
+    return {
+      matched: false,
+      missingFields: [],
+      invalidReason: 'unsupported_international_destination',
+      alternativeDestination: nearestDestinationAlternative,
+      weightKg: null,
+      serviceKey: 'ems',
+      originKey: inferTariffOriginKey(messageBody),
+      destinationKey: 'china',
+      emsCategory: 'EMS INT',
       deliveryMode: '',
       effectiveDeliveryMode: '',
       requestedDeliveryTime: false,
@@ -8844,14 +8880,17 @@ const getTariffQuote = async ({ messageBody, recentConversation = '', skipMultip
   const currentDeliveryMode = inferDeliveryExpressMode(messageBody)
   const currentServiceKey = inferTariffServiceKey(messageBody)
   const recentCustomerServiceKey = inferRecentCustomerTariffServiceKey(recentConversation)
-  const isFreshInternationalShipmentRequest = isEmsInternationalShipmentRequest(messageBody)
+  const isFreshInternationalShipmentRequest =
+    isEmsInternationalShipmentRequest(messageBody) || Boolean(acceptedDestinationAlternative)
   const recentEmsFollowUpCategory = isEmsTariffFollowUp(messageBody, recentConversation)
     ? inferEmsCategoryFromPendingPrompt(recentConversation)
     : ''
   const needsEmsWeightUnitClarification = isEmsWeightReplyMissingUnit(messageBody, recentConversation)
-  const calculatorText = isFreshInternationalShipmentRequest
-    ? messageBody
-    : [customerLookupText, messageBody].filter(Boolean).join('\n')
+  const calculatorText = selectedDestinationAlternative
+    ? `Quiero enviar un paquete por EMS Internacional a ${selectedDestinationAlternative.name}`
+    : isFreshInternationalShipmentRequest
+      ? messageBody
+      : [customerLookupText, messageBody].filter(Boolean).join('\n')
   const emsCalculatorEndpoint = getEmsCalculatorEndpoint()
   const recentQuotedTariffContext = inferRecentQuotedTariffContext(recentConversation)
   const recentQuotedDeliveryMode = recentQuotedTariffContext.deliveryMode || inferRecentQuotedDeliveryMode(recentConversation)
@@ -9447,6 +9486,13 @@ const buildTariffReply = async (tariffQuote, { messageBody = '' } = {}) => {
       ),
       { serviceName: 'Nacional Express' },
     )
+  }
+
+  if (tariffQuote.invalidReason === 'unsupported_international_destination') {
+    const alternativeName = tariffQuote.alternativeDestination?.name
+    return alternativeName
+      ? `China no figura en el tarifario EMS disponible. Rusia es una alternativa distinta que puedo revisar; cotizar hasta Rusia no incluye reenvío a China. ¿Quieres que cotice EMS hasta ${alternativeName}?`
+      : 'China no figura en el tarifario EMS disponible. No puedo confirmar cobertura ni precio para ese destino; consulta con un asesor de Correos.'
   }
 
   if (tariffQuote.invalidReason === 'senior_discount_unavailable') {
@@ -11535,9 +11581,25 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
         }).catch(() => {})
       }
     }
+    const conversationDestinationAlternative = getNearestConfiguredEmsDestination(
+      getRecentCustomerConversationText(recentConversation),
+    )
+    const isConfirmingDestinationAlternative =
+      conversationDestinationAlternative &&
+      isEmsAlternativeDestinationAcceptance({
+        text: messageBody,
+        conversation: recentConversation,
+        destinationName: conversationDestinationAlternative.name,
+      })
+    const acceptedConversationDestinationAlternative =
+      getAcceptedEmsAlternativeDestination(recentConversation)
     const emsTariffFollowUp =
       !isInjectionAttempt &&
-      (isEmsTariffFollowUp(messageBody, recentConversation) || isPendingEmsWeightReply)
+      (
+        isEmsTariffFollowUp(messageBody, recentConversation) ||
+        isPendingEmsWeightReply ||
+        Boolean(isConfirmingDestinationAlternative || acceptedConversationDestinationAlternative)
+      )
     const tariffQuote =
       !isInjectionAttempt &&
       !isExplicitPackageTrackingRequest &&

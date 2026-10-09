@@ -8,6 +8,9 @@ const emsDestinations = JSON.parse(
 )
 const NATIONAL_DESTINATIONS = emsDestinations.national
 const INTERNATIONAL_DESTINATIONS = emsDestinations.international
+const UNSUPPORTED_DESTINATION_ALTERNATIVES = [
+  { aliases: ['china', 'republica popular china'], destinationCode: 'dest_d_rusia' },
+]
 const INTERNATIONAL_ZONE_LABELS = {
   a: 'Sudamérica',
   b: 'Centroamérica y el Caribe',
@@ -115,6 +118,85 @@ export const isEmsInternationalShipmentRequest = (text = '') => {
   return Boolean(inferEmsInternationalDestination(text).destinationCode) &&
     /\b(quiero|quisiera|necesito|deseo|voy a|enviar|envio|mandar|llevar)\b/.test(normalized) &&
     /\b(paquete|paquetes|encomienda|envio)\b/.test(normalized)
+}
+
+export const isUnsupportedEmsInternationalShipmentRequest = (text = '') => {
+  const normalized = normalizeText(text)
+  return /\bchina\d*\b/.test(normalized) &&
+    /\b(quiero|quisiera|necesito|deseo|voy a|enviar|envio|mandar|llevar)\b/.test(normalized) &&
+    /\b(paquete|paquetes|encomienda|envio)\b/.test(normalized)
+}
+
+export const getNearestConfiguredEmsDestination = (text = '') => {
+  const normalized = normalizeText(text)
+  const alternative = UNSUPPORTED_DESTINATION_ALTERNATIVES.find(({ aliases }) =>
+    aliases.some((alias) => matchPhrase(normalized, alias) || new RegExp(`\\b${alias}\\d+\\b`).test(normalized)),
+  )
+  if (!alternative) return null
+
+  const destination = INTERNATIONAL_DESTINATIONS.find((entry) => entry.code === alternative.destinationCode)
+  return destination ? { name: destination.name, code: destination.code } : null
+}
+
+export const isEmsAlternativeDestinationAcceptance = ({
+  text = '',
+  conversation = '',
+  destinationName = '',
+} = {}) => {
+  const assistantPrompt = String(conversation)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => /^Equipo:/i.test(line))
+    .map((line) => line.replace(/^Equipo:\s*/i, ''))
+    .at(-1)
+  if (!assistantPrompt || !destinationName) return false
+
+  const normalizedPrompt = normalizeText(assistantPrompt)
+  const expectedPrompt = `quieres que cotice ems hasta ${normalizeText(destinationName)}`
+  const normalizedReply = normalizeText(text).replace(/[.!?¿¡,]/g, '').trim()
+
+  return normalizedPrompt.includes(expectedPrompt) &&
+    /^(si|claro|dale|perfecto|ok|de acuerdo|por favor|si por favor|claro por favor|quiero|cotiza|cotizar)$/.test(normalizedReply)
+}
+
+export const getAcceptedEmsAlternativeDestination = (conversation = '') => {
+  const lines = String(conversation).split('\n').map((line) => line.trim())
+  const lastAssistantPrompt = lines
+    .filter((line) => /^Equipo:/i.test(line))
+    .at(-1)
+    ?.replace(/^Equipo:\s*/i, '')
+  if (!lastAssistantPrompt) return null
+
+  const normalizedLastPrompt = normalizeText(lastAssistantPrompt)
+  if (!/\bems internacional\b/.test(normalizedLastPrompt) || !/\bpeso\b/.test(normalizedLastPrompt)) {
+    return null
+  }
+
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (!/^Equipo:/i.test(lines[index])) continue
+    const prompt = lines[index].replace(/^Equipo:\s*/i, '')
+    const normalizedPrompt = normalizeText(prompt)
+    const countryMatch = normalizedPrompt.match(/quieres que cotice ems hasta ([a-z ]+)\s*$/)
+    if (!countryMatch) continue
+
+    const acceptanceLine = lines.slice(index + 1).find((line) => /^Cliente:/i.test(line))
+    const countryName = countryMatch[1].trim().replace(/\b\w/g, (letter) => letter.toUpperCase())
+    if (!acceptanceLine || !isEmsAlternativeDestinationAcceptance({
+      text: acceptanceLine.replace(/^Cliente:\s*/i, ''),
+      conversation: `Equipo: ${prompt}`,
+      destinationName: countryName,
+    })) {
+      return null
+    }
+
+    const destination = INTERNATIONAL_DESTINATIONS.find((entry) =>
+      normalizeText(entry.name) === normalizeText(countryName) ||
+      entry.aliases.some((alias) => normalizeText(alias) === normalizeText(countryName)),
+    )
+    return destination ? { name: destination.name, code: destination.code } : null
+  }
+
+  return null
 }
 
 export const inferEmsCalculatorCategory = (text = '') => {
