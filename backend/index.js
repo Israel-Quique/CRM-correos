@@ -34,12 +34,15 @@ import {
 } from './services/ems-calculator.js'
 import { isPackageTrackingRequest, selectLatestPackageEntry } from './services/whatsapp-intent.js'
 import {
+  buildInternationalArrivalMessage,
   buildPackageEventSignature,
   buildPackageReturnToOriginMessage,
   getPackageAutomationNextDelayMs,
   getWhatsAppTrackingRetrySchedule,
   getNewPackageWelcomePhoneCandidates,
   getTrackingPackageRecipientPhoneCandidates,
+  hasInternationalArrivalEvent,
+  isInternationalArrivalEvent,
   isEligibleNewPackageWelcomeEntry,
   isPackageEventNotificationEligible,
   isPackageReturnToOriginEvent,
@@ -6207,6 +6210,11 @@ const fetchMatchingPackageContext = async (reference, packageCode = '') => {
   const packageEventsPayload = primaryPackageCode ? await fetchPackageEventsForCode(primaryPackageCode) : null
   const packageEvents = Array.isArray(packageEventsPayload?.data) ? packageEventsPayload.data : []
   const packageEventsText = buildPackageEventsTimelineText(packageEvents, primaryPackageCode)
+  const internationalArrivalConfirmed = hasInternationalArrivalEvent([
+    ...matchingTrackingItems.flatMap((item) => (Array.isArray(item?.eventos) ? item.eventos : [])),
+    ...packageEvents,
+    mostAdvancedEntry?.latestEventLabel,
+  ])
 
   return setCachedValue(packageContextCache, cacheKey, {
     matched: matchingTrackingItems.length > 0 || matchingContactItems.length > 0,
@@ -6234,6 +6242,7 @@ const fetchMatchingPackageContext = async (reference, packageCode = '') => {
     packageEvents,
     packageEventsText,
     packageEventsCount: packageEvents.length,
+    internationalArrivalConfirmed,
     lookupUnavailable: externalLookupUnavailable && !matchingTrackingItems.length && !matchingContactItems.length,
     trackingLookupUnavailable:
       trackingLookupUnavailable && !matchingTrackingItems.length,
@@ -7363,7 +7372,11 @@ const buildFriendlyFallbackAgentReply = ({ contact, messageBody, currentStatus, 
   const originBranch = getPackageOriginBranch(packageContext)
   const destinationBranch = getPackageDestinationBranch(packageContext)
   const originDisplay = originDepartment || originBranch?.label || originLabel || 'origen'
-  const destinationDisplay = destinationDepartment || destinationBranch?.label || destinationLabel || destinationAddress || 'destino'
+  const destinationCandidate = destinationDepartment || destinationBranch?.label || destinationLabel || destinationAddress
+  const destinationDisplay =
+    destinationCandidate && !/^(sin destino|sin dato|sin ubicacion|no disponible)$/i.test(destinationCandidate)
+      ? destinationCandidate
+      : ''
   const originLocationText = originBranch?.address ? `${originDisplay} (${originBranch.address})` : originDisplay
   const destinationLocationText = destinationBranch?.address
     ? `${destinationDisplay} (${destinationBranch.address})`
@@ -7392,6 +7405,23 @@ const buildFriendlyFallbackAgentReply = ({ contact, messageBody, currentStatus, 
     return formatPackageHistoryReply(packageContext)
   }
 
+  const latestPackageEvent = Array.isArray(packageContext?.packageEvents)
+    ? packageContext.packageEvents
+        .slice()
+        .sort((firstEvent, secondEvent) => getPackageEventTimestampValue(secondEvent) - getPackageEventTimestampValue(firstEvent))[0]
+    : null
+  const internationalArrivalMessage = packageContext?.matched
+    ? buildInternationalArrivalMessage({
+        packageCode,
+        eventLabel:
+          normalizeReference(packageContext.currentLatestEventLabel) ||
+          (latestPackageEvent ? getPackageEventTitle(latestPackageEvent) : ''),
+        arrivalConfirmed:
+          packageContext.internationalArrivalConfirmed ||
+          hasInternationalArrivalEvent(packageContext.packageEvents),
+      })
+    : ''
+
   if (packageContext?.matched && packageContext.stage === 'delivered') {
     return `RevisÃ© la guÃ­a ${packageCode || 'indicada'} ðŸ“¦ y figura como entregada âœ…${destinationLocationText ? ` en ${destinationLocationText} ðŸ“` : ''}. Si necesitas mÃ¡s detalle sobre la entrega, puedo ayudarte a revisarlo ðŸ˜Š.`
   }
@@ -7404,11 +7434,15 @@ const buildFriendlyFallbackAgentReply = ({ contact, messageBody, currentStatus, 
     return `RevisÃ© la guÃ­a ${packageCode || 'indicada'} ðŸ“¦ y figura asignada a cartero ðŸ›µ${destinationLocationText ? ` en ${destinationLocationText} ðŸ“` : ''}. EstÃ¡ en proceso de reparto ðŸšš; no aparece como entregada todavÃ­a â³.`
   }
 
+  if (internationalArrivalMessage) {
+    return internationalArrivalMessage
+  }
+
   if (packageContext?.matched && packageContext.stage === 'transit') {
     return [
       `Â¡Hola, ${contactName}! ðŸ‘‹ Muchas gracias por escribirnos.`,
       '',
-      `ðŸšš Tu paquete estÃ¡ en trÃ¡nsito con destino a ${destinationDisplay} ðŸ“¦. Seguimos monitoreando su avance ðŸ”Ž y te avisaremos cuando haya un nuevo movimiento ðŸ“².`,
+      `ðŸšš Tu paquete estÃ¡ en trÃ¡nsito${destinationDisplay ? ` con destino a ${destinationDisplay}` : ''} ðŸ“¦. Seguimos monitoreando su avance ðŸ”Ž y te avisaremos cuando haya un nuevo movimiento ðŸ“².`,
     ].join('\n')
   }
 
@@ -7481,6 +7515,10 @@ const getFriendlyPackageEventTitle = (event) => {
   const rawTitle = normalizeReference(getPackageEventTitle(event))
   const normalized = normalizeIntentText(rawTitle)
 
+  if (isInternationalArrivalEvent(rawTitle)) {
+    return 'Llegó a Bolivia; recibido en oficina de cambio 📥'
+  }
+
   if (normalized.includes('recibido') && normalized.includes('cliente')) {
     return 'Paquete recibido en origen 📥'
   }
@@ -7535,6 +7573,10 @@ const getFriendlyPackageEventTitle = (event) => {
 const getFriendlyPackageCurrentStatus = (packageContext, latestEvent) => {
   const stage = normalizeReference(packageContext?.stage)
   const latestTitle = normalizeIntentText(getPackageEventTitle(latestEvent))
+
+  if (isInternationalArrivalEvent(latestTitle)) {
+    return 'Llegó a Bolivia y continúa su procesamiento.'
+  }
 
   if (stage === 'delivered' || latestTitle.includes('entregado')) {
     return 'Entregado.'

@@ -16,6 +16,46 @@ const normalizePackageStatusText = (value) =>
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
 
+export const isInternationalArrivalEvent = (eventLabel = '') => {
+  const eventText = normalizePackageStatusText(eventLabel)
+  return (
+    eventText.includes('oficina de cambio') &&
+    !/\b(salida|despacho de salida|outbound)\b/.test(eventText) &&
+    /\b(entrada|recibir|recibido|recepcion)\b/.test(eventText)
+  )
+}
+
+export const hasInternationalArrivalEvent = (events = []) =>
+  events.some((event) => {
+    const eventLabel =
+      typeof event === 'string'
+        ? event
+        : [
+            event?.nombre,
+            event?.evento_api,
+            event?.evento_original,
+            event?.movimiento_bolivia,
+            event?.detalle,
+            event?.event_name,
+          ]
+            .filter(Boolean)
+            .join(' ')
+    return isInternationalArrivalEvent(eventLabel)
+  })
+
+export const buildInternationalArrivalMessage = ({
+  packageCode = '',
+  eventLabel = '',
+  arrivalConfirmed = false,
+}) => {
+  const eventConfirmsArrival = isInternationalArrivalEvent(eventLabel)
+  if (!arrivalConfirmed && !eventConfirmsArrival) return ''
+
+  const code = String(packageCode ?? '').trim()
+  const subject = code ? `La guía *${code}*` : 'Tu paquete'
+  return `¡Buenas noticias! ${subject} ya llegó a Bolivia y continúa su proceso de clasificación y distribución. El sistema todavía no muestra una sucursal de destino ni disponibilidad para recojo.`
+}
+
 export const isPackageReturnToOriginEvent = ({ eventLabel = '', eventSignature = '' }) => {
   const eventText = normalizePackageStatusText(`${eventLabel} ${eventSignature}`)
   const indicatesReturn = ['devolucion', 'retorn', 'devuelt', 'regres'].some((indicator) =>

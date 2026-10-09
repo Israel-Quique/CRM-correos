@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  buildInternationalArrivalMessage,
   buildPackageReturnToOriginMessage,
   buildPackageEventSignature,
   getPackageAutomationNextDelayMs,
@@ -11,6 +12,8 @@ import {
   WHATSAPP_TRACKING_RETRY_WINDOW_MS,
   getPackageAutomationPollIntervalMs,
   getTrackingPackageRecipientPhoneCandidates,
+  hasInternationalArrivalEvent,
+  isInternationalArrivalEvent,
   isEligibleNewPackageWelcomeEntry,
   isPackageEventNotificationEligible,
   isPackageReturnToOriginEvent,
@@ -32,6 +35,34 @@ test('programa reintentos de tracking cada 15 minutos y vence a las 24 horas', (
   assert.equal(WHATSAPP_TRACKING_RETRY_WINDOW_MS, 24 * 60 * 60 * 1000)
   assert.equal(schedule.nextAttemptAt.getTime(), createdAt + 15 * 60 * 1000)
   assert.equal(schedule.expiresAt.getTime(), createdAt + 24 * 60 * 60 * 1000)
+})
+
+test('identifica la recepción de entrada en oficina de cambio como llegada a Bolivia', () => {
+  const eventLabel = 'Recibir envío en oficina de cambio (entrada)'
+  const expectedMessage =
+    '¡Buenas noticias! La guía *EY592031552US* ya llegó a Bolivia y continúa su proceso de clasificación y distribución. El sistema todavía no muestra una sucursal de destino ni disponibilidad para recojo.'
+
+  assert.equal(isInternationalArrivalEvent(eventLabel), true)
+  assert.equal(hasInternationalArrivalEvent([{ evento_api: eventLabel }]), true)
+  assert.equal(
+    buildInternationalArrivalMessage({ packageCode: 'EY592031552US', eventLabel }),
+    expectedMessage,
+  )
+  assert.equal(
+    buildInternationalArrivalMessage({
+      packageCode: 'EY592031552US',
+      eventLabel: 'Paquete en tránsito',
+      arrivalConfirmed: true,
+    }),
+    expectedMessage,
+  )
+})
+
+test('no infiere llegada a Bolivia por un evento de salida o por tener una guía registrada', () => {
+  assert.equal(isInternationalArrivalEvent('Despacho desde oficina de cambio (salida)'), false)
+  assert.equal(isInternationalArrivalEvent('Recibir envío en oficina de cambio (salida)'), false)
+  assert.equal(hasInternationalArrivalEvent([{ evento_api: 'Despacho desde oficina de cambio (salida)' }]), false)
+  assert.equal(buildInternationalArrivalMessage({ packageCode: 'EY592031552US' }), '')
 })
 
 test('en modo de prueba envía solo al número autorizado vinculado al paquete', () => {

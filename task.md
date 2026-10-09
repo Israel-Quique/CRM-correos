@@ -2249,3 +2249,22 @@ Al finalizar, recargar `http://localhost:5173/internacionales-pipeline` y pulsar
 - `npm run build` del CRM: compilacion TypeScript y build de Vite exitosos.
 - Diagnosticos del editor para `frontend/src/main.ts` y `frontend/src/views/internationalPackagesView.ts`: sin errores.
 - `git diff --check` para ambos archivos del frontend: exitoso.
+
+## Correccion 2026-10-09: guia internacional recibida en Bolivia
+
+### Caso reportado
+- Guia: `EY592031552US`.
+- La fila muestra origen `United States of America (the)`, ultimo evento `Recibir envío en oficina de cambio (entrada)`, ubicacion `Sin dato` y peso `2.565 Kg`.
+- El mensaje de WhatsApp indicaba que el paquete estaba en la sucursal del pais de origen y que saldria en un despacho futuro hacia `Sin destino`, aunque el ultimo movimiento confirma la llegada a Bolivia.
+
+### Cambio aplicado
+- `backend/services/whatsapp-package-automation.js`: identifica la llegada a partir del evento de recepcion de entrada en oficina de cambio; la misma respuesta indica que llego a Bolivia y que continua el procesamiento, sin inventar sucursal ni disponibilidad de recojo.
+- `backend/index.js`: la confirmacion se calcula sobre todos los movimientos disponibles en Tracking y en el historial de eventos, no solo sobre la etiqueta elegida como ultimo movimiento. Asi, un estado concurrente de transito no vuelve a presentar el paquete en el pais de origen.
+- `backend/index.js`: los mensajes de transito omiten el destino cuando SITRA lo entrega como `Sin destino`, en vez de incluir ese texto como si fuera un destino real.
+- El historial identifica el evento de entrada y el mensaje normal de seguimiento evita afirmar que el paquete ya esta disponible para entrega.
+- No se infiere llegada por el mero registro de una guia y se excluyen movimientos de salida.
+
+### Verificacion
+- `node --test backend/tests/whatsapp-package-automation.test.js`: validar el evento de entrada, la persistencia de la confirmacion cuando el ultimo movimiento dice transito y el rechazo de eventos de salida.
+- `node --check backend/index.js` y `backend/services/whatsapp-package-automation.js`.
+- `git diff --check` para los archivos modificados.
