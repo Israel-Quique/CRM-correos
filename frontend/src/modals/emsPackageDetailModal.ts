@@ -8,15 +8,16 @@ export const renderEmsPackageDetailModal = (ctx: any) => {
     getEmsStatusToneClass,
     getEmsStatusLabel,
     findContactByWhatsAppReferenceValue,
+    getEmsReferenceChannelState,
   } = ctx
 
   if (!state.isEmsPackageDetailModalOpen || !state.selectedEmsPackageDetailId) {
     return ''
   }
 
-  const packageCard = ctx
-    .getEmsApiStatusPackages()
-    .all.find((card: any) => card.id === state.selectedEmsPackageDetailId)
+  const packageCard = Object.values(state.emsPipelineColumns ?? {})
+    .flatMap((pageState: any) => pageState?.items ?? [])
+    .find((card: any) => card.id === state.selectedEmsPackageDetailId)
 
   if (!packageCard) {
     return ''
@@ -24,11 +25,14 @@ export const renderEmsPackageDetailModal = (ctx: any) => {
 
   const getParticipantInfo = (reference: string) => {
     const contact = findContactByWhatsAppReferenceValue(reference)
+    const channelState = getEmsReferenceChannelState(reference, contact)
 
     return {
       contact,
       hasWhatsApp: Boolean(contact?.id),
-      label: contact?.id ? 'WhatsApp disponible' : 'Solo telefono',
+      label: channelState.label,
+      toneClass: channelState.toneClass,
+      isCellPhone: channelState.isCellPhone,
     }
   }
 
@@ -46,7 +50,7 @@ export const renderEmsPackageDetailModal = (ctx: any) => {
 
     return `
       <div class="ems-package-detail-muted">
-        <span>${escapeHtml(label)} sin WhatsApp</span>
+        <span>${escapeHtml(label)} sin contacto vinculado</span>
         <small>${escapeHtml(reference || 'Sin referencia')}</small>
       </div>
     `
@@ -85,24 +89,32 @@ export const renderEmsPackageDetailModal = (ctx: any) => {
           <section class="ems-package-detail-card">
             <div class="ems-package-detail-card-head">
               <span class="ems-package-detail-label">Remitente</span>
-              <span class="ems-package-detail-channel-state ${senderInfo.hasWhatsApp ? 'is-whatsapp' : 'is-phone'}">
+              <span class="ems-package-detail-channel-state ${senderInfo.toneClass}">
                 ${escapeHtml(senderInfo.label)}
               </span>
             </div>
             <strong>${escapeHtml(packageCard.senderName)}</strong>
             <small>${escapeHtml(packageCard.senderReference)}</small>
-            ${renderReferenceAction(senderInfo.contact, 'conversacion del remitente', packageCard.senderReference)}
+            ${renderReferenceAction(
+              senderInfo.contact,
+              senderInfo.isCellPhone ? 'celular del remitente' : 'conversacion del remitente',
+              packageCard.senderReference,
+            )}
           </section>
           <section class="ems-package-detail-card">
             <div class="ems-package-detail-card-head">
               <span class="ems-package-detail-label">Destinatario</span>
-              <span class="ems-package-detail-channel-state ${recipientInfo.hasWhatsApp ? 'is-whatsapp' : 'is-phone'}">
+              <span class="ems-package-detail-channel-state ${recipientInfo.toneClass}">
                 ${escapeHtml(recipientInfo.label)}
               </span>
             </div>
             <strong>${escapeHtml(packageCard.recipientName)}</strong>
             <small>${escapeHtml(packageCard.recipientReference)}</small>
-            ${renderReferenceAction(recipientInfo.contact, 'conversacion del destinatario', packageCard.recipientReference)}
+            ${renderReferenceAction(
+              recipientInfo.contact,
+              recipientInfo.isCellPhone ? 'celular del destinatario' : 'conversacion del destinatario',
+              packageCard.recipientReference,
+            )}
           </section>
         </div>
 

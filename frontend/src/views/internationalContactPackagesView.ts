@@ -114,18 +114,6 @@ export const renderInternationalContactPackagesView = (ctx: any) => {
                 .join('')}
             </select>
           </label>
-          <label class="field-control compact-field">
-            <span>Estado</span>
-            <select id="contact-packages-status-filter">
-              <option value="all" ${state.contactPackagesStatusFilter === 'all' ? 'selected' : ''}>Todos los estados</option>
-              ${getContactPackageStatusOptions()
-                .map(
-                  (status) =>
-                    `<option value="${escapeHtml(status)}" ${state.contactPackagesStatusFilter === status ? 'selected' : ''}>${escapeHtml(status)}</option>`,
-                )
-                .join('')}
-            </select>
-          </label>
           ${
             isLookupContactResult
               ? '<button class="secondary-btn" id="clear-package-code-lookup-filter" type="button">Limpiar filtro</button>'
@@ -148,7 +136,6 @@ export const renderInternationalContactPackagesView = (ctx: any) => {
               <th>Código</th>
               <th>Remitente</th>
               <th>Destinatario</th>
-              <th>Estado</th>
               <th>Lugar destino</th>
               <th>Tipo</th>
               <th>Fecha</th>

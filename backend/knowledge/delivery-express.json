@@ -1,0 +1,36 @@
+{
+  "serviceKey": "delivery_express",
+  "name": "Delivery Express",
+  "description": "Entrega rapida de paquetes a nivel nacional.",
+  "coverage": {
+    "allowed": "Capitales y zonas urbanas habilitadas a nivel nacional.",
+    "notAllowed": "No aplica para provincia, comunidades ni municipios fuera de cobertura urbana.",
+    "provinceKeywords": ["provincia", "provincial", "comunidad", "municipio", "achacachi"]
+  },
+  "limits": {
+    "maxWeightKg": 5
+  },
+  "modes": {
+    "puerta_a_puerta": {
+      "label": "puerta a puerta",
+      "description": "Recogemos el paquete en la casa del remitente y lo entregamos en el domicilio destino."
+    },
+    "puerta_a_ventanilla": {
+      "label": "puerta a ventanilla",
+      "description": "Recogemos el paquete en la casa del remitente y lo dejamos disponible en una sucursal destino."
+    },
+    "ventanilla_a_ventanilla": {
+      "label": "ventanilla a ventanilla",
+      "description": "El remitente deja el paquete en una sucursal y el destinatario lo recoge en una sucursal destino."
+    }
+  },
+  "rules": [
+    "Si el paquete excede 5 kg, no cotizar Delivery Express; orientar a EMS Nacional e Internacional.",
+    "Si el destino es provincia, comunidad o municipio fuera de cobertura urbana, no cotizar Delivery Express; orientar a EMS Nacional.",
+    "Si falta modalidad, pedir puerta a puerta, puerta a ventanilla o ventanilla a ventanilla.",
+    "Si el cliente pide ventanilla a puerta, no invertir ni asumir puerta a ventanilla; esa modalidad no existe y se debe pedir aclaracion.",
+    "Si el cliente pide recojo en casa y entrega a domicilio, clasificar como puerta_a_puerta.",
+    "Si el cliente pide recojo en casa y entrega en sucursal, clasificar como puerta_a_ventanilla.",
+    "Si el cliente deja en sucursal y el destinatario recoge en sucursal, clasificar como ventanilla_a_ventanilla."
+  ]
+}

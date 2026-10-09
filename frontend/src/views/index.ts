@@ -1,4 +1,4 @@
-﻿// @ts-nocheck
+// @ts-nocheck
 
 export { renderContactsView } from './contactsView'
 export { renderChatView } from './chatView'
@@ -8,6 +8,7 @@ export { renderEmsView } from './emsView'
 export { renderInternationalPackagesView } from './internationalPackagesView'
 export { renderInternationalContactPackagesView } from './internationalContactPackagesView'
 export { renderInternationalPipelineView } from './internationalPipelineView'
+export { renderInternationalScannerView } from './internationalScannerView'
 export { renderProntsView } from './prontsView'
 export { renderLogsView } from './logsView'
-
+export { renderSettingsView } from './settingsView'

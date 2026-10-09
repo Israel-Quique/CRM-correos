@@ -1,4 +1,4 @@
-﻿import './style.css'
+import './style.css'
 import 'flag-icons/css/flag-icons.min.css'
 import { parsePhoneNumberFromString } from 'libphonenumber-js'
 import type { CountryCode } from 'libphonenumber-js'
@@ -9,6 +9,7 @@ type ViewKey =
   | 'ems'
   | 'internacionales'
   | 'internacionales-pipeline'
+  | 'internacionales-tablero'
   | 'internacionales-paquetes'
   | 'pronts-nacional'
   | 'pronts-internacional'
@@ -17,12 +18,13 @@ type ViewKey =
   | 'agrupaciones'
   | 'usuarios'
   | 'logs'
+  | 'configuraciones'
 
 type MenuGroupKey = 'ems' | 'internacionales' | 'clientes' | 'usuarios' | 'sistema' | 'marketing'
 
-type EmsStatusFilter = 'all' | 'received' | 'transit' | 'regional' | 'courier' | 'delivered'
+type EmsStatusFilter = 'all' | 'paused' | 'received' | 'transit' | 'regional' | 'courier' | 'delivered' | 'cancelled'
 
-type BaseEmsColumnKey = Exclude<EmsStatusFilter, 'all'>
+type BaseEmsColumnKey = Exclude<EmsStatusFilter, 'all' | 'paused'>
 
 type EmsColumnKey = BaseEmsColumnKey
 
@@ -42,6 +44,7 @@ type ProntsColumnConfig = {
 type PipelineColumnConfig = {
   title: string
   helper: string
+  allowedStates?: string[]
 }
 
 type CustomPipelineColumnConfig = PipelineColumnConfig & {
@@ -91,6 +94,20 @@ type Contact = {
   updatedAt: string
   lastMessageText?: string | null
   lastMessageDirection?: string | null
+  lastMessageAt?: string | null
+  autoReplyPause?: {
+    isPaused: boolean
+    pausedUntil: string | null
+    reason: string | null
+  }
+}
+
+type ChatListPagination = {
+  items: Contact[]
+  currentPage: number
+  totalPages: number
+  totalItems: number
+  pageSize: number
 }
 
 type InternationalPackage = {
@@ -128,6 +145,7 @@ type TrackingApiPackage = {
   remitente?: {
     nombre?: string | null
     telefono?: string | null
+    direccion?: string | null
   } | null
   destinatario?: {
     nombre?: string | null
@@ -137,6 +155,11 @@ type TrackingApiPackage = {
   eventos?: Array<{
     fecha?: string | null
     codigo_evento?: number | null
+    evento_id?: number | null
+    event_code?: number | null
+    event_type_cd?: number | null
+    event_id?: number | null
+    nombre?: string | null
     evento_original?: string | null
     evento_api?: string | null
     oficina?: string | null
@@ -144,19 +167,29 @@ type TrackingApiPackage = {
     movimiento_bolivia?: string | null
   }>
   origen:
-    | {
-        codigo: string | null
-        nombre: string | null
-        telefono?: string | null
-      }
-    | string
+  | {
+    codigo: string | null
+    nombre: string | null
+    telefono?: string | null
+    direccion?: string | null
+  }
+  | string
   destino:
-    | {
-        codigo: string | null
-        nombre: string | null
-        telefono?: string | null
-      }
-    | string
+  | {
+    codigo: string | null
+    nombre: string | null
+    telefono?: string | null
+  }
+  | string
+}
+
+type TrackingApiEvent = NonNullable<TrackingApiPackage['eventos']>[number]
+
+type TrackingApiStateOption = {
+  value: string
+  label: string
+  count: number
+  sampleCode: string
 }
 
 type ContactPackagesApiItem = {
@@ -177,21 +210,22 @@ type ContactPackagesApiItem = {
     direccion?: string | null
   } | null
   origen?:
-    | {
-        nombre?: string | null
-        telefono?: string | null
-      }
-    | string
-    | null
+  | {
+    nombre?: string | null
+    telefono?: string | null
+  }
+  | string
+  | null
   destino?:
-    | {
-        nombre?: string | null
-        telefono?: string | null
-        direccion?: string | null
-      }
-    | string
-    | null
+  | {
+    nombre?: string | null
+    telefono?: string | null
+    direccion?: string | null
+  }
+  | string
+  | null
   fecha_registro: string | null
+  eventos?: TrackingApiPackage['eventos']
 }
 
 type EmsPackageCard = {
@@ -205,11 +239,36 @@ type EmsPackageCard = {
   recipientName: string
   recipientReference: string
   destination: string
+  currentLocation?: string
+  department?: string
   status: string
   updatedAt: string
   sourceKind: 'tracking' | 'contact'
   sourceRecord: TrackingApiPackage | ContactPackagesApiItem
 }
+
+type EmsPipelineColumnPage = {
+  items: EmsPackageCard[]
+  currentPage: number
+  totalPages: number
+  totalItems: number
+  pageSize: number
+  state: 'idle' | 'loading' | 'error'
+  error: string | null
+  syncedAt: string | null
+  requestSignature: string | null
+}
+
+type InternationalPipelineColumnPage = {
+  items: TrackingApiPackage[]
+  currentPage: number
+  totalPages: number
+  totalItems: number
+  state: 'idle' | 'loading' | 'error'
+  error: string | null
+}
+
+type EmsStageOverrideMap = Record<string, EmsColumnKey>
 
 type ContactGroup = {
   id: number
@@ -243,6 +302,7 @@ type DashboardData = {
   contactGroups: ContactGroup[]
   prontsConfig?: Record<string, ProntsColumnConfig>
   pipelineConfig?: PipelineConfig
+  emsStageOverrides?: Record<string, string>
   channelConfig?: {
     whatsapp: WhatsAppChannelConfig
   }
@@ -312,6 +372,16 @@ type WhatsAppTestResult = {
   recipient: string
   provider: string
   messageId: string
+}
+
+type MessageNotification = {
+  id: string
+  contactId: number
+  contactName: string
+  preview: string
+  timestamp: string
+  createdAt: string
+  contactAvatar?: string;
 }
 
 type WhatsAppTestModeApiPayload = {
@@ -384,8 +454,9 @@ type UserForm = {
 
 type LogsReport = {
   generatedAt: string
-  period: { hours: number; level: string | null; path: string | null }
+  period: { hours: number; level: string | null; path: string | null; month: string | null }
   totals: { total: number; info: number; warn: number; error: number }
+  months: Array<{ value: string; label: string; count: number }>
   byEndpoint: Array<{ path: string; count: number; average_duration_ms: number | null; errors: number }>
   recent: Array<{
     id: number
@@ -399,6 +470,12 @@ type LogsReport = {
     user_id: number | null
     details: Record<string, unknown>
   }>
+  pagination: {
+    page: number
+    perPage: number
+    totalItems: number
+    totalPages: number
+  }
 }
 
 const app = document.querySelector<HTMLDivElement>('#app')
@@ -409,23 +486,43 @@ if (!app) {
 
 const normalizeApiBase = (value: string | undefined) => value?.trim().replace(/\/$/, '') ?? ''
 
+const isLocalhostBase = (value: string) => {
+  try {
+    const url = new URL(value)
+    return ['localhost', '127.0.0.1', '::1'].includes(url.hostname)
+  } catch {
+    return false
+  }
+}
+
+const isLocalhostPage = () => ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname)
+
+const getCurrentHostApiBase = (configuredBase: string) => {
+  try {
+    const configuredUrl = new URL(configuredBase)
+    return `${window.location.protocol}//${window.location.hostname}:${configuredUrl.port || '3001'}`
+  } catch {
+    return ''
+  }
+}
+
 const getRuntimeApiBase = () => {
   const configuredBase = normalizeApiBase(import.meta.env.VITE_API_URL)
 
-  if (configuredBase) {
+  if (typeof window === 'undefined') {
     return configuredBase
   }
 
-  if (typeof window === 'undefined') {
-    return ''
-  }
-
   if (window.location.protocol === 'file:') {
-    return 'http://localhost:3001'
+    return configuredBase || 'http://localhost:3001'
   }
 
-  if (window.location.origin.startsWith('http')) {
-    return window.location.origin.replace(/\/$/, '')
+  if (configuredBase && (!isLocalhostBase(configuredBase) || isLocalhostPage())) {
+    return configuredBase
+  }
+
+  if (configuredBase && isLocalhostBase(configuredBase)) {
+    return getCurrentHostApiBase(configuredBase)
   }
 
   return ''
@@ -439,12 +536,40 @@ type AiAgentApiPayload = {
 
 const API_BASE = getRuntimeApiBase()
 
+const getBoliviaDateInputValue = (date: Date) => {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/La_Paz',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date)
+  const part = (type: string) => parts.find((value) => value.type === type)?.value ?? ''
+  return `${part('year')}-${part('month')}-${part('day')}`
+}
+
+const getDefaultEmsPipelineDateRange = () => {
+  const end = getBoliviaDateInputValue(new Date())
+  const startDate = new Date(`${end}T00:00:00Z`)
+  startDate.setUTCDate(startDate.getUTCDate() - 29)
+  return { start: startDate.toISOString().slice(0, 10), end }
+}
+
+const initialEmsPipelineDateRange = getDefaultEmsPipelineDateRange()
+const getDefaultInternationalPipelineDateRange = () => {
+  const end = getBoliviaDateInputValue(new Date())
+  return { start: `${end.slice(0, 7)}-01`, end }
+}
+const initialInternationalPipelineDateRange = getDefaultInternationalPipelineDateRange()
+
 const STORAGE_KEYS = {
   sidebarCollapsed: 'crm-sidebar-collapsed',
   activeView: 'crm-active-view',
   prontsActiveColumn: 'crm-pronts-active-column',
   globalAiAgentEnabled: 'crm-global-ai-agent-enabled',
-  emsMonthFilter: 'crm-ems-month-filter',
+  emsStageOverrides: 'crm-ems-stage-overrides',
+  trackingApiServiceFilter: 'crm-tracking-api-service-filter',
+  trackingApiOriginFilter: 'crm-tracking-api-origin-filter',
+  trackingApiDestinationFilter: 'crm-tracking-api-destination-filter',
   authToken: 'crm-auth-token',
   authExpiry: 'crm-auth-expiry',
   rememberSession: 'crm-remember-session',
@@ -514,14 +639,30 @@ const createProntsConfigFromPreset = (
       sampleContactId: null,
       response: DEFAULT_PRONTS_RESPONSE,
     },
+    cancelled: {
+      presetKey: 'cancelled',
+      systemPrompt:
+        'Eres un coordinador de excepciones EMS. Informas cancelaciones, anulaciones y rechazos con tono claro y directo, sin dejar dudas sobre el estado final.',
+      userTemplate:
+        'Genera una actualización para un envio cancelado:\n- Cliente: {cliente}\n- Tracking: {tracking}\n- Destino: {destino}\n- Estado: {estado}\n- Grupo: {grupoNombre}',
+      temperature: 0.2,
+      action: 'Registrar cancelación y notificar WhatsApp',
+      sampleContactId: null,
+      response: DEFAULT_PRONTS_RESPONSE,
+    },
   }
 
+  const safePresetKey = baseConfigs[presetKey] ? presetKey : 'received'
+
   return {
-    ...baseConfigs[presetKey],
+    ...baseConfigs[safePresetKey],
     ...overrides,
-    presetKey,
+    presetKey: safePresetKey,
   }
 }
+
+const isProntsPresetKey = (value: unknown): value is ProntsPresetKey =>
+  typeof value === 'string' && value in prontsPresetMeta
 
 const createDefaultProntsConfigs = (): Record<string, ProntsColumnConfig> => ({
   received: createProntsConfigFromPreset('received'),
@@ -529,6 +670,7 @@ const createDefaultProntsConfigs = (): Record<string, ProntsColumnConfig> => ({
   regional: createProntsConfigFromPreset('regional'),
   courier: createProntsConfigFromPreset('courier'),
   delivered: createProntsConfigFromPreset('delivered'),
+  cancelled: createProntsConfigFromPreset('cancelled'),
 })
 
 const createDefaultPipelineConfig = (): PipelineConfig => ({
@@ -536,22 +678,32 @@ const createDefaultPipelineConfig = (): PipelineConfig => ({
     received: {
       title: 'Recibido Origen',
       helper: 'Ingresados o en recepción inicial',
+      allowedStates: ['recibido-origen'],
     },
     transit: {
       title: 'En Camino',
       helper: 'En tránsito hacia el destino final',
+      allowedStates: ['en-camino'],
     },
     regional: {
       title: 'Recibido Destino',
       helper: 'Paquetes ya recibidos en la regional',
+      allowedStates: ['recibido-destino'],
     },
     courier: {
       title: 'Cartero',
       helper: 'Paquetes asignados a reparto',
+      allowedStates: ['cartero'],
     },
     delivered: {
       title: 'Entregado',
       helper: 'Entregas confirmadas o cerradas',
+      allowedStates: ['entregado'],
+    },
+    cancelled: {
+      title: 'Cancelado',
+      helper: 'Envios anulados, cancelados o rechazados',
+      allowedStates: ['cancelado', 'cancelada', 'anulado', 'anulada', 'cancelled', 'cancelada por cliente'],
     },
   },
   customColumns: [],
@@ -563,49 +715,57 @@ const menuGroups: Array<{
   shortLabel: string
   items: Array<{ view: ViewKey; label: string }>
 }> = [
-  {
-    key: 'ems',
-    label: 'Nacional',
-    shortLabel: 'NA',
-    items: [
-      { view: 'ems', label: 'Pipeline Nacional' },
-      { view: 'pronts-nacional', label: 'Pronts Nacional' },
-      { view: 'internacionales-paquetes', label: 'Nacionales' },
-    ],
-  },
-  {
-    key: 'internacionales',
-    label: 'Internacionales',
-    shortLabel: 'IN',
-    items: [
-      { view: 'internacionales', label: 'Internacionales' },
-      { view: 'internacionales-pipeline', label: 'Pipeline' },
-      { view: 'pronts-internacional', label: 'Pronts Internacional' },
-    ],
-  },
-  {
-    key: 'clientes',
-    label: 'Clientes',
-    shortLabel: 'CL',
-    items: [
-      { view: 'chat', label: 'Chat' },
-      { view: 'contactos', label: 'Contactos' },
-      { view: 'agrupaciones', label: 'Agrupaciones' },
-    ],
-  },
-  {
-    key: 'usuarios',
-    label: 'Usuarios',
-    shortLabel: 'US',
-    items: [{ view: 'usuarios', label: 'Usuarios' }],
-  },
-  {
-    key: 'sistema',
-    label: 'Sistema',
-    shortLabel: 'SI',
-    items: [{ view: 'logs', label: 'Reporte de logs' }],
-  },
-]
+    {
+      key: 'ems',
+      label: 'Nacional',
+      shortLabel: 'NA',
+      items: [
+        { view: 'internacionales-paquetes', label: 'Nacionales' },
+        { view: 'ems', label: 'Pipeline Nacional' },
+        { view: 'pronts-nacional', label: 'Pronts Nacional' },
+
+      ],
+    },
+    {
+      key: 'internacionales',
+      label: 'Internacionales',
+      shortLabel: 'IN',
+      items: [
+        { view: 'internacionales', label: 'Paquetes internacionales' },
+        { view: 'internacionales-pipeline', label: 'Escáner internacional' },
+        { view: 'internacionales-tablero', label: 'Pipeline internacional' },
+        { view: 'pronts-internacional', label: 'Pronts Internacional' },
+      ],
+    },
+    {
+      key: 'clientes',
+      label: 'Clientes',
+      shortLabel: 'CL',
+      items: [
+        { view: 'chat', label: 'Chat' },
+        { view: 'contactos', label: 'Contactos' },
+        { view: 'agrupaciones', label: 'Agrupaciones' },
+      ],
+    },
+    {
+      key: 'usuarios',
+      label: 'Usuarios',
+      shortLabel: 'US',
+      items: [{ view: 'usuarios', label: 'Usuarios' }],
+    },
+    {
+      key: 'sistema',
+      label: 'Sistema',
+      shortLabel: 'SI',
+      items: [
+        { view: 'logs', label: 'Reporte de logs' },
+        { view: 'configuraciones', label: 'Configuraciones' },
+      ],
+    },
+  ]
+
+const isValidView = (value: unknown): value is ViewKey =>
+  typeof value === 'string' && menuGroups.some((group) => group.items.some((item) => item.view === value))
 
 type PhoneCountry = {
   iso2: CountryCode
@@ -727,6 +887,15 @@ const getStoredBoolean = (key: string, fallback: boolean) => {
   }
 }
 
+const getStoredString = (key: string, fallback: string) => {
+  try {
+    const value = localStorage.getItem(key)
+    return value == null || value === '' ? fallback : value
+  } catch {
+    return fallback
+  }
+}
+
 const getStoredJson = <T,>(key: string, fallback: T): T => {
   try {
     const value = localStorage.getItem(key)
@@ -746,8 +915,59 @@ const getStoredView = (): ViewKey | null => {
     const value = rawValue === 'pronts' ? 'pronts-nacional' : (rawValue as ViewKey | null)
     const validViews = menuGroups.flatMap((group) => group.items.map((item) => item.view))
     return value && validViews.includes(value) ? value : null
+    return isValidView(value) ? value : null
   } catch {
     return null
+  }
+}
+
+const getViewFromLocation = (): ViewKey | null => {
+  try {
+    const rawPath = window.location.pathname.replace(/\/+$/, '')
+    const normalizedPath = rawPath === '' ? '/' : rawPath
+
+    if (normalizedPath === '/login') {
+      return null
+    }
+
+    const pathSegment = normalizedPath.startsWith('/') ? normalizedPath.slice(1) : normalizedPath
+    const normalizedView = pathSegment === 'pronts' ? 'pronts-nacional' : pathSegment
+    return isValidView(normalizedView) ? normalizedView : null
+  } catch {
+    return null
+  }
+}
+
+const getInitialView = (): ViewKey => getViewFromLocation() ?? getStoredView() ?? 'ems'
+
+const getViewHref = (view: ViewKey) => `/${view}`
+
+const syncViewToLocation = (view: ViewKey, options: { replace?: boolean } = {}) => {
+  try {
+    const nextPath = getViewHref(view)
+    if (window.location.pathname !== nextPath) {
+      if (options.replace) {
+        window.history.replaceState(null, '', nextPath)
+      } else {
+        window.history.pushState(null, '', nextPath)
+      }
+    }
+  } catch {
+    // ignore history issues
+  }
+}
+
+const syncLoginToLocation = (options: { replace?: boolean } = {}) => {
+  try {
+    if (window.location.pathname !== '/login') {
+      if (options.replace) {
+        window.history.replaceState(null, '', '/login')
+      } else {
+        window.history.pushState(null, '', '/login')
+      }
+    }
+  } catch {
+    // ignore history issues
   }
 }
 
@@ -783,7 +1003,19 @@ const storedAuthSession = getStoredAuthSession()
 let sessionExpiryTimer: ReturnType<typeof setTimeout> | null = null
 let chatRefreshTimer: ReturnType<typeof setInterval> | null = null
 let dashboardRefreshTimer: ReturnType<typeof setInterval> | null = null
+let dashboardRefreshInFlight = false
 const CHAT_REFRESH_INTERVAL_MS = 5000
+const DASHBOARD_REFRESH_INTERVAL_MS = 15000
+const CHAT_LIST_PAGE_SIZE = 20
+const CONTACT_LIST_PAGE_SIZE = 7
+const MESSAGE_NOTIFICATION_DURATION_MS = 5500
+let topbarProfileGlobalListenersInstalled = false
+let messageNotificationToneUnlocked = false
+let messageNotificationAudioContext: AudioContext | null = null
+let messageNotificationInteractionListenersInstalled = false
+let locationSyncListenerInstalled = false
+const seenMessageNotificationKeys = new Set<string>()
+const messageNotificationCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
 const defaultContactForm = (): CreateContactForm => ({
   name: '',
@@ -881,20 +1113,34 @@ const state: {
   isSidebarCollapsed: boolean
   expandedGroups: Set<MenuGroupKey>
   collapsedFlyoutGroup: MenuGroupKey | null
-  activeView: ViewKey | null
+  activeView: ViewKey
   internationalPackages: InternationalPackage[]
   trackingApiPackages: TrackingApiPackage[]
   trackingApiState: 'idle' | 'loading' | 'error'
   trackingApiError: string | null
+  trackingApiWarning: string | null
   trackingApiSyncedAt: string | null
   trackingApiTotalItems: number
   trackingApiPage: number
   trackingApiPageSize: number
   trackingApiHasMore: boolean
+  trackingApiStateFilter: string
+  trackingApiServiceFilter: string
+  trackingApiOriginFilter: string
+  trackingApiDestinationFilter: string
   trackingApiCatalogPackages: TrackingApiPackage[]
   trackingApiCatalogState: 'idle' | 'loading' | 'error'
   trackingApiCatalogError: string | null
   trackingApiCatalogSyncedAt: string | null
+  internationalPipelineSearch: Record<string, string>
+  internationalPipelineDateStart: string
+  internationalPipelineDateEnd: string
+  internationalPipelineDepartment: string
+  internationalPipelineSort: 'newest' | 'oldest'
+  internationalPipelinePage: Record<string, number>
+  internationalPipelineColumns: Record<string, InternationalPipelineColumnPage>
+  internationalPipelineCatalogTotal: number
+  internationalPipelineSource: string
   emsPipelineSyncState: 'idle' | 'loading' | 'error'
   emsPipelineSyncError: string | null
   emsPipelineSyncSummary: {
@@ -903,7 +1149,10 @@ const state: {
     updatedCount: number
     syncedAt: string | null
   } | null
-  emsMonthFilter: string
+  emsPipelineDateStart: string
+  emsPipelineDateEnd: string
+  emsPipelineDepartment: string
+  emsStageOverrides: EmsStageOverrideMap
   packageCodeLookupQuery: string
   packageCodeLookupState: 'idle' | 'loading' | 'error'
   packageCodeLookupError: string | null
@@ -915,6 +1164,7 @@ const state: {
   isEmsStatePackagesModalOpen: boolean
   emsStatePackagesModalScope: EmsColumnKey | null
   emsStatePackagesModalPage: number
+  emsPipelineColumns: Record<string, EmsPipelineColumnPage>
   contactPackages: ContactPackagesApiItem[]
   contactPackagesState: 'idle' | 'loading' | 'error'
   contactPackagesError: string | null
@@ -933,7 +1183,58 @@ const state: {
   emsTransitSearchQuery: string
   emsDeliveredSearchQuery: string
   emsCourierSearchQuery: string
+  chatListPage: number
+  contactListPage: number
   globalAiAgentEnabled: boolean
+  automationConfig: {
+    automaticWelcome: boolean
+    automaticStatusUpdates: boolean
+    automaticReconciliation: boolean
+    aiAutoReply: boolean
+    welcomeResponseIntervalMs: number
+    eventChangeResponseIntervalMs: number
+    reconciliationIntervalMs: number
+  } | null
+  automationWatcherStatus: {
+    checkedAt: string
+    status: 'completed' | 'failed'
+    totalPackages: number
+    newPackages: number
+    welcomeSent: number
+    welcomeSkipped: number
+    eventSent: number
+    eventSkipped: number
+    eventSkippedByReason: Record<string, number>
+    eventReason: string | null
+    packageCountsBySource: Record<string, number>
+    packageSourceFailures: string[]
+    welcomeSkippedByReason: Record<string, number>
+  } | null
+  automationReconciliationStatus: {
+    checkedAt: string
+    status: 'completed' | 'partial' | 'failed' | 'running'
+    totalPackages: number
+    sentTotal: number
+    welcomeSent: number
+    welcomeSkipped: number
+    welcomeSkippedByReason: Record<string, number>
+    welcomeReason: string | null
+    eventSent: number
+    eventSkipped: number
+    eventSkippedByReason: Record<string, number>
+    eventReason: string | null
+    sourceFailures: string[]
+    notificationFailures: string[]
+  } | null
+  latestInboundReplyStatus: {
+    receivedAt: string | null
+    event: string | null
+    attemptedAt: string | null
+    reason: string | null
+  } | null
+  automationConfigError: string | null
+  automationConfigNotice: string | null
+  automationConfigState: 'idle' | 'saving'
   prontsActiveColumn: ProntsColumnKey
   prontsConfigs: Record<string, ProntsColumnConfig>
   prontsConfigState: 'idle' | 'submitting'
@@ -1026,28 +1327,65 @@ const state: {
   logsError: string | null
   logsHours: number
   logsLevel: string
+  logsMonthFilter: string
+  logsPage: number
+  logsPageSize: number
+  messageNotifications: MessageNotification[]
+  scannerQuery: string
+  scannerResult: any
+  scannerEventsState: 'idle' | 'loading' | 'error'
+  scannerEventsError: string | null
+  scannerSessionLog: any[]
+  scannerStageFilter: string
+  scannerQueryState: 'idle' | 'loading' | 'error'
+  scannerQueryError: string | null
 } = {
   isSidebarCollapsed: getStoredBoolean(STORAGE_KEYS.sidebarCollapsed, false),
-  expandedGroups: new Set(['ems', 'internacionales', 'clientes', 'usuarios', 'sistema']),
+  expandedGroups: new Set(),
   collapsedFlyoutGroup: null,
-  activeView: getStoredView() ?? 'ems',
+  activeView: getInitialView(),
+  scannerQuery: '',
+  scannerResult: null,
+  scannerEventsState: 'idle',
+  scannerEventsError: null,
+  scannerSessionLog: [],
+  scannerStageFilter: 'all',
+  scannerQueryState: 'idle',
+  scannerQueryError: null,
   internationalPackages: getStoredJson<InternationalPackage[]>(STORAGE_KEYS.internationalPackages, []),
   trackingApiPackages: [],
   trackingApiState: 'idle',
   trackingApiError: null,
+  trackingApiWarning: null,
   trackingApiSyncedAt: null,
   trackingApiTotalItems: 0,
   trackingApiPage: 1,
   trackingApiPageSize: 12,
   trackingApiHasMore: false,
+  trackingApiStateFilter: 'all',
+  trackingApiServiceFilter: getStoredString(STORAGE_KEYS.trackingApiServiceFilter, 'all'),
+  trackingApiOriginFilter: getStoredString(STORAGE_KEYS.trackingApiOriginFilter, 'all'),
+  trackingApiDestinationFilter: getStoredString(STORAGE_KEYS.trackingApiDestinationFilter, 'all'),
   trackingApiCatalogPackages: [],
   trackingApiCatalogState: 'idle',
   trackingApiCatalogError: null,
   trackingApiCatalogSyncedAt: null,
+  internationalPipelineSearch: {},
+  internationalPipelineDateStart: initialInternationalPipelineDateRange.start,
+  internationalPipelineDateEnd: initialInternationalPipelineDateRange.end,
+  internationalPipelineDepartment: 'all',
+  internationalPipelineSort: 'newest',
+  internationalPipelinePage: {},
+  internationalPipelineColumns: {},
+  internationalPipelineCatalogTotal: 0,
+  internationalPipelineSource: '',
   emsPipelineSyncState: 'idle',
   emsPipelineSyncError: null,
   emsPipelineSyncSummary: null,
-  emsMonthFilter: 'all',
+  emsPipelineDateStart: initialEmsPipelineDateRange.start,
+  emsPipelineDateEnd: initialEmsPipelineDateRange.end,
+  emsPipelineDepartment: 'all',
+  emsStageOverrides: getStoredJson<EmsStageOverrideMap>(STORAGE_KEYS.emsStageOverrides, {}),
   packageCodeLookupQuery: '',
   packageCodeLookupState: 'idle',
   packageCodeLookupError: null,
@@ -1059,6 +1397,7 @@ const state: {
   isEmsStatePackagesModalOpen: false,
   emsStatePackagesModalScope: null,
   emsStatePackagesModalPage: 1,
+  emsPipelineColumns: {},
   contactPackages: [],
   contactPackagesState: 'idle',
   contactPackagesError: null,
@@ -1077,7 +1416,16 @@ const state: {
   emsTransitSearchQuery: '',
   emsDeliveredSearchQuery: '',
   emsCourierSearchQuery: '',
+  chatListPage: 1,
+  contactListPage: 1,
   globalAiAgentEnabled: getStoredBoolean(STORAGE_KEYS.globalAiAgentEnabled, false),
+  automationConfig: null,
+  automationWatcherStatus: null,
+  automationReconciliationStatus: null,
+  latestInboundReplyStatus: null,
+  automationConfigError: null,
+  automationConfigNotice: null,
+  automationConfigState: 'idle',
   prontsActiveColumn: 'received',
   prontsConfigs: createDefaultProntsConfigs(),
   prontsConfigState: 'idle',
@@ -1170,12 +1518,24 @@ const state: {
   logsError: null,
   logsHours: 24,
   logsLevel: '',
+  logsMonthFilter: 'all',
+  logsPage: 1,
+  logsPageSize: 10,
+  messageNotifications: [],
 }
 
 const hydrateProntsState = () => {
   const storedActiveColumn = getStoredJson<ProntsColumnKey>(STORAGE_KEYS.prontsActiveColumn, state.prontsActiveColumn)
   if (typeof storedActiveColumn === 'string' && storedActiveColumn.trim().length > 0) {
     state.prontsActiveColumn = storedActiveColumn
+  }
+}
+
+const saveStoredJson = <T,>(key: string, value: T) => {
+  try {
+    localStorage.setItem(key, JSON.stringify(value))
+  } catch {
+    // ignore storage issues
   }
 }
 
@@ -1205,8 +1565,8 @@ const toggleGlobalAiAgent = async () => {
     if (!response.ok) {
       throw new Error(
         (payload?.error as string) ||
-          (payload?.message as string) ||
-          'No se pudo actualizar el agente IA.',
+        (payload?.message as string) ||
+        'No se pudo actualizar el agente IA.',
       )
     }
 
@@ -1224,6 +1584,18 @@ const toggleGlobalAiAgent = async () => {
 
 const toggleWhatsAppTestMode = async () => {
   const nextEnabled = !state.whatsappTestModeEnabled
+
+  if (!nextEnabled) {
+    const shouldDisable = window.confirm(
+      'Si desactivas el modo prueba, el CRM podra enviar comunicaciones a todos los contactos con seguimiento de paquetes. ¿Deseas continuar?',
+    )
+
+    if (!shouldDisable) {
+      state.notice = 'Modo prueba cancelado. No se desactivó.'
+      renderApp()
+      return
+    }
+  }
 
   state.whatsappTestModeState = 'submitting'
   state.notice = null
@@ -1250,8 +1622,8 @@ const toggleWhatsAppTestMode = async () => {
     if (!response.ok) {
       throw new Error(
         (payload as { error?: string; message?: string } | null)?.error ||
-          (payload as { error?: string; message?: string } | null)?.message ||
-          'No se pudo actualizar el modo de prueba.',
+        (payload as { error?: string; message?: string } | null)?.message ||
+        'No se pudo actualizar el modo de prueba.',
       )
     }
 
@@ -1310,6 +1682,35 @@ const getImportedValue = (row: Record<string, unknown>, aliases: string[]) => {
 }
 
 const normalizePhoneDigits = (value: unknown) => String(value ?? '').replace(/[^\d]/g, '')
+const parsePossiblePhoneNumber = (value: unknown, defaultCountry: CountryCode = 'BO') => {
+  const digits = normalizePhoneDigits(value)
+
+  if (!digits) {
+    return null
+  }
+
+  const phoneNumber =
+    parsePhoneNumberFromString(digits, defaultCountry) ??
+    parsePhoneNumberFromString(`+${digits}`)
+
+  if (!phoneNumber?.isPossible()) {
+    return null
+  }
+
+  return phoneNumber
+}
+
+const isCellPhoneNumber = (value: unknown) => {
+  const phoneNumber = parsePossiblePhoneNumber(value, 'BO')
+
+  if (!phoneNumber) {
+    return false
+  }
+
+  const phoneType = phoneNumber.getType?.()
+  return phoneType === 'MOBILE' || phoneType === 'FIXED_LINE_OR_MOBILE'
+}
+
 const normalizeBoliviaTestPhoneDigits = (value: unknown) => {
   const digits = normalizePhoneDigits(value)
 
@@ -1347,9 +1748,13 @@ const saveInternationalPackages = () => {
   localStorage.setItem(STORAGE_KEYS.internationalPackages, JSON.stringify(state.internationalPackages))
 }
 
+let trackingApiCatalogLoadRequestId = 0
+let internationalPipelineSearchTimer: ReturnType<typeof setTimeout> | null = null
+
 const loadTrackingApiPackages = async () => {
   state.trackingApiState = 'loading'
   state.trackingApiError = null
+  state.trackingApiWarning = null
   renderApp()
   const requestedPage = state.trackingApiPage
 
@@ -1364,25 +1769,36 @@ const loadTrackingApiPackages = async () => {
       state.loginError = 'Tu sesion expiro. Vuelve a iniciar sesion.'
       state.trackingApiState = 'idle'
       renderApp()
-      return
+      return false
     }
 
     if (!response.ok) {
       throw new Error(
         (payload?.error as string) ||
-          (payload?.message as string) ||
-          'No se pudo cargar la informacion de tracking.',
+        (payload?.message as string) ||
+        'No se pudo cargar la informacion de tracking.',
       )
     }
 
     const remoteData = Array.isArray(payload?.data) ? (payload.data as TrackingApiPackage[]) : []
-      const totalItems = Number(
-        (payload?.paginacion as { total_registros?: number } | undefined)?.total_registros ??
-          (payload?.meta as { total?: number } | undefined)?.total ??
-          payload?.count ??
-          remoteData.length ??
-          0,
-      )
+    const reportedTotal = Number(
+      (payload?.paginacion as { total_registros?: number } | undefined)?.total_registros ??
+      (payload?.pagination as { total_registros?: number; total?: number } | undefined)?.total_registros ??
+      (payload?.pagination as { total_registros?: number; total?: number } | undefined)?.total ??
+      (payload?.meta as { total?: number } | undefined)?.total ??
+      (payload as { total?: number } | undefined)?.total ??
+      (payload as { total_registros?: number } | undefined)?.total_registros ??
+      remoteData.length ??
+      0,
+    )
+    const paginationData = (payload?.paginacion ?? payload?.pagination ?? payload?.meta ?? {}) as Record<string, unknown>
+    const upstreamCurrentPage = Number(
+      paginationData.pagina_actual ?? paginationData.current_page ?? paginationData.page ?? requestedPage,
+    )
+    const upstreamLastPage = Number(
+      paginationData.ultima_pagina ?? paginationData.last_page ?? paginationData.total_pages,
+    )
+    const explicitHasMore = paginationData.has_more ?? paginationData.hasMore
 
     if (remoteData.length === 0 && requestedPage > 1) {
       state.trackingApiPage = requestedPage - 1
@@ -1390,22 +1806,76 @@ const loadTrackingApiPackages = async () => {
       state.trackingApiState = 'idle'
       state.trackingApiError = null
       renderApp()
-      return
+      return false
     }
 
+    const loadedThrough = (requestedPage - 1) * state.trackingApiPageSize + remoteData.length
+    const totalItems = Number.isFinite(reportedTotal)
+      ? Math.max(reportedTotal, loadedThrough)
+      : loadedThrough
+
     state.trackingApiPackages = remoteData
-    state.trackingApiTotalItems = Number.isFinite(totalItems) ? totalItems : remoteData.length
-    state.trackingApiHasMore = remoteData.length >= state.trackingApiPageSize
-    state.trackingApiSyncedAt = new Date().toISOString()
+    state.trackingApiTotalItems = totalItems
+    state.trackingApiWarning =
+      typeof payload?.warning === 'string'
+        ? payload.warning
+        : payload?.source === 'local-db' || payload?.fallback
+          ? 'No se pudo consultar la API externa de tracking; se muestran datos locales sincronizados.'
+          : null
+    const receivedFullPage = remoteData.length >= state.trackingApiPageSize
+    state.trackingApiHasMore =
+      receivedFullPage ||
+      explicitHasMore === true ||
+      (Number.isFinite(upstreamLastPage) && upstreamLastPage > 0 && upstreamCurrentPage < upstreamLastPage) ||
+      requestedPage * state.trackingApiPageSize < totalItems
+    state.trackingApiSyncedAt =
+      typeof payload?.cachedAt === 'string' ? payload.cachedAt : new Date().toISOString()
   } catch (error) {
     state.trackingApiState = 'error'
     state.trackingApiError =
       error instanceof Error ? error.message : 'No se pudo consultar la API de tracking.'
     renderApp()
-    return
+    return false
   }
 
   state.trackingApiState = 'idle'
+  renderApp()
+  return true
+}
+
+const refreshTrackingApiPackages = async () => {
+  if (state.trackingApiState === 'loading') {
+    return
+  }
+
+  state.trackingApiPage = 1
+  const loaded = await loadTrackingApiPackages()
+
+  if (!loaded || state.trackingApiState !== 'idle' || state.trackingApiWarning) {
+    return
+  }
+
+  const latestPackages = state.trackingApiPackages
+  const latestCodes = new Set(
+    latestPackages
+      .map((item) => getTrackingPackageCode(item) || normalizeEmsPackageCode(item.mailitm_pid))
+      .filter(Boolean),
+  )
+  const catalogPackages = new Map<string, TrackingApiPackage>()
+
+  for (const item of latestPackages) {
+    const code = getTrackingPackageCode(item) || normalizeEmsPackageCode(item.mailitm_pid)
+    if (code) catalogPackages.set(code, item)
+  }
+
+  for (const item of state.trackingApiCatalogPackages) {
+    const code = getTrackingPackageCode(item) || normalizeEmsPackageCode(item.mailitm_pid)
+    if (code && !latestCodes.has(code)) {
+      catalogPackages.set(code, item)
+    }
+  }
+
+  state.trackingApiCatalogPackages = [...catalogPackages.values()]
   renderApp()
 }
 
@@ -1414,53 +1884,51 @@ const loadTrackingApiCatalogPackages = async () => {
     return
   }
 
+  const requestId = trackingApiCatalogLoadRequestId + 1
+  trackingApiCatalogLoadRequestId = requestId
+
   state.trackingApiCatalogState = 'loading'
   state.trackingApiCatalogError = null
   renderApp()
 
-  const pageSize = 500
-  const maxPages = 12
-  const catalogPackages: TrackingApiPackage[] = []
-
   try {
-    for (let page = 1; page <= maxPages; page += 1) {
-      const response = await authFetch(`/api/tracking/paquetes?page=${page}&per_page=${pageSize}`)
-      const payload = await parseApiPayload(response)
+    const response = await authFetch('/api/tracking/paquetes?all=1&fresh=1')
+    const payload = await parseApiPayload(response)
+    const payloadAny = payload as any
 
-      if (response.status === 401) {
-        clearSession()
-        state.loginError = 'Tu sesion expiro. Vuelve a iniciar sesion.'
-        state.trackingApiCatalogState = 'idle'
-        renderApp()
-        return
-      }
-
-      if (!response.ok) {
-        throw new Error(
-          (payload?.error as string) ||
-            (payload?.message as string) ||
-            'No se pudo cargar el catalogo de estados de tracking.',
-        )
-      }
-
-      const remoteData = Array.isArray(payload?.data) ? (payload.data as TrackingApiPackage[]) : []
-      catalogPackages.push(...remoteData)
-
-      const totalItems = Number(
-        payload?.count ?? (payload?.meta as { total?: number } | undefined)?.total ?? remoteData.length ?? 0,
-      )
-      const hasMore = remoteData.length >= pageSize && (!Number.isFinite(totalItems) || catalogPackages.length < totalItems)
-
-      if (!hasMore) {
-        break
-      }
+    if (requestId !== trackingApiCatalogLoadRequestId) {
+      return
     }
 
-    state.trackingApiCatalogPackages = catalogPackages
+    if (response.status === 401) {
+      clearSession()
+      state.loginError = 'Tu sesion expiro. Vuelve a iniciar sesion.'
+      state.trackingApiCatalogState = 'idle'
+      renderApp()
+      return
+    }
+
+    if (!response.ok) {
+      throw new Error(
+        (payloadAny?.error as string) ||
+        (payloadAny?.message as string) ||
+        'No se pudo cargar el catalogo de estados de tracking.',
+      )
+    }
+
+    state.trackingApiCatalogPackages = Array.isArray(payloadAny?.data) ? (payloadAny.data as TrackingApiPackage[]) : []
+    resetUnavailableTrackingApiFilters()
+    if (typeof payloadAny?.warning === 'string') {
+      state.trackingApiWarning = payloadAny.warning
+    }
     state.trackingApiCatalogSyncedAt = new Date().toISOString()
     state.trackingApiCatalogState = 'idle'
     renderApp()
   } catch (error) {
+    if (requestId !== trackingApiCatalogLoadRequestId) {
+      return
+    }
+
     state.trackingApiCatalogState = 'error'
     state.trackingApiCatalogError =
       error instanceof Error ? error.message : 'No se pudo cargar el catalogo de estados de tracking.'
@@ -1468,78 +1936,421 @@ const loadTrackingApiCatalogPackages = async () => {
   }
 }
 
+const internationalPipelineStages: EmsColumnKey[] = [
+  'received',
+  'transit',
+  'regional',
+  'courier',
+  'delivered',
+  'cancelled',
+]
+
+const loadInternationalPipelineColumn = async (stage: EmsColumnKey, page = 1) => {
+  const previous = state.internationalPipelineColumns[stage]
+  state.internationalPipelineColumns[stage] = {
+    items: previous?.items ?? [],
+    currentPage: previous?.currentPage ?? 1,
+    totalPages: previous?.totalPages ?? 1,
+    totalItems: previous?.totalItems ?? 0,
+    state: 'loading',
+    error: null,
+  }
+  renderApp()
+
+  const query = new URLSearchParams({
+    scope: stage,
+    page: String(page),
+    per_page: '6',
+    sort: state.internationalPipelineSort,
+    date_start: state.internationalPipelineDateStart,
+    date_end: state.internationalPipelineDateEnd,
+    department: state.internationalPipelineDepartment,
+  })
+  const search = String(state.internationalPipelineSearch[stage] ?? '').trim()
+  if (search) query.set('query', search)
+
+  try {
+    const response = await authFetch(`/api/internacionales/pipeline?${query.toString()}`, { timeoutMs: 15 * 60 * 1000 })
+    const payload = await parseApiPayload(response)
+    if (!response.ok) {
+      throw new Error(
+        (payload?.message as string) ||
+        (payload?.error as string) ||
+        'No se pudo cargar el pipeline internacional.',
+      )
+    }
+
+    const pagination = payload?.pagination as
+      | { page?: number; total_pages?: number; total_items?: number }
+      | undefined
+    state.internationalPipelineColumns[stage] = {
+      items: Array.isArray(payload?.data) ? (payload.data as TrackingApiPackage[]) : [],
+      currentPage: Number(pagination?.page ?? payload?.page ?? 1),
+      totalPages: Number(pagination?.total_pages ?? payload?.total_pages ?? 1),
+      totalItems: Number(pagination?.total_items ?? payload?.total ?? 0),
+      state: 'idle',
+      error: null,
+    }
+    state.internationalPipelineCatalogTotal = Number(payload?.catalog_total ?? state.internationalPipelineCatalogTotal)
+    state.internationalPipelineSource = String(payload?.source ?? state.internationalPipelineSource)
+    state.internationalPipelinePage[stage] = state.internationalPipelineColumns[stage].currentPage
+    if (typeof payload?.warning === 'string') state.trackingApiWarning = payload.warning
+  } catch (error) {
+    state.internationalPipelineColumns[stage] = {
+      items: previous?.items ?? [],
+      currentPage: previous?.currentPage ?? 1,
+      totalPages: previous?.totalPages ?? 1,
+      totalItems: previous?.totalItems ?? 0,
+      state: 'error',
+      error: error instanceof Error ? error.message : 'No se pudo cargar el pipeline internacional.',
+    }
+  }
+  renderApp()
+}
+
+const loadInternationalPipeline = async () => {
+  await Promise.all(internationalPipelineStages.map((stage) => loadInternationalPipelineColumn(stage, 1)))
+}
+
+const buildTrackingApiExportQuery = (page: number, perPage: number) => {
+  const query = new URLSearchParams({
+    page: String(page),
+    per_page: String(perPage),
+  })
+
+  return query
+}
+
+const fetchTrackingApiExportPage = async (page: number, perPage: number) => {
+  const query = buildTrackingApiExportQuery(page, perPage)
+  const response = await authFetch(`/api/tracking/paquetes?${query.toString()}`)
+  const payload = await parseApiPayload(response)
+
+  if (response.status === 401) {
+    clearSession()
+    state.loginError = 'Tu sesion expiro. Vuelve a iniciar sesion.'
+    renderApp()
+    return null
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      (payload?.error as string) ||
+      (payload?.message as string) ||
+      'No se pudo extraer la informacion de tracking.',
+    )
+  }
+
+  const remoteData = Array.isArray(payload?.data) ? (payload.data as TrackingApiPackage[]) : []
+  const totalItems = Number(
+    (payload?.paginacion as { total_registros?: number } | undefined)?.total_registros ??
+    (payload?.pagination as { total_registros?: number; total?: number } | undefined)?.total_registros ??
+    (payload?.pagination as { total_registros?: number; total?: number } | undefined)?.total ??
+    (payload?.meta as { total?: number } | undefined)?.total ??
+    (payload as { total?: number } | undefined)?.total ??
+    (payload as { total_registros?: number } | undefined)?.total_registros ??
+    payload?.count ??
+    remoteData.length ??
+    0,
+  )
+
+  return {
+    payload,
+    remoteData,
+    totalItems,
+  }
+}
+
+const exportTrackingApiToExcel = async () => {
+  const exportButton = document.querySelector<HTMLButtonElement>('#export-tracking-api-excel')
+  if (exportButton) {
+    exportButton.disabled = true
+  }
+
+  state.notice = 'Preparando el Excel con todos los paquetes de tracking...'
+  renderApp()
+
+  try {
+    const pageSize = 200
+    const maxPages = 2000
+    const exportedPackages: TrackingApiPackage[] = []
+    let page = 1
+    let lastPage = 1
+    const seenPageKeys = new Set<string>()
+
+    while (page <= lastPage && page <= maxPages) {
+      state.notice = `Extrayendo tracking: página ${page}${lastPage > 1 ? ` de ${lastPage}` : ''}...`
+      renderApp()
+
+      const result = await fetchTrackingApiExportPage(page, pageSize)
+      if (!result) {
+        return
+      }
+
+      const currentPageData = result.remoteData
+      const firstCode = normalizeText(currentPageData[0]?.codigo_s10 ?? currentPageData[0]?.codigo ?? '')
+      const lastCode = normalizeText(
+        currentPageData[currentPageData.length - 1]?.codigo_s10 ?? currentPageData[currentPageData.length - 1]?.codigo ?? '',
+      )
+      const pageKey = `${page}:${currentPageData.length}:${firstCode}:${lastCode}`
+
+      if (seenPageKeys.has(pageKey)) {
+        break
+      }
+
+      seenPageKeys.add(pageKey)
+      exportedPackages.push(...currentPageData)
+
+      const paginationData = (result.payload?.paginacion ?? result.payload?.pagination ?? result.payload?.meta ?? null) as
+        | {
+          ultima_pagina?: number
+          last_page?: number
+          total_registros?: number
+          total?: number
+          por_pagina?: number
+          per_page?: number
+        }
+        | null
+      const payloadAny = result.payload as any
+      const paginationLastPage = Number(
+        paginationData?.ultima_pagina ??
+        paginationData?.last_page ??
+        payloadAny?.ultima_pagina ??
+        payloadAny?.last_page ??
+        payloadAny?.pagination?.last_page ??
+        payloadAny?.meta?.last_page,
+      )
+      const paginationTotalItems = Number(
+        paginationData?.total_registros ??
+        paginationData?.total ??
+        payloadAny?.total_registros ??
+        payloadAny?.total ??
+        payloadAny?.pagination?.total_registros ??
+        payloadAny?.pagination?.total ??
+        payloadAny?.meta?.total_registros ??
+        payloadAny?.meta?.total,
+      )
+      const paginationPerPage = Number(
+        paginationData?.por_pagina ??
+        paginationData?.per_page ??
+        payloadAny?.por_pagina ??
+        payloadAny?.per_page ??
+        payloadAny?.pagination?.per_page ??
+        payloadAny?.meta?.per_page,
+      )
+
+      lastPage =
+        Number.isFinite(paginationLastPage) && paginationLastPage > 0
+          ? paginationLastPage
+          : Number.isFinite(paginationTotalItems) && Number.isFinite(paginationPerPage) && paginationPerPage > 0
+            ? Math.max(1, Math.ceil(paginationTotalItems / paginationPerPage))
+            : currentPageData.length > 0
+              ? page + 1
+              : page
+
+      if (Number.isFinite(lastPage)) {
+        lastPage = Math.min(Math.max(1, Math.floor(lastPage)), maxPages)
+      } else {
+        lastPage = maxPages
+      }
+
+      if (currentPageData.length < pageSize) {
+        break
+      }
+
+      page += 1
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
+    }
+
+    const packageRows = exportedPackages.map((item) => ({
+      Código: item.codigo_s10 || item.codigo || '',
+      'Código S10': item.codigo_s10 || '',
+      Estado: getTrackingVisibleStateValue(item),
+      'Estado postal': getTrackingStatusValue(item),
+      Origen: getTrackingOriginPlaceValue(item),
+      Destino: getTrackingDestinationLocationValue(item),
+      Peso: item.peso ?? '',
+      'Teléfono origen': getTrackingOriginPhoneValue(item),
+      'Teléfono destino': getTrackingDestinationPhoneValue(item),
+      'Fecha registro': item.fecha_registro ?? '',
+      'Número despacho': item.numero_despacho ?? '',
+      Contenido: item.contenido ?? '',
+      ID: item.mailitm_pid ?? '',
+    }))
+
+    const eventRows = exportedPackages.flatMap((item) => {
+      const packageCode = item.codigo_s10 || item.codigo || 'Sin código'
+      const events = Array.isArray(item.eventos) ? item.eventos.filter(Boolean) : []
+
+      if (events.length === 0) {
+        return [
+          {
+            Código: packageCode,
+            'Código S10': item.codigo_s10 || '',
+            Fecha: '',
+            'Código evento': '',
+            Evento: getTrackingVisibleStateValue(item),
+            'Evento API': '',
+            'Movimiento Bolivia': '',
+            Oficina: '',
+            Detalle: '',
+          },
+        ]
+      }
+
+      return events.map((event) => ({
+        Código: packageCode,
+        'Código S10': item.codigo_s10 || '',
+        Fecha: event.fecha ?? '',
+        'Código evento': event.evento_id ?? event.codigo_evento ?? '',
+        Evento: getTrackingApiEventStateLabel(event) || getTrackingVisibleStateValue(item),
+        'Evento API': event.evento_api ?? '',
+        'Movimiento Bolivia': event.movimiento_bolivia ?? '',
+        Oficina: event.oficina ?? '',
+        Detalle: event.detalle ?? '',
+      }))
+    })
+
+    const summaryRows = [
+      {
+        'Total de paquetes': exportedPackages.length,
+        'Total de eventos': eventRows.length,
+        'Generado en': new Date().toISOString(),
+      },
+    ]
+
+    const workbook = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(summaryRows), 'Resumen')
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(packageRows), 'Paquetes')
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(eventRows), 'Eventos')
+
+    const workbookData = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' })
+    const downloadUrl = URL.createObjectURL(
+      new Blob([workbookData], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
+    )
+    const downloadLink = document.createElement('a')
+    downloadLink.href = downloadUrl
+    downloadLink.download = `tracking-paquetes-${new Date().toISOString().slice(0, 10)}.xlsx`
+    downloadLink.style.display = 'none'
+    document.body.appendChild(downloadLink)
+    downloadLink.click()
+    window.setTimeout(() => {
+      downloadLink.remove()
+      URL.revokeObjectURL(downloadUrl)
+    }, 1500)
+
+    state.notice = `Excel generado correctamente con ${exportedPackages.length} paquetes y ${eventRows.length} eventos.`
+  } catch (error) {
+    console.error('No se pudo generar el Excel de tracking:', error)
+    state.notice = error instanceof Error ? error.message : 'No se pudo exportar la informacion de tracking.'
+  } finally {
+    if (exportButton) {
+      exportButton.disabled = false
+    }
+    renderApp()
+  }
+}
+
+let contactPackagesLoadPromise: Promise<void> | null = null
+let contactPackagesLastLoadKey = ''
+let contactPackagesLastLoadedAt = 0
+
 const loadContactPackages = async () => {
+  const loadKey = `${state.contactPackagesPage}:${state.contactPackagesPageSize}`
+  const now = Date.now()
+
+  if (contactPackagesLoadPromise) {
+    return contactPackagesLoadPromise
+  }
+
+  if (
+    state.contactPackages.length > 0 &&
+    contactPackagesLastLoadKey === loadKey &&
+    now - contactPackagesLastLoadedAt < 30000
+  ) {
+    return
+  }
+
   state.contactPackagesState = 'loading'
   state.contactPackagesError = null
   renderApp()
   const requestedPage = state.contactPackagesPage
 
-  try {
-    const response = await authFetch(
-      `/api/internacionales/paquetes-contactos?page=${state.contactPackagesPage}&per_page=${state.contactPackagesPageSize}`,
-    )
-    const payload = await parseApiPayload(response)
+  contactPackagesLoadPromise = (async () => {
+    try {
+      const response = await authFetch(
+        `/api/internacionales/paquetes-contactos?page=${state.contactPackagesPage}&per_page=${state.contactPackagesPageSize}`,
+        { timeoutMs: 30000 },
+      )
+      const payload = await parseApiPayload(response)
 
-    if (response.status === 401) {
-      state.contactPackagesState = 'error'
-      state.contactPackagesError =
-        (payload?.message as string) ||
-        'La API de paquetes de contactos rechazo la consulta. Tu sesion sigue activa.'
-      renderApp()
-      return
-    }
+      if (response.status === 401) {
+        state.contactPackagesState = 'error'
+        state.contactPackagesError =
+          (payload?.message as string) ||
+          'La API de paquetes de contactos rechazo la consulta. Tu sesion sigue activa.'
+        renderApp()
+        return
+      }
 
-    if (!response.ok) {
-      throw new Error(
-        (payload?.error as string) ||
+      if (!response.ok) {
+        throw new Error(
+          (payload?.error as string) ||
           (payload?.message as string) ||
           'No se pudo cargar la informacion de paquetes de contactos.',
-      )
-    }
+        )
+      }
 
-    const remoteData = Array.isArray(payload?.data) ? (payload.data as ContactPackagesApiItem[]) : []
-    const paginationData = (payload?.paginacion as {
-      total_registros?: number
-      ultima_pagina?: number
-      pagina_actual?: number
-      por_pagina?: number
-      desde?: number
-      hasta?: number
-    } | undefined) ?? null
-    const totalItems = Number(
-      paginationData?.total_registros ??
+      const remoteData = Array.isArray(payload?.data) ? (payload.data as ContactPackagesApiItem[]) : []
+      const paginationData = (payload?.paginacion as {
+        total_registros?: number
+        ultima_pagina?: number
+        pagina_actual?: number
+        por_pagina?: number
+        desde?: number
+        hasta?: number
+      } | undefined) ?? null
+      const totalItems = Number(
+        paginationData?.total_registros ??
         (payload?.meta as { total?: number } | undefined)?.total ??
         payload?.count ??
         remoteData.length ??
         0,
-    )
+      )
 
-    if (remoteData.length === 0 && requestedPage > 1) {
-      state.contactPackagesPage = requestedPage - 1
-      state.contactPackagesHasMore = false
-      state.contactPackagesState = 'idle'
-      state.contactPackagesError = null
+      if (remoteData.length === 0 && requestedPage > 1) {
+        state.contactPackagesPage = requestedPage - 1
+        state.contactPackagesHasMore = false
+        state.contactPackagesState = 'idle'
+        state.contactPackagesError = null
+        renderApp()
+        return
+      }
+
+      state.contactPackages = remoteData
+      state.contactPackagesTotalItems = Number.isFinite(totalItems) ? totalItems : remoteData.length
+      state.contactPackagesHasMore =
+        typeof paginationData?.ultima_pagina === 'number'
+          ? state.contactPackagesPage < paginationData.ultima_pagina
+          : remoteData.length >= state.contactPackagesPageSize
+      state.contactPackagesSyncedAt = new Date().toISOString()
+      contactPackagesLastLoadKey = loadKey
+      contactPackagesLastLoadedAt = Date.now()
+    } catch (error) {
+      state.contactPackagesState = 'error'
+      state.contactPackagesError =
+        error instanceof Error ? error.message : 'No se pudo consultar la API de paquetes de contactos.'
       renderApp()
       return
     }
 
-    state.contactPackages = remoteData
-    state.contactPackagesTotalItems = Number.isFinite(totalItems) ? totalItems : remoteData.length
-    state.contactPackagesHasMore =
-      typeof paginationData?.ultima_pagina === 'number'
-        ? state.contactPackagesPage < paginationData.ultima_pagina
-        : remoteData.length >= state.contactPackagesPageSize
-    state.contactPackagesSyncedAt = new Date().toISOString()
-  } catch (error) {
-    state.contactPackagesState = 'error'
-    state.contactPackagesError =
-      error instanceof Error ? error.message : 'No se pudo consultar la API de paquetes de contactos.'
+    state.contactPackagesState = 'idle'
     renderApp()
-    return
-  }
+  })().finally(() => {
+    contactPackagesLoadPromise = null
+  })
 
-  state.contactPackagesState = 'idle'
-  renderApp()
+  return contactPackagesLoadPromise
 }
 
 const refreshEmsPipelineFromApis = async () => {
@@ -1559,25 +2370,84 @@ const refreshEmsPipelineFromApis = async () => {
       loadTrackingApiCatalogPackages(),
       ensureAllContactPackagesForFilters(),
     ])
+    const syncResponse = await authFetch('/api/pipeline/sync-packages', {
+      method: 'POST',
+      timeoutMs: 120000,
+    })
+    const syncPayload = await parseApiPayload(syncResponse)
+
+    if (syncResponse.status === 401) {
+      clearSession()
+      state.loginError = 'Tu sesion expiro. Vuelve a iniciar sesion.'
+      state.emsPipelineSyncState = 'idle'
+      renderApp()
+      return
+    }
+
+    if (!syncResponse.ok) {
+      throw new Error(
+        (syncPayload?.message as string) ||
+        (syncPayload?.error as string) ||
+        'No se pudo sincronizar el pipeline EMS.',
+      )
+    }
+
+    const scopeKeys = [
+      'received',
+      'transit',
+      'regional',
+      'courier',
+      'delivered',
+      'cancelled',
+      ...state.pipelineConfig.customColumns.map((column) => column.id),
+    ]
+
+    await Promise.all(
+      scopeKeys.map((scope) => loadEmsPipelineScopePage(scope, 1, { silent: true, timeoutMs: 60000 })),
+    )
+
     state.emsPipelineSyncSummary = {
-      total:
-        (state.trackingApiCatalogPackages.length > 0 ? state.trackingApiCatalogPackages.length : state.trackingApiPackages.length) +
-        (state.contactPackagesCatalogLoaded ? state.contactPackagesCatalog.length : state.contactPackages.length),
-      createdCount:
-        state.trackingApiCatalogPackages.length > 0 ? state.trackingApiCatalogPackages.length : state.trackingApiPackages.length,
-      updatedCount: state.contactPackagesCatalogLoaded ? state.contactPackagesCatalog.length : state.contactPackages.length,
-      syncedAt: new Date().toISOString(),
+      total: Number(syncPayload?.total ?? 0),
+      createdCount: Number(syncPayload?.createdCount ?? 0),
+      updatedCount: Number(syncPayload?.updatedCount ?? 0),
+      syncedAt: String(syncPayload?.syncedAt ?? new Date().toISOString()),
     }
   } catch (error) {
     state.emsPipelineSyncState = 'error'
     state.emsPipelineSyncError =
       error instanceof Error ? error.message : 'No se pudo sincronizar el pipeline EMS.'
+    await ensureApiPipelineStateSourcesLoaded()
+    await reloadEmsPipelinePages()
+    state.emsPipelineSyncSummary = null
+    state.emsPipelineSyncState = 'idle'
+    state.notice = 'La sincronizacion remota fallo, pero se cargo el tablero con los datos locales disponibles.'
     renderApp()
     return
   }
 
   state.emsPipelineSyncState = 'idle'
   renderApp()
+}
+
+const reloadEmsPipelinePages = async () => {
+  const scopeKeys = [
+    'received',
+    'transit',
+    'regional',
+    'courier',
+    'delivered',
+    'cancelled',
+    ...state.pipelineConfig.customColumns.map((column) => column.id),
+  ]
+
+  await Promise.all(
+    scopeKeys.map((scope) => loadEmsPipelineScopePage(scope, 1, { silent: true, timeoutMs: 60000 })),
+  )
+}
+
+const bootstrapEmsPipelineView = () => {
+  void ensureApiPipelineStateSourcesLoaded()
+  void reloadEmsPipelinePages()
 }
 
 const lookupPackageCode = async () => {
@@ -1609,8 +2479,8 @@ const lookupPackageCode = async () => {
     if (!response.ok) {
       throw new Error(
         (payload?.error as string) ||
-          (payload?.message as string) ||
-          'No se pudo consultar el codigo en las APIs.',
+        (payload?.message as string) ||
+        'No se pudo consultar el codigo en las APIs.',
       )
     }
 
@@ -1620,6 +2490,160 @@ const lookupPackageCode = async () => {
     state.packageCodeLookupState = 'error'
     state.packageCodeLookupError =
       error instanceof Error ? error.message : 'No se pudo consultar el codigo en las APIs.'
+  }
+
+  renderApp()
+}
+
+const performScannerSearch = async (rawCode: string) => {
+  const code = (rawCode || '').trim().toUpperCase()
+  if (!code) return
+
+  state.scannerQuery = code
+  state.scannerResult = null
+  state.scannerEventsState = 'idle'
+  state.scannerEventsError = null
+  state.scannerQueryState = 'loading'
+  state.scannerQueryError = null
+  renderApp()
+
+  try {
+    const sourcePackages = state.trackingApiCatalogPackages.length > 0
+      ? state.trackingApiCatalogPackages
+      : state.trackingApiPackages
+
+    let matched: any = sourcePackages.find((pkg) => {
+      const c = String(pkg.codigo_s10 || pkg.codigo || '').toUpperCase()
+      const pid = String(pkg.mailitm_pid || '').toUpperCase()
+      return c === code || pid === code
+    })
+
+    let searchWarning: string | null = null
+    if (!matched) {
+      const response = await authFetch(`/api/tracking/paquetes?q=${encodeURIComponent(code)}&page=1&per_page=20`)
+      const payload = await parseApiPayload(response)
+
+      if (response.status === 401) {
+        clearSession()
+        state.loginError = 'Tu sesion expiro. Vuelve a iniciar sesion.'
+        state.scannerQueryState = 'idle'
+        renderApp()
+        return
+      }
+
+      if (!response.ok) {
+        throw new Error(
+          (payload?.error as string) ||
+          (payload?.message as string) ||
+          'No se pudo consultar el código en tracking.',
+        )
+      }
+
+      searchWarning = typeof payload?.warning === 'string' ? payload.warning : null
+      const items = Array.isArray(payload?.data) ? payload.data : []
+      matched = items.find((pkg: any) => {
+        const packageCode = String(pkg.codigo_s10 || pkg.codigo || '').toUpperCase()
+        const packageId = String(pkg.mailitm_pid || '').toUpperCase()
+        return packageCode === code || packageId === code
+      })
+    }
+
+    if (!matched) {
+      throw new Error(
+        searchWarning
+          ? `No se encontró ${code} en los datos sincronizados. ${searchWarning}`
+          : `No se encontró el paquete ${code} en tracking.`,
+      )
+    }
+
+    const trackingCode = String(matched.codigo_s10 || matched.codigo || code).trim().toUpperCase()
+    const calculatedStage = getTrackingPipelineStage(matched)
+    matched.stage = calculatedStage
+
+    state.scannerEventsState = 'loading'
+    state.scannerResult = matched
+    renderApp()
+
+    try {
+      const eventsResponse = await authFetch(`/api/tracking/paquetes/${encodeURIComponent(trackingCode)}/eventos`)
+      const eventsPayload = await parseApiPayload(eventsResponse)
+      if (eventsResponse.status === 401) {
+        clearSession()
+        state.loginError = 'Tu sesion expiro. Vuelve a iniciar sesion.'
+        state.scannerQueryState = 'idle'
+        state.scannerEventsState = 'idle'
+        renderApp()
+        return
+      }
+      if (!eventsResponse.ok) {
+        throw new Error(
+          (eventsPayload?.message as string) ||
+          (eventsPayload?.warning as string) ||
+          'No se pudo cargar el historial de movimientos.',
+        )
+      }
+
+      const eventItems = Array.isArray(eventsPayload?.data) ? eventsPayload.data : []
+      if (eventItems.length > 0) {
+        matched.eventos = eventItems.map((entry: any) => {
+          const event = entry?.evento && typeof entry.evento === 'object'
+            ? { ...entry, ...entry.evento }
+            : entry?.event && typeof entry.event === 'object'
+              ? { ...entry, ...entry.event }
+              : entry
+          return {
+            ...event,
+            fecha: event?.event_gmt_dt || event?.event_date || event?.fecha_evento || event?.fecha || '',
+            codigo_evento: event?.codigo_evento ?? event?.event_code ?? event?.event_type_cd ?? event?.event_id,
+            evento_api: event?.evento_api || event?.nombre || event?.event_name || event?.evento_original || '',
+            evento_original: event?.evento_original || event?.event_name || event?.nombre || '',
+            oficina: event?.oficina || event?.office_name || event?.off_name || event?.ubicacion || '',
+            detalle: event?.detalle || event?.description || event?.observacion || '',
+            movimiento_bolivia: event?.movimiento_bolivia || '',
+          }
+        }).sort((first: any, second: any) => {
+          const firstDate = Date.parse(first.fecha)
+          const secondDate = Date.parse(second.fecha)
+          if (!Number.isFinite(firstDate) || !Number.isFinite(secondDate)) return 0
+          return firstDate - secondDate
+        })
+      }
+      state.scannerEventsState = 'idle'
+      state.scannerEventsError = null
+    } catch (error) {
+      state.scannerEventsState = 'error'
+      state.scannerEventsError =
+        error instanceof Error ? error.message : 'No se pudieron cargar los movimientos del paquete.'
+    }
+
+    const now = new Date()
+    const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
+    const lastEv = Array.isArray(matched.eventos) && matched.eventos.length > 0 ? matched.eventos[matched.eventos.length - 1] : null
+    const eventDesc = lastEv
+      ? `Evento ${lastEv.codigo_evento || ''} ${lastEv.evento_api || lastEv.evento_original || 'Movimiento registrado'}`.trim()
+      : 'Sin movimientos registrados'
+    const stageIndex = internationalPipelineStages.indexOf(calculatedStage)
+
+    const existingLogIdx = state.scannerSessionLog.findIndex((l: any) => l.codigo === trackingCode)
+    const logItem = {
+      codigo: trackingCode,
+      stage: calculatedStage,
+      stageLabel: internationalPipelineStages[stageIndex] ? `Etapa ${stageIndex + 1}` : 'Sin etapa',
+      lastEvent: eventDesc,
+      time: timeStr,
+      pkg: matched,
+    }
+
+    if (existingLogIdx >= 0) {
+      state.scannerSessionLog.splice(existingLogIdx, 1)
+    }
+    state.scannerSessionLog.unshift(logItem)
+    state.scannerQueryState = 'idle'
+  } catch (err) {
+    state.scannerQueryState = 'error'
+    state.scannerQueryError = err instanceof Error ? err.message : 'Error al consultar código.'
+    state.scannerEventsState = 'idle'
+    state.scannerEventsError = null
   }
 
   renderApp()
@@ -1652,6 +2676,9 @@ const openEmsStatePackagesModal = (scope: EmsColumnKey | null = null) => {
   state.isEmsStatePackagesModalOpen = true
   state.emsStatePackagesModalScope = scope
   state.emsStatePackagesModalPage = 1
+  if (scope) {
+    void loadEmsPipelineScopePage(scope, 1, { silent: true })
+  }
   renderApp()
 }
 
@@ -1665,12 +2692,22 @@ const closeEmsStatePackagesModal = () => {
 const goToPrevEmsStatePackagesPage = () => {
   state.emsStatePackagesModalPage = Math.max(1, state.emsStatePackagesModalPage - 1)
   renderApp()
+  const scope = state.emsStatePackagesModalScope
+  if (!scope) return
+  const currentPage = getEmsPipelineScopePageState(scope).currentPage
+  state.emsStatePackagesModalPage = Math.max(1, currentPage - 1)
+  void loadEmsPipelineScopePage(scope, state.emsStatePackagesModalPage, { silent: true })
 }
 
 const goToNextEmsStatePackagesPage = () => {
   const pagination = getEmsStatePackagesModalPagination()
   state.emsStatePackagesModalPage = Math.min(pagination.totalPages, state.emsStatePackagesModalPage + 1)
   renderApp()
+  const scope = state.emsStatePackagesModalScope
+  if (!scope) return
+  const pageState = getEmsPipelineScopePageState(scope)
+  state.emsStatePackagesModalPage = Math.min(pageState.totalPages, pageState.currentPage + 1)
+  void loadEmsPipelineScopePage(scope, state.emsStatePackagesModalPage, { silent: true })
 }
 
 const clearPackageCodeLookupFilter = () => {
@@ -1680,13 +2717,101 @@ const clearPackageCodeLookupFilter = () => {
   renderApp()
 }
 
-const getTrackingApiPagination = () => {
-  return {
-    totalItems: state.trackingApiTotalItems || state.trackingApiPackages.length,
-    currentPage: Math.max(state.trackingApiPage, 1),
-    pageSize: state.trackingApiPageSize,
-    items: state.trackingApiPackages,
+const hasTrackingApiFilters = () =>
+  state.trackingApiStateFilter !== 'all' ||
+  state.trackingApiServiceFilter !== 'all' ||
+  state.trackingApiOriginFilter !== 'all' ||
+  state.trackingApiDestinationFilter !== 'all' ||
+  Boolean(state.packageCodeLookupResult?.found)
+
+const resetUnavailableTrackingApiFilters = () => {
+  const availableServices = new Set(getTrackingApiAvailableServices().map((item) => item.value))
+  const availableOrigins = new Set(getTrackingApiAvailableCountries('origen').map((item) => item.value))
+  const availableDestinations = new Set(getTrackingApiAvailableCountries('destino').map((item) => item.value))
+
+  if (state.trackingApiServiceFilter !== 'all' && !availableServices.has(state.trackingApiServiceFilter)) {
+    state.trackingApiServiceFilter = 'all'
+    localStorage.setItem(STORAGE_KEYS.trackingApiServiceFilter, 'all')
   }
+  if (state.trackingApiOriginFilter !== 'all' && !availableOrigins.has(state.trackingApiOriginFilter)) {
+    state.trackingApiOriginFilter = 'all'
+    localStorage.setItem(STORAGE_KEYS.trackingApiOriginFilter, 'all')
+  }
+  if (state.trackingApiDestinationFilter !== 'all' && !availableDestinations.has(state.trackingApiDestinationFilter)) {
+    state.trackingApiDestinationFilter = 'all'
+    localStorage.setItem(STORAGE_KEYS.trackingApiDestinationFilter, 'all')
+  }
+}
+
+const getTrackingApiPagination = () => {
+  const lookupPackage = getTrackingApiLookupPackage()
+
+  if (lookupPackage) {
+    return {
+      totalItems: 1,
+      currentPage: 1,
+      pageSize: 1,
+      totalPages: 1,
+      items: [lookupPackage],
+      lookupPackage,
+      hasMorePages: false,
+      mode: 'lookup' as const,
+    }
+  }
+
+  const filteredPackages = getFilteredTrackingApiPackages()
+  const isListFiltered = hasTrackingApiFilters()
+
+  if (!isListFiltered) {
+    const totalItems = state.trackingApiTotalItems || state.trackingApiPackages.length
+    const totalPages = Math.max(1, Math.ceil(totalItems / state.trackingApiPageSize))
+    const currentPage = Math.min(Math.max(state.trackingApiPage, 1), totalPages)
+
+    return {
+      totalItems,
+      currentPage,
+      pageSize: state.trackingApiPageSize,
+      totalPages,
+      items: state.trackingApiPackages,
+      lookupPackage,
+      hasMorePages: state.trackingApiHasMore && state.trackingApiState !== 'loading',
+      mode: 'remote' as const,
+    }
+  }
+
+  const totalItems = filteredPackages.length
+  const pageSize = state.trackingApiPageSize
+  const totalPages = Math.max(1, Math.ceil(totalItems / pageSize))
+  const currentPage = Math.min(Math.max(state.trackingApiPage, 1), totalPages)
+  const startIndex = (currentPage - 1) * pageSize
+
+  return {
+    totalItems,
+    currentPage,
+    pageSize,
+    totalPages,
+    items: filteredPackages.slice(startIndex, startIndex + pageSize),
+    lookupPackage,
+    hasMorePages: currentPage < totalPages,
+    mode: 'filtered' as const,
+  }
+}
+
+const getTrackingApiTableHead = () => {
+  return `
+    <thead>
+      <tr>
+        <th>Código</th>
+        <th>Origen</th>
+        <th>Estado</th>
+        <th>Destino</th>
+        <th>Peso</th>
+        <th>Teléfono origen</th>
+        <th>Teléfono destino</th>
+        <th>Acciones</th>
+      </tr>
+    </thead>
+  `
 }
 
 const getContactPackagesPagination = () => {
@@ -1708,12 +2833,12 @@ const getContactPackagesPagination = () => {
 }
 
 const getContactPackageTypeOptions = () =>
-  [...new Set((state.contactPackagesCatalogLoaded ? state.contactPackagesCatalog : state.contactPackages).map((item) => String(item.tipo ?? '').trim()).filter(Boolean))].sort((first, second) =>
+  [...new Set(getEffectiveContactPackages().map((item) => String(item.tipo ?? '').trim()).filter(Boolean))].sort((first, second) =>
     first.localeCompare(second, 'es'),
   )
 
 const getContactPackageStatusOptions = () =>
-  [...new Set((state.contactPackagesCatalogLoaded ? state.contactPackagesCatalog : state.contactPackages).map((item) => getContactPackageEstado(item)).filter(Boolean))].sort((first, second) =>
+  [...new Set(getEffectiveContactPackages().map((item) => getContactPackageEstado(item)).filter(Boolean))].sort((first, second) =>
     first.localeCompare(second, 'es'),
   )
 
@@ -1755,8 +2880,8 @@ const loadAllContactPackages = async () => {
     if (!response.ok) {
       throw new Error(
         (payloadAny?.message as string) ||
-          (payloadAny?.error as string) ||
-          'No se pudo cargar todos los paquetes para aplicar el filtro.',
+        (payloadAny?.error as string) ||
+        'No se pudo cargar todos los paquetes para aplicar el filtro.',
       )
     }
 
@@ -1817,39 +2942,39 @@ const exportContactPackagesToExcel = async () => {
       exportedItems.push(...pageItems)
       const paginationData = (payloadAny?.paginacion ?? payloadAny?.pagination ?? payloadAny?.meta ?? null) as
         | {
-            ultima_pagina?: number
-            last_page?: number
-            total_registros?: number
-            total?: number
-            por_pagina?: number
-            per_page?: number
-          }
+          ultima_pagina?: number
+          last_page?: number
+          total_registros?: number
+          total?: number
+          por_pagina?: number
+          per_page?: number
+        }
         | null
       const paginationLastPage = Number(
         paginationData?.ultima_pagina ??
-          paginationData?.last_page ??
-          payloadAny?.ultima_pagina ??
-          payloadAny?.last_page ??
-          payloadAny?.pagination?.last_page ??
-          payloadAny?.meta?.last_page,
+        paginationData?.last_page ??
+        payloadAny?.ultima_pagina ??
+        payloadAny?.last_page ??
+        payloadAny?.pagination?.last_page ??
+        payloadAny?.meta?.last_page,
       )
       const paginationTotalItems = Number(
         paginationData?.total_registros ??
-          paginationData?.total ??
-          payloadAny?.total_registros ??
-          payloadAny?.total ??
-          payloadAny?.pagination?.total_registros ??
-          payloadAny?.pagination?.total ??
-          payloadAny?.meta?.total_registros ??
-          payloadAny?.meta?.total,
+        paginationData?.total ??
+        payloadAny?.total_registros ??
+        payloadAny?.total ??
+        payloadAny?.pagination?.total_registros ??
+        payloadAny?.pagination?.total ??
+        payloadAny?.meta?.total_registros ??
+        payloadAny?.meta?.total,
       )
       const paginationPerPage = Number(
         paginationData?.por_pagina ??
-          paginationData?.per_page ??
-          payloadAny?.por_pagina ??
-          payloadAny?.per_page ??
-          payloadAny?.pagination?.per_page ??
-          payloadAny?.meta?.per_page,
+        paginationData?.per_page ??
+        payloadAny?.por_pagina ??
+        payloadAny?.per_page ??
+        payloadAny?.pagination?.per_page ??
+        payloadAny?.meta?.per_page,
       )
 
       lastPage =
@@ -1866,8 +2991,7 @@ const exportContactPackagesToExcel = async () => {
 
     const rows = exportedItems.map((item) => ({
       Código: item.codigo ?? '',
-      Tipo: item.tipo ?? '',
-      Estado: getContactPackageEstado(item),
+      Tipo: 'SIOP',
       Remitente: getContactPackageRemitenteName(item),
       'Teléfono remitente': getContactPackageRemitentePhone(item),
       Destinatario: getContactPackageDestinatarioName(item),
@@ -1900,21 +3024,25 @@ const exportContactPackagesToExcel = async () => {
 }
 
 const renderTrackingApiRows = () => {
-  const lookupResult = state.packageCodeLookupResult as Record<string, any> | null
-  const trackingLookupRecord =
-    lookupResult?.found && lookupResult?.tracking?.record ? [lookupResult.tracking.record] : null
   const pagination = getTrackingApiPagination()
-  const items = trackingLookupRecord ?? pagination.items
+  const items = pagination.items
+  const isLoadingTrackingStates =
+    state.trackingApiCatalogState === 'loading' &&
+    state.trackingApiCatalogPackages.length === 0 &&
+    state.trackingApiPackages.length === 0
 
   if (items.length === 0) {
     return `
       <tr>
-        <td class="international-empty" colspan="10">
-          ${
-            state.trackingApiState === 'loading'
-              ? 'Cargando paquetes desde la API de tracking...'
-              : 'Aún no se cargaron paquetes desde la API.'
-          }
+        <td class="international-empty" colspan="8">
+          ${state.trackingApiState === 'loading' || isLoadingTrackingStates
+        ? 'Cargando paquetes desde la API de tracking...'
+        : state.packageCodeLookupQuery.trim()
+          ? `No se encontraron paquetes para el codigo ${normalizeText(state.packageCodeLookupQuery)}.`
+          : state.trackingApiStateFilter === 'all'
+            ? 'Aún no se cargaron paquetes desde la API.'
+            : 'No hay paquetes para ese estado.'
+      }
         </td>
       </tr>
     `
@@ -1925,11 +3053,9 @@ const renderTrackingApiRows = () => {
       (item) => `
         <tr>
           <td><strong>${escapeHtml(item.codigo_s10 || item.codigo || 'Sin código')}</strong></td>
-          <td>${escapeHtml(getTrackingLocationName(item.origen))}</td>
-          <td>${escapeHtml(getTrackingLocationName(item.destino))}</td>
-          <td>${escapeHtml(getTrackingStatusValue(item))}</td>
-          <td>${escapeHtml(getTrackingDestinationPlaceValue(item))}</td>
-          <td>${escapeHtml(item.tipo_servicio || item.clase_correo || 'Sin servicio')}</td>
+          <td>${escapeHtml(getTrackingOriginPlaceValue(item))}</td>
+          <td>${escapeHtml(getTrackingVisibleStateValue(item))}</td>
+          <td>${escapeHtml(getTrackingDestinationLocationValue(item))}</td>
           <td>${escapeHtml(item.peso == null ? '—' : `${item.peso} Kg`)}</td>
           <td>${escapeHtml(getTrackingOriginPhoneValue(item))}</td>
           <td>${escapeHtml(getTrackingDestinationPhoneValue(item))}</td>
@@ -1952,11 +3078,10 @@ const renderContactPackagesRows = () => {
     return `
       <tr>
         <td class="international-empty" colspan="10">
-          ${
-            state.contactPackagesState === 'loading'
-              ? 'Cargando paquetes de contactos desde la API...'
-              : 'Aún no se cargaron paquetes de contactos desde la API.'
-          }
+          ${state.contactPackagesState === 'loading'
+        ? 'Cargando paquetes de contactos desde la API...'
+        : 'Aún no se cargaron paquetes de contactos desde la API.'
+      }
         </td>
       </tr>
     `
@@ -1979,9 +3104,8 @@ const renderContactPackagesRows = () => {
               <span class="international-country-code">${escapeHtml(getContactPackageDestinatarioPhone(item))}</span>
             </div>
           </td>
-          <td>${escapeHtml(getContactPackageEstado(item))}</td>
           <td>${escapeHtml(getContactPackageDestinationPlace(item))}</td>
-          <td>${escapeHtml(item.tipo || 'Sin tipo')}</td>
+          <td>${escapeHtml('SIOP')}</td>
           <td>${escapeHtml(item.fecha_registro ? formatConversationTimestamp(item.fecha_registro) : '—')}</td>
           <td>${escapeHtml(getContactPackageRemitentePhone(item))}</td>
           <td>${escapeHtml(getContactPackageDestinatarioPhone(item))}</td>
@@ -1995,34 +3119,46 @@ const renderContactPackagesRows = () => {
 }
 
 const renderTrackingApiPagination = () => {
-  const lookupResult = state.packageCodeLookupResult as Record<string, any> | null
   const pagination = getTrackingApiPagination()
   void renderTrackingApiRows()
-  const hasMorePages = state.trackingApiHasMore && state.trackingApiState !== 'loading'
-  const isLookupTrackingResult = Boolean(lookupResult?.found && lookupResult?.tracking?.record)
+  const hasMorePages = pagination.hasMorePages ?? (pagination.currentPage * pagination.pageSize < pagination.totalItems)
+  const isLookupTrackingResult = Boolean(pagination.lookupPackage)
+  const hasSelectedState = state.trackingApiStateFilter !== 'all'
+  const selectedStateOption = getTrackingApiSelectedStateOption()
+  const rangeStart = pagination.totalItems === 0 ? 0 : (pagination.currentPage - 1) * pagination.pageSize + 1
+  const rangeEnd = Math.min(pagination.currentPage * pagination.pageSize, pagination.totalItems)
+  const remoteTotalIsStillUnknown = pagination.mode === 'remote' && hasMorePages
 
   return `
     <div class="international-pagination">
       <div class="international-pagination-info">
-        <span>${
-          isLookupTrackingResult
-            ? 'Mostrando 1 resultado encontrado por el buscador'
-            : pagination.totalItems > 0
-              ? `Mostrando ${pagination.totalItems} registros en esta página`
-              : 'Sin registros para mostrar'
-        }</span>
-        <strong>${
-          isLookupTrackingResult
-            ? 'Resultado filtrado por código'
-            : `Página ${pagination.currentPage}${hasMorePages ? '  · más resultados' : ''}`
-        }</strong>
+        <span>${isLookupTrackingResult
+      ? 'Mostrando 1 resultado encontrado por el buscador'
+      : pagination.totalItems > 0
+        ? remoteTotalIsStillUnknown
+          ? `Mostrando ${rangeStart}-${rangeEnd} registros; hay mas paquetes en la API`
+          : hasSelectedState
+            ? `Mostrando ${rangeStart}-${rangeEnd} de ${pagination.totalItems} registros con estado ${selectedStateOption?.label ?? state.trackingApiStateFilter}`
+          : `Mostrando ${rangeStart}-${rangeEnd} de ${pagination.totalItems} registros`
+        : hasSelectedState
+          ? 'Sin registros para mostrar con ese estado'
+          : state.packageCodeLookupQuery.trim()
+            ? `No se encontraron paquetes para el codigo ${normalizeText(state.packageCodeLookupQuery)}.`
+            : 'Sin registros para mostrar'
+    }</span>
+        <strong>${isLookupTrackingResult
+      ? 'Resultado filtrado por código'
+      : hasSelectedState
+        ? `Página ${pagination.currentPage} de ${pagination.totalPages}${hasMorePages ? ' · más resultados' : ''}`
+        : `Página ${state.trackingApiPage}${hasMorePages ? ' · más resultados' : ''}`
+    }</strong>
       </div>
       <div class="international-pagination-actions">
         <button
           class="secondary-btn pagination-btn"
           type="button"
           id="tracking-page-prev"
-          ${isLookupTrackingResult || pagination.currentPage <= 1 || state.trackingApiState === 'loading' ? 'disabled' : ''}
+          ${isLookupTrackingResult || state.trackingApiPage <= 1 || state.trackingApiState === 'loading' ? 'disabled' : ''}
         >
           Anterior
         </button>
@@ -2030,7 +3166,7 @@ const renderTrackingApiPagination = () => {
           class="secondary-btn pagination-btn"
           type="button"
           id="tracking-page-next"
-          ${isLookupTrackingResult || !hasMorePages ? 'disabled' : ''}
+          ${isLookupTrackingResult || !hasMorePages || state.trackingApiState === 'loading' ? 'disabled' : ''}
         >
           Siguiente
         </button>
@@ -2051,22 +3187,20 @@ const renderContactPackagesPagination = () => {
   return `
     <div class="international-pagination">
       <div class="international-pagination-info">
-        <span>${
-          isLookupContactResult
-            ? 'Mostrando 1 resultado encontrado por el buscador'
-            : hasActiveFilters
-              ? `Mostrando ${pagination.totalItems} resultado${pagination.totalItems === 1 ? '' : 's'} filtrado${pagination.totalItems === 1 ? '' : 's'}`
-            : pagination.totalItems > 0
-              ? `Mostrando ${pagination.totalItems} registros en esta página`
-              : 'Sin registros para mostrar'
-        }</span>
-        <strong>${
-          isLookupContactResult
-            ? 'Resultado filtrado por código'
-            : hasActiveFilters
-              ? 'Filtro aplicado sobre todos los paquetes'
-            : `Página ${pagination.currentPage}${hasMorePages ? '  · más resultados' : ''}`
-        }</strong>
+        <span>${isLookupContactResult
+      ? 'Mostrando 1 resultado encontrado por el buscador'
+      : hasActiveFilters
+        ? `Mostrando ${pagination.totalItems} resultado${pagination.totalItems === 1 ? '' : 's'} filtrado${pagination.totalItems === 1 ? '' : 's'}`
+        : pagination.totalItems > 0
+          ? `Mostrando ${pagination.totalItems} registros en esta página`
+          : 'Sin registros para mostrar'
+    }</span>
+        <strong>${isLookupContactResult
+      ? 'Resultado filtrado por código'
+      : hasActiveFilters
+        ? 'Filtro aplicado sobre todos los paquetes'
+        : `Página ${pagination.currentPage}${hasMorePages ? '  · más resultados' : ''}`
+    }</strong>
       </div>
       <div class="international-pagination-actions">
         <button
@@ -2256,11 +3390,10 @@ const renderCountryWithFlag = (value: string | null | undefined, code?: string |
 
   return `
     <span class="international-country-cell" title="${escapeHtml([label, countryCode ? `(${countryCode})` : ''].filter(Boolean).join(' '))}">
-      ${
-        iso2
-          ? `<span class="international-country-flag fi ${getFlagIconClass(iso2)}" aria-hidden="true"></span>`
-          : ''
-      }
+      ${iso2
+      ? `<span class="international-country-flag fi ${getFlagIconClass(iso2)}" aria-hidden="true"></span>`
+      : ''
+    }
       <span class="international-country-copy">
         <span class="international-country-name">${escapeHtml(label)}</span>
         ${countryCode ? `<span class="international-country-code">${escapeHtml(countryCode)}</span>` : ''}
@@ -2273,9 +3406,9 @@ const getTrackingLocationName = (
   value:
     | string
     | {
-        codigo?: string | null
-        nombre?: string | null
-      }
+      codigo?: string | null
+      nombre?: string | null
+    }
     | null
     | undefined,
 ) => {
@@ -2289,8 +3422,39 @@ const getTrackingLocationName = (
 const getTrackingStatusValue = (item: TrackingApiPackage) =>
   normalizeText(item.estado?.nombre) || normalizeText(item.estado_postal) || 'Sin estado'
 
+const getTrackingVisibleStateValue = (item: TrackingApiPackage) => {
+  const latestEvent = getTrackingLatestEvent(item)
+
+  return (
+    normalizeText(latestEvent?.nombre ?? null) ||
+    normalizeText(latestEvent?.evento_api) ||
+    normalizeText(latestEvent?.evento_original) ||
+    normalizeText(latestEvent?.movimiento_bolivia) ||
+    normalizeText(latestEvent?.detalle) ||
+    getTrackingStatusValue(item)
+  )
+}
+
 const getTrackingDestinationPlaceValue = (item: TrackingApiPackage) =>
   normalizeText(item.destinatario?.direccion) || getTrackingLocationName(item.destino)
+
+const getTrackingOriginPlaceValue = (item: TrackingApiPackage) => {
+  const origin = item.origen
+  if (typeof origin === 'string') {
+    const originName = normalizeText(origin)
+    return originName && originName.toLowerCase() !== 'tracking api' ? originName : 'Sin dato'
+  }
+
+  const originName = normalizeText(origin?.nombre)
+  if (originName && originName.toLowerCase() !== 'tracking api') {
+    return originName
+  }
+
+  return normalizeText(origin?.codigo) || 'Sin dato'
+}
+
+const getTrackingDestinationLocationValue = (item: TrackingApiPackage) =>
+  getTrackingLocationName(item.destino)
 
 const getTrackingOriginPhoneValue = (item: TrackingApiPackage) =>
   normalizeText(item.telefonos?.remitente ?? null) ||
@@ -2303,6 +3467,274 @@ const getTrackingDestinationPhoneValue = (item: TrackingApiPackage) =>
   normalizeText(item.destinatario?.telefono ?? null) ||
   (typeof item.destino === 'string' ? '' : normalizeText(item.destino?.telefono ?? null)) ||
   '—'
+
+const getTrackingLatestEvent = (item: TrackingApiPackage) => {
+  const events = Array.isArray(item.eventos) ? item.eventos.filter(Boolean) : []
+  return [...events].sort((first, second) => {
+    const firstTimestamp = Date.parse(normalizeText(first?.fecha))
+    const secondTimestamp = Date.parse(normalizeText(second?.fecha))
+    const firstValue = Number.isFinite(firstTimestamp) ? firstTimestamp : 0
+    const secondValue = Number.isFinite(secondTimestamp) ? secondTimestamp : 0
+    return secondValue - firstValue
+  })[0] ?? null
+}
+
+const getInternationalIpsStage = (event?: TrackingApiEvent | null): EmsColumnKey | null => {
+  if (!event) return null
+
+  const eventId = Number(event.evento_id ?? event.codigo_evento ?? event.event_code ?? event.event_type_cd ?? event.event_id)
+  if (eventId === 37) return 'delivered'
+  if (eventId === 76) return 'cancelled'
+  if ([32, 36, 39, 73, 74, 75].includes(eventId)) return 'courier'
+  if ([13, 14, 35, 71, 72].includes(eventId)) return 'regional'
+  if ([31, 34, 38].includes(eventId)) return 'transit'
+  if ([1, 2, 3, 8, 12, 30].includes(eventId)) return 'received'
+
+  return null
+}
+
+const getPackageEventStage = (event?: TrackingApiEvent | null): EmsColumnKey | null => {
+  if (!event) return null
+
+  const eventId = Number(event.evento_id ?? event.codigo_evento)
+  if ([318, 295, 2239, 2240, 2241, 297, 2242].includes(eventId)) return 'received'
+  if ([168, 240, 296].includes(eventId)) return 'transit'
+  if ([310, 312, 183, 4410, 2103, 4405, 4404, 3345, 4400].includes(eventId)) return 'regional'
+  if ([4409, 315].includes(eventId)) return 'courier'
+  if (eventId === 316) return 'delivered'
+  if (eventId === 4402) return 'cancelled'
+
+  const eventText = normalizeCountryKey(
+    [event.nombre, event.evento_api, event.evento_original, event.movimiento_bolivia, event.detalle]
+      .filter(Boolean)
+      .join(' '),
+  )
+
+  if (eventText.includes('cancel') || eventText.includes('anul') || eventText.includes('rechaz')) return 'cancelled'
+  if (eventText.includes('devuelto')) return 'cancelled'
+  if (eventText.includes('entreg')) return 'delivered'
+  if (eventText.includes('cartero') || eventText.includes('reparto')) return 'courier'
+  if (
+    eventText.includes('regional') ||
+    eventText.includes('destino') ||
+    eventText.includes('listo para entregar') ||
+    eventText.includes('oficina de entrega') ||
+    eventText.includes('ventanilla')
+  ) {
+    return 'regional'
+  }
+  if (eventText.includes('saca interna') || eventText.includes('salida') || eventText.includes('transito')) return 'transit'
+  if (eventText.includes('recibido') || eventText.includes('origen') || eventText.includes('admis')) return 'received'
+
+  return null
+}
+
+const getPackageStageFromEvents = (item: { eventos?: TrackingApiPackage['eventos'] | null }) => {
+  const events = Array.isArray(item.eventos) ? item.eventos.filter(Boolean) : []
+  const latestEvent = getTrackingLatestEvent({ eventos: events } as TrackingApiPackage)
+  const latestEventId = Number(latestEvent?.evento_id ?? latestEvent?.codigo_evento)
+  const hasPreviousTransit = events.some((event) => getPackageEventStage(event) === 'transit')
+
+  if (latestEventId === 297 && hasPreviousTransit) {
+    return 'regional'
+  }
+
+  return getPackageEventStage(latestEvent)
+}
+
+const getPackageStageRank = (stage: EmsColumnKey | null | undefined) => {
+  if (stage === 'received') return 0
+  if (stage === 'transit') return 1
+  if (stage === 'regional') return 2
+  if (stage === 'courier') return 3
+  if (stage === 'delivered') return 4
+  if (stage === 'cancelled') return 5
+  return -1
+}
+
+const getMostAdvancedPackageStage = (...stages: Array<EmsColumnKey | null | undefined>) =>
+  stages
+    .filter((stage): stage is EmsColumnKey => Boolean(stage))
+    .sort((stageA, stageB) => getPackageStageRank(stageB) - getPackageStageRank(stageA))[0] ?? null
+
+const hasPackageTransfer = (item: Record<string, unknown>) =>
+  [
+    item.traspaso,
+    item.fecha_traspaso,
+    item.fechaTraspaso,
+    item.transferencia,
+    item.fecha_transferencia,
+    item.cod_especial,
+    item.codigo_especial,
+    item.codigoEspecial,
+    item.codigo_relacionado,
+    item.numero_despacho,
+  ].some((value) => normalizeText(String(value ?? '')).length > 0)
+
+const getTrackingApiLookupPackage = () => {
+  const lookupResult = state.packageCodeLookupResult as Record<string, any> | null
+  return lookupResult?.found && lookupResult?.tracking?.record ? (lookupResult.tracking.record as TrackingApiPackage) : null
+}
+
+const getTrackingApiSourcePackages = () =>
+  state.trackingApiCatalogPackages.length > 0 ? state.trackingApiCatalogPackages : state.trackingApiPackages
+
+const getTrackingApiServiceValue = (item: TrackingApiPackage) =>
+  normalizeText(item.tipo_servicio ?? null) || normalizeText(item.clase_correo ?? null) || 'Sin servicio'
+
+const getTrackingApiCountryValue = (
+  value:
+    | string
+    | {
+      codigo?: string | null
+      nombre?: string | null
+    }
+    | null
+    | undefined,
+) => normalizeText(getTrackingLocationName(value)) || 'Sin dato'
+
+const getTrackingApiEventStateLabel = (event?: TrackingApiEvent | null) =>
+  normalizeText(event?.nombre ?? null) ||
+  normalizeText(event?.evento_api ?? null) ||
+  normalizeText(event?.evento_original ?? null) ||
+  normalizeText(event?.movimiento_bolivia ?? null) ||
+  normalizeText(event?.detalle ?? null) ||
+  'Sin evento'
+
+const getTrackingApiPackageStateLabels = (item: TrackingApiPackage) => {
+  const events = Array.isArray(item.eventos) ? item.eventos.filter(Boolean) : []
+  const eventLabels = events.map((event) => getTrackingApiEventStateLabel(event)).filter(Boolean)
+  const fallbackLabels = eventLabels.length > 0 ? eventLabels : [getTrackingApiStateLabel(item)]
+  return [...new Set(fallbackLabels.map((label) => normalizeText(label)).filter(Boolean))]
+}
+
+const getPackageApiStateLabels = (item: { eventos?: TrackingApiPackage['eventos']; estado?: { nombre?: string | null } | null }) => {
+  const events = Array.isArray(item.eventos) ? item.eventos.filter(Boolean) : []
+  const eventLabels = events.map((event) => getTrackingApiEventStateLabel(event)).filter(Boolean)
+  const fallbackLabels = eventLabels.length > 0 ? eventLabels : [normalizeText(item.estado?.nombre ?? null)]
+  return [...new Set(fallbackLabels.map((label) => normalizeText(label)).filter(Boolean))]
+}
+
+const getTrackingApiAvailableStates = (): TrackingApiStateOption[] => {
+  const sourcePackages = getTrackingApiSourcePackages()
+  const stateMap = new Map<
+    string,
+    {
+      value: string
+      label: string
+      count: number
+      sampleCode: string
+    }
+  >()
+
+  sourcePackages.forEach((item) => {
+    const labels = getTrackingApiPackageStateLabels(item)
+
+    labels.forEach((label) => {
+      const normalizedLabel = normalizeText(label)
+      if (!normalizedLabel || normalizedLabel.toLowerCase() === 'sin estado') {
+        return
+      }
+
+      const value = normalizedLabel
+      const existing = stateMap.get(value)
+      if (existing) {
+        existing.count += 1
+        return
+      }
+
+      stateMap.set(value, {
+        value,
+        label: normalizedLabel,
+        count: 1,
+        sampleCode: normalizeText(item.codigo_s10 || item.codigo || 'Sin código'),
+      })
+    })
+  })
+
+  return [...stateMap.values()].sort((first, second) => {
+    if (first.count !== second.count) {
+      return second.count - first.count
+    }
+
+    return first.label.localeCompare(second.label, 'es')
+  })
+}
+
+const getTrackingApiAvailableServices = () => {
+  const serviceMap = new Map<string, { value: string; label: string; count: number }>()
+
+  getTrackingApiSourcePackages().forEach((item) => {
+    const label = getTrackingApiServiceValue(item)
+    const existing = serviceMap.get(label)
+    if (existing) {
+      existing.count += 1
+      return
+    }
+
+    serviceMap.set(label, { value: label, label, count: 1 })
+  })
+
+  return [...serviceMap.values()].sort((first, second) => {
+    if (first.count !== second.count) {
+      return second.count - first.count
+    }
+
+    return first.label.localeCompare(second.label, 'es')
+  })
+}
+
+const getTrackingApiAvailableCountries = (field: 'origen' | 'destino') => {
+  const countryMap = new Map<string, { value: string; label: string; count: number }>()
+
+  getTrackingApiSourcePackages().forEach((item) => {
+    const label = getTrackingApiCountryValue(field === 'origen' ? item.origen : item.destino)
+    const existing = countryMap.get(label)
+    if (existing) {
+      existing.count += 1
+      return
+    }
+
+    countryMap.set(label, { value: label, label, count: 1 })
+  })
+
+  return [...countryMap.values()].sort((first, second) => {
+    if (first.count !== second.count) {
+      return second.count - first.count
+    }
+
+    return first.label.localeCompare(second.label, 'es')
+  })
+}
+
+const getTrackingApiSelectedStateOption = () =>
+  getTrackingApiAvailableStates().find((option) => option.value === state.trackingApiStateFilter) ?? null
+
+const getFilteredTrackingApiPackages = () => {
+  const sourcePackages = getTrackingApiSourcePackages()
+  const lookupPackage = getTrackingApiLookupPackage()
+
+  if (lookupPackage) {
+    return [lookupPackage]
+  }
+
+  return sourcePackages.filter((item) => {
+    const matchesState =
+      state.trackingApiStateFilter === 'all' ||
+      getTrackingApiPackageStateLabels(item).includes(state.trackingApiStateFilter)
+    const matchesService =
+      state.trackingApiServiceFilter === 'all' ||
+      getTrackingApiServiceValue(item) === state.trackingApiServiceFilter
+    const matchesOrigin =
+      state.trackingApiOriginFilter === 'all' ||
+      getTrackingApiCountryValue(item.origen) === state.trackingApiOriginFilter
+    const matchesDestination =
+      state.trackingApiDestinationFilter === 'all' ||
+      getTrackingApiCountryValue(item.destino) === state.trackingApiDestinationFilter
+
+    return matchesState && matchesService && matchesOrigin && matchesDestination
+  })
+}
 
 const getContactPackageRemitente = (item: ContactPackagesApiItem) => {
   const anyItem = item as ContactPackagesApiItem & {
@@ -2337,14 +3769,64 @@ const getContactPackageDestinatarioPhone = (item: ContactPackagesApiItem) =>
 const getContactPackageEstado = (item: ContactPackagesApiItem) =>
   normalizeText(item.estado?.nombre ?? null) || 'Sin estado'
 
+const normalizeEmsPackageCode = (value: unknown) => normalizeText(String(value ?? '')).toUpperCase().replace(/\s+/g, '')
+
+const getTrackingPackageCode = (item: TrackingApiPackage) => {
+  const flexibleItem = item as TrackingApiPackage & Record<string, unknown>
+  return normalizeEmsPackageCode(
+    flexibleItem.codigo_s10 || flexibleItem.codigo || flexibleItem.codigoSeguimiento || flexibleItem.tracking,
+  )
+}
+
+const getContactPackageCode = (item: ContactPackagesApiItem) => {
+  const flexibleItem = item as ContactPackagesApiItem & Record<string, unknown>
+  return normalizeEmsPackageCode(
+    flexibleItem.codigo || flexibleItem.codigo_s10 || flexibleItem.codigoSeguimiento || flexibleItem.tracking,
+  )
+}
+
+const isNationalPackageCode = (code: unknown) => /^[A-Z]{1,2}\d+[A-Z]{2}$/.test(normalizeEmsPackageCode(code)) && normalizeEmsPackageCode(code).endsWith('BO')
+
+const isNationalTrackingPackage = (item: TrackingApiPackage) => isNationalPackageCode(getTrackingPackageCode(item))
+
+const isNationalContactPackage = (item: ContactPackagesApiItem) => isNationalPackageCode(getContactPackageCode(item))
+
 const getContactPackagePipelineStage = (item: ContactPackagesApiItem): EmsColumnKey => {
   const status = normalizeCountryKey(getContactPackageEstado(item))
+  const eventStage = getPackageStageFromEvents(item)
+  const configuredStage = findConfiguredPipelineStageForState(getContactPackageEstado(item))
+  const transferStage = hasPackageTransfer(item as Record<string, unknown>) ? 'transit' : null
+  const advancedMovementStage = getMostAdvancedPackageStage(configuredStage, eventStage, transferStage)
+
+  if (advancedMovementStage && advancedMovementStage !== 'received') {
+    return advancedMovementStage
+  }
 
   if (
     status.includes('entreg') ||
     status.includes('confirm')
   ) {
     return 'delivered'
+  }
+
+  if (
+    status.includes('cancel') ||
+    status.includes('anul') ||
+    status.includes('rechaz')
+  ) {
+    return 'cancelled'
+  }
+
+  if (
+    status.includes('regional') ||
+    status.includes('destino') ||
+    status.includes('recibido destino') ||
+    status.includes('recibido regional') ||
+    status.includes('sucursal de destino') ||
+    status.includes('pasar a recoger') ||
+    status.includes('ventanilla')
+  ) {
+    return 'regional'
   }
 
   if (
@@ -2356,20 +3838,33 @@ const getContactPackagePipelineStage = (item: ContactPackagesApiItem): EmsColumn
   }
 
   if (
-    status.includes('regional') ||
-    status.includes('destino') ||
-    status.includes('recibido')
-  ) {
-    return 'regional'
-  }
-
-  if (
     status.includes('transit') ||
     status.includes('camino') ||
     status.includes('despacho') ||
-    status.includes('aduana')
+    status.includes('aduana') ||
+    status.includes('seguimiento') ||
+    status.includes('activo') ||
+    status.includes('proceso') ||
+    status.includes('proces') ||
+    status.includes('en curso') ||
+    status.includes('ruta') ||
+    status.includes('clasific')
   ) {
     return 'transit'
+  }
+
+  if (
+    status.includes('recibido') ||
+    status.includes('origen') ||
+    status.includes('nuevo') ||
+    status.includes('ingreso') ||
+    status.includes('admis')
+  ) {
+    return 'received'
+  }
+
+  if (advancedMovementStage) {
+    return advancedMovementStage
   }
 
   return 'received'
@@ -2430,6 +3925,33 @@ const findContactByWhatsAppReferenceValue = (reference: string) => {
   )
 }
 
+const getEmsReferenceChannelState = (reference: string, contact: Contact | null) => {
+  if (contact?.id) {
+    return {
+      label: 'WhatsApp disponible',
+      toneClass: 'is-whatsapp',
+      isWhatsApp: true,
+      isCellPhone: false,
+    }
+  }
+
+  if (isCellPhoneNumber(reference)) {
+    return {
+      label: 'Celular disponible',
+      toneClass: 'is-cellphone',
+      isWhatsApp: false,
+      isCellPhone: true,
+    }
+  }
+
+  return {
+    label: 'Solo telefono',
+    toneClass: 'is-phone',
+    isWhatsApp: false,
+    isCellPhone: false,
+  }
+}
+
 const openContactConversationOrProfile = async (contactId: number) => {
   const contact = state.data?.contacts.find((item) => item.id === contactId)
   if (!contact) return
@@ -2448,6 +3970,8 @@ const buildEmsPackageCardFromTracking = (
   stage: EmsColumnKey,
 ): EmsPackageCard => {
   const code = normalizeReference(item?.codigo_s10) || normalizeReference(item?.codigo) || `TR-${index + 1}`
+  const id = `tracking-${item.mailitm_pid ?? code}`
+  const resolvedStage = state.emsStageOverrides[code.trim().toUpperCase()] ?? stage
   const senderReference =
     normalizeText(item.telefono ?? null) ||
     normalizeText(item.phone ?? null) ||
@@ -2464,11 +3988,16 @@ const buildEmsPackageCardFromTracking = (
   const senderName = normalizeText(item.remitente?.nombre ?? null) || getTrackingLocationName(item.origen)
   const recipientName = normalizeText(item.destinatario?.nombre ?? null) || getTrackingLocationName(item.destino)
   const destination = getTrackingDestinationPlaceValue(item)
-  const status = normalizeReference(item?.estado?.nombre) || normalizeReference(item?.estado_postal) || getEmsStatusLabel(stage)
+  const latestEvent = getTrackingLatestEvent(item)
+  const status =
+    (latestEvent ? getTrackingApiEventStateLabel(latestEvent) : '') ||
+    normalizeReference(item?.estado?.nombre) ||
+    normalizeReference(item?.estado_postal) ||
+    getEmsStatusLabel(stage)
 
   return {
-    id: `tracking-${item.mailitm_pid ?? code}`,
-    stage,
+    id,
+    stage: resolvedStage,
     code,
     title: `Tracking ${code}`,
     summary: normalizeText(item.contenido ?? null) || `${senderName} → ${recipientName}`,
@@ -2477,8 +4006,10 @@ const buildEmsPackageCardFromTracking = (
     recipientName,
     recipientReference,
     destination,
+    currentLocation: getEmsPipelineEventLocation(item),
+    department: getBolivianDepartmentKey(getEmsPipelineEventLocation(item)),
     status,
-    updatedAt: getEmsApiContactTimestamp(item?.fecha_registro || item?.eventos?.[0]?.fecha),
+    updatedAt: getEmsApiContactTimestamp(latestEvent?.fecha || item?.fecha_registro),
     sourceKind: 'tracking',
     sourceRecord: item,
   }
@@ -2490,16 +4021,19 @@ const buildEmsPackageCardFromContact = (
   stage: EmsColumnKey,
 ): EmsPackageCard => {
   const code = normalizeReference(item?.codigo) || `CP-${index + 1}`
+  const id = `contact-${item.id ?? code}`
+  const resolvedStage = state.emsStageOverrides[code.trim().toUpperCase()] ?? stage
   const senderName = getContactPackageRemitenteName(item)
   const senderReference = getContactPackageRemitentePhone(item)
   const recipientName = getContactPackageDestinatarioName(item)
   const recipientReference = getContactPackageDestinatarioPhone(item)
   const destination = getContactPackageDestinationPlace(item)
-  const status = getContactPackageEstado(item)
+  const latestEvent = getTrackingLatestEvent(item as unknown as TrackingApiPackage)
+  const status = (latestEvent ? getTrackingApiEventStateLabel(latestEvent) : '') || getContactPackageEstado(item)
 
   return {
-    id: `contact-${item.id ?? code}`,
-    stage,
+    id,
+    stage: resolvedStage,
     code,
     title: code,
     summary: `${senderName} → ${recipientName}`,
@@ -2508,82 +4042,40 @@ const buildEmsPackageCardFromContact = (
     recipientName,
     recipientReference,
     destination,
+    currentLocation: getEmsPipelineEventLocation(item),
+    department: getBolivianDepartmentKey(getEmsPipelineEventLocation(item)),
     status,
-    updatedAt: getEmsApiContactTimestamp(item?.fecha_registro),
+    updatedAt: getEmsApiContactTimestamp(latestEvent?.fecha || item?.fecha_registro),
     sourceKind: 'contact',
     sourceRecord: item,
   }
 }
 
-const getEmsApiStatusPackages = () => {
-  const trackingItems = state.trackingApiCatalogPackages.length > 0 ? state.trackingApiCatalogPackages : state.trackingApiPackages
-  const contactItems = state.contactPackagesCatalogLoaded ? state.contactPackagesCatalog : state.contactPackages
-  const selectedMonth = state.emsMonthFilter.trim() || 'all'
-  const matchesSelectedMonth = (value: unknown) => {
-    if (selectedMonth === 'all') {
-      return true
-    }
-
-    return getEmsMonthKeyFromValue(value) === selectedMonth
-  }
-
-  const filteredTrackingItems = trackingItems.filter((item) =>
-    matchesSelectedMonth(item?.fecha_registro || item?.eventos?.[0]?.fecha),
-  )
-  const filteredContactItems = contactItems.filter((item) => matchesSelectedMonth(item?.fecha_registro))
-
-  const received = filteredTrackingItems
-    .filter((item) => getTrackingPipelineStage(item) === 'received')
-    .map((item, index) => buildEmsPackageCardFromTracking(item, index, 'received'))
-    .concat(
-      filteredContactItems
-        .filter((item) => getContactPackagePipelineStage(item) === 'received')
-        .map((item, index) => buildEmsPackageCardFromContact(item, index, 'received')),
-    )
-
-  const transit = filteredTrackingItems
-    .filter((item) => getTrackingPipelineStage(item) === 'transit')
-    .map((item, index) => buildEmsPackageCardFromTracking(item, index, 'transit'))
-    .concat(
-      filteredContactItems
-        .filter((item) => getContactPackagePipelineStage(item) === 'transit')
-        .map((item, index) => buildEmsPackageCardFromContact(item, index, 'transit')),
-    )
-
-  const regional = filteredTrackingItems
-    .filter((item) => getTrackingPipelineStage(item) === 'regional')
-    .map((item, index) => buildEmsPackageCardFromTracking(item, index, 'regional'))
-    .concat(
-      filteredContactItems
-        .filter((item) => getContactPackagePipelineStage(item) === 'regional')
-        .map((item, index) => buildEmsPackageCardFromContact(item, index, 'regional')),
-    )
-
-  const courier = filteredTrackingItems
-    .filter((item) => getTrackingPipelineStage(item) === 'courier')
-    .map((item, index) => buildEmsPackageCardFromTracking(item, index, 'courier'))
-    .concat(
-      filteredContactItems
-        .filter((item) => getContactPackagePipelineStage(item) === 'courier')
-        .map((item, index) => buildEmsPackageCardFromContact(item, index, 'courier')),
-    )
-
-  const delivered = filteredTrackingItems
-    .filter((item) => getTrackingPipelineStage(item) === 'delivered')
-    .map((item, index) => buildEmsPackageCardFromTracking(item, index, 'delivered'))
-    .concat(
-      filteredContactItems
-        .filter((item) => getContactPackagePipelineStage(item) === 'delivered')
-        .map((item, index) => buildEmsPackageCardFromContact(item, index, 'delivered')),
-    )
+const getEmsApiStatusPackages = (): {
+  all: EmsPackageCard[]
+  received: EmsPackageCard[]
+  transit: EmsPackageCard[]
+  regional: EmsPackageCard[]
+  courier: EmsPackageCard[]
+  delivered: EmsPackageCard[]
+  cancelled: EmsPackageCard[]
+} => {
+  const trackingItems = getTrackingApiSourcePackages().filter(isNationalTrackingPackage)
+  const contactItems = getEffectiveContactPackages().filter(isNationalContactPackage)
+  const allCards = [
+    ...trackingItems.map((item, index) => buildEmsPackageCardFromTracking(item, index, getTrackingPipelineStage(item))),
+    ...contactItems.map((item, index) => buildEmsPackageCardFromContact(item, index, getContactPackagePipelineStage(item))),
+  ].filter((card) => matchesEmsPipelineFilters(card.updatedAt, card.currentLocation))
+  const buckets = createEmsStageBuckets(allCards)
 
   return {
-    all: [...received, ...transit, ...regional, ...courier, ...delivered],
-    received,
-    transit,
-    regional,
-    courier,
-    delivered,
+    all: buckets.all,
+    received: buckets.received,
+    transit: buckets.transit,
+    regional: buckets.regional,
+    courier: buckets.courier,
+    delivered: buckets.delivered,
+    cancelled: buckets.cancelled,
   }
 }
 
@@ -2755,13 +4247,15 @@ const submitWhatsAppTestNumber = async () => {
     if (!response.ok) {
       throw new Error(
         (payload?.error as string) ||
-          (payload?.message as string) ||
-          'No se pudo guardar el numero de prueba.',
+        (payload?.message as string) ||
+        'No se pudo guardar el numero de prueba.',
       )
     }
 
     applyWhatsAppTestNumbersPayload(payload)
     resetWhatsAppTestNumbersState()
+    state.logsError = null
+    state.logsState = state.logsState === 'error' ? 'idle' : state.logsState
     state.notice = isEditing
       ? 'Numero de prueba actualizado correctamente.'
       : 'Numero de prueba agregado correctamente.'
@@ -2795,13 +4289,15 @@ const deleteWhatsAppTestNumber = async (number: string) => {
     if (!response.ok) {
       throw new Error(
         (payload?.error as string) ||
-          (payload?.message as string) ||
-          'No se pudo eliminar el numero de prueba.',
+        (payload?.message as string) ||
+        'No se pudo eliminar el numero de prueba.',
       )
     }
 
     applyWhatsAppTestNumbersPayload(payload)
     resetWhatsAppTestNumbersState()
+    state.logsError = null
+    state.logsState = state.logsState === 'error' ? 'idle' : state.logsState
     state.notice = 'Numero de prueba eliminado correctamente.'
     renderApp()
   } catch (error) {
@@ -2824,12 +4320,45 @@ const ensureWhatsAppTestModeSourcesLoaded = async () => {
 
 const getTrackingPipelineStage = (item: TrackingApiPackage): EmsColumnKey => {
   const postalState = normalizeCountryKey(item.estado_postal)
-  const latestEvent = item.eventos?.[0]
+  const latestEvent = getTrackingLatestEvent(item)
+  const ipsStage = getInternationalIpsStage(latestEvent)
+  if (ipsStage) return ipsStage
+
+  const eventStage = getPackageStageFromEvents(item)
   const latestEventText = normalizeCountryKey(
-    [latestEvent?.evento_api, latestEvent?.evento_original, latestEvent?.movimiento_bolivia, latestEvent?.detalle]
+    [latestEvent?.nombre, latestEvent?.evento_api, latestEvent?.evento_original, latestEvent?.movimiento_bolivia, latestEvent?.detalle]
       .filter(Boolean)
       .join(' '),
   )
+  const latestEventLabel = [
+    latestEvent?.nombre,
+    latestEvent?.evento_api,
+    latestEvent?.evento_original,
+    latestEvent?.movimiento_bolivia,
+    latestEvent?.detalle,
+  ]
+    .filter(Boolean)
+    .join(' ')
+  const configuredStage =
+    findConfiguredPipelineStageForState(latestEventLabel) ??
+    findConfiguredPipelineStageForState(getTrackingApiStateLabel(item)) ??
+    findConfiguredPipelineStageForState(item.estado_postal)
+  const transferStage = hasPackageTransfer(item as Record<string, unknown>) ? 'transit' : null
+  const advancedMovementStage = getMostAdvancedPackageStage(configuredStage, eventStage, transferStage)
+
+  if (advancedMovementStage && advancedMovementStage !== 'received') {
+    return advancedMovementStage
+  }
+
+  if (
+    postalState.includes('cancel') ||
+    postalState.includes('anul') ||
+    latestEventText.includes('cancel') ||
+    latestEventText.includes('anul') ||
+    latestEventText.includes('rechaz')
+  ) {
+    return 'cancelled'
+  }
 
   if (
     postalState.includes('entreg') ||
@@ -2846,7 +4375,13 @@ const getTrackingPipelineStage = (item: TrackingApiPackage): EmsColumnKey => {
     postalState.includes('trÃ¡nsit') ||
     latestEventText.includes('salida') ||
     latestEventText.includes('transit') ||
-    latestEventText.includes('camino')
+    latestEventText.includes('camino') ||
+    latestEventText.includes('activo') ||
+    latestEventText.includes('proceso') ||
+    latestEventText.includes('proces') ||
+    latestEventText.includes('en curso') ||
+    latestEventText.includes('ruta') ||
+    latestEventText.includes('clasific')
   ) {
     return 'transit'
   }
@@ -2863,21 +4398,22 @@ const getTrackingPipelineStage = (item: TrackingApiPackage): EmsColumnKey => {
   if (
     postalState.includes('regional') ||
     postalState.includes('destino') ||
+    postalState.includes('ventanilla') ||
     latestEventText.includes('regional') ||
     latestEventText.includes('destino') ||
+    latestEventText.includes('ventanilla') ||
     latestEventText.includes('sucursal de destino') ||
     latestEventText.includes('recibido destino') ||
-    latestEventText.includes('recibido regional')
+    latestEventText.includes('recibido regional') ||
+    latestEventText.includes('pasar a recoger')
   ) {
     return 'regional'
   }
 
   if (
-    postalState.includes('ventanilla') ||
     postalState.includes('almacen') ||
     postalState.includes('almacen origen') ||
     postalState.includes('origen') ||
-    latestEventText.includes('ventanilla') ||
     latestEventText.includes('almacen') ||
     latestEventText.includes('almacen origen') ||
     latestEventText.includes('origen') ||
@@ -2888,18 +4424,33 @@ const getTrackingPipelineStage = (item: TrackingApiPackage): EmsColumnKey => {
     return 'received'
   }
 
+  if (advancedMovementStage) {
+    return advancedMovementStage
+  }
+
   return 'received'
 }
 
-const getTrackingPipelineColumns = () => {
-  const packages = state.trackingApiPackages
+const getTrackingPipelineColumns = (scope: 'all' | 'national' | 'international' = 'all') => {
+  const packages = getTrackingApiSourcePackages().filter((item) => {
+    if (scope === 'national') return isNationalTrackingPackage(item)
+    if (scope === 'international') return !isNationalTrackingPackage(item)
+    return true
+  })
+  const buckets = createEmsStageBuckets(
+    packages.map((item) => ({
+      ...item,
+      stage: getTrackingPipelineStage(item),
+    })),
+  )
 
   return {
-    received: packages.filter((item) => getTrackingPipelineStage(item) === 'received'),
-    regional: packages.filter((item) => getTrackingPipelineStage(item) === 'regional'),
-    transit: packages.filter((item) => getTrackingPipelineStage(item) === 'transit'),
-    courier: packages.filter((item) => getTrackingPipelineStage(item) === 'courier'),
-    delivered: packages.filter((item) => getTrackingPipelineStage(item) === 'delivered'),
+    received: buckets.received,
+    regional: buckets.regional,
+    transit: buckets.transit,
+    courier: buckets.courier,
+    delivered: buckets.delivered,
+    cancelled: buckets.cancelled,
   }
 }
 
@@ -2910,8 +4461,45 @@ const normalizeApiPipelineStateKey = (value: string) =>
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
 
+const normalizeAllowedStates = (value: unknown, fallback: string[] = []) => {
+  const source = Array.isArray(value) ? value : []
+  const nextValues = source
+    .map((entry) => normalizeApiPipelineStateKey(normalizeText(entry)))
+    .filter(Boolean)
+
+  if (nextValues.length === 0 && fallback.length > 0) {
+    return [...new Set(fallback.map((entry) => normalizeApiPipelineStateKey(normalizeText(entry))).filter(Boolean))]
+  }
+
+  return [...new Set(nextValues)]
+}
+
+const getPipelineColumnAllowedStateKeys = (column: EmsColumnKey | null) => {
+  if (!column) return []
+
+  return normalizeAllowedStates(state.pipelineConfig.columns[column]?.allowedStates ?? [], [
+    state.pipelineConfig.columns[column]?.title ?? '',
+  ])
+}
+
+const findConfiguredPipelineStageForState = (stateValue: string): EmsColumnKey | null => {
+  const normalizedState = normalizeApiPipelineStateKey(normalizeText(stateValue))
+  if (!normalizedState) {
+    return null
+  }
+
+  for (const key of ['received', 'transit', 'regional', 'courier', 'delivered', 'cancelled'] as EmsColumnKey[]) {
+    const allowedStates = getPipelineColumnAllowedStateKeys(key)
+    if (allowedStates.includes(normalizedState)) {
+      return key
+    }
+  }
+
+  return null
+}
+
 const getTrackingApiStateLabel = (item: TrackingApiPackage) => {
-  const latestEvent = item.eventos?.[0]
+  const latestEvent = getTrackingLatestEvent(item)
 
   return (
     normalizeText(item.estado?.nombre) ||
@@ -2925,20 +4513,17 @@ const getTrackingApiStateLabel = (item: TrackingApiPackage) => {
 }
 
 const getApiPipelineStateOptions = (scope: EmsColumnKey | null = null): ApiPipelineStateOption[] => {
-  const trackingPackages = state.trackingApiCatalogPackages.length > 0 ? state.trackingApiCatalogPackages : state.trackingApiPackages
-  const contactPackages = state.contactPackagesCatalogLoaded ? state.contactPackagesCatalog : state.contactPackages
-  const selectedMonth = state.emsMonthFilter.trim() || 'all'
-  const matchesSelectedMonth = (value: unknown) => {
-    if (selectedMonth === 'all') {
-      return true
-    }
-
-    return getEmsMonthKeyFromValue(value) === selectedMonth
-  }
+  const trackingPackages = getTrackingApiSourcePackages().filter(isNationalTrackingPackage)
+  const contactPackages = getEffectiveContactPackages().filter(isNationalContactPackage)
   const filteredTrackingPackages = trackingPackages.filter((item) =>
-    matchesSelectedMonth(item?.fecha_registro || item?.eventos?.[0]?.fecha),
+    matchesEmsPipelineFilters(
+      getTrackingLatestEvent(item)?.fecha || item?.fecha_registro,
+      getEmsPipelineEventLocation(item),
+    ),
   )
-  const filteredContactPackages = contactPackages.filter((item) => matchesSelectedMonth(item?.fecha_registro))
+  const filteredContactPackages = contactPackages.filter((item) =>
+    matchesEmsPipelineFilters(item?.fecha_registro, getEmsPipelineEventLocation(item)),
+  )
   const stateMap = new Map<
     string,
     {
@@ -2950,12 +4535,7 @@ const getApiPipelineStateOptions = (scope: EmsColumnKey | null = null): ApiPipel
       stages: Set<EmsColumnKey>
     }
   >()
-  const registeredKeys = new Set<string>([
-    ...Object.keys(state.pipelineConfig.columns),
-    ...Object.values(state.pipelineConfig.columns).map((column) => normalizeApiPipelineStateKey(column.title)),
-    ...state.pipelineConfig.customColumns.map((column) => column.id),
-    ...state.pipelineConfig.customColumns.map((column) => normalizeApiPipelineStateKey(column.title)),
-  ])
+  const scopeAllowedStates = getPipelineColumnAllowedStateKeys(scope)
 
   const registerState = (title: string, source: string, stage: EmsColumnKey) => {
     const normalizedTitle = normalizeText(title)
@@ -2987,11 +4567,13 @@ const getApiPipelineStateOptions = (scope: EmsColumnKey | null = null): ApiPipel
   }
 
   filteredTrackingPackages.forEach((item) => {
-    registerState(getTrackingApiStateLabel(item), 'Tracking', getTrackingPipelineStage(item))
+    const stage = getTrackingPipelineStage(item)
+    getPackageApiStateLabels(item).forEach((label) => registerState(label, 'Tracking', stage))
   })
 
   filteredContactPackages.forEach((item) => {
-    registerState(getContactPackageEstado(item), 'Paquetes', getContactPackagePipelineStage(item))
+    const stage = getContactPackagePipelineStage(item)
+    getPackageApiStateLabels(item).forEach((label) => registerState(label || getContactPackageEstado(item), 'Paquetes', stage))
   })
 
   const stageCounts: Record<EmsColumnKey, number> = {
@@ -3000,6 +4582,7 @@ const getApiPipelineStateOptions = (scope: EmsColumnKey | null = null): ApiPipel
     regional: 0,
     courier: 0,
     delivered: 0,
+    cancelled: 0,
   }
 
   filteredTrackingPackages.forEach((item) => {
@@ -3010,28 +4593,28 @@ const getApiPipelineStateOptions = (scope: EmsColumnKey | null = null): ApiPipel
     stageCounts[getContactPackagePipelineStage(item)] += 1
   })
 
-  ;(['received', 'transit', 'regional', 'courier', 'delivered'] as EmsColumnKey[]).forEach((stageKey) => {
-    const pipelineColumn = state.pipelineConfig.columns[stageKey]
-    const normalizedStateKey = normalizeApiPipelineStateKey(pipelineColumn.title)
+    ; (['received', 'transit', 'regional', 'courier', 'delivered', 'cancelled'] as EmsColumnKey[]).forEach((stageKey) => {
+      const pipelineColumn = getPipelineColumnConfig(stageKey)
+      const normalizedStateKey = normalizeApiPipelineStateKey(pipelineColumn.title)
 
-    if (!stateMap.has(normalizedStateKey)) {
-      stateMap.set(normalizedStateKey, {
-        stateKey: normalizedStateKey,
-        title: pipelineColumn.title,
-        helper: pipelineColumn.helper,
-        count: stageCounts[stageKey],
-        sources: new Set(['Pipeline']),
-        stages: new Set([stageKey]),
-      })
-      return
-    }
+      if (!stateMap.has(normalizedStateKey)) {
+        stateMap.set(normalizedStateKey, {
+          stateKey: normalizedStateKey,
+          title: pipelineColumn.title,
+          helper: pipelineColumn.helper,
+          count: stageCounts[stageKey],
+          sources: new Set(['Pipeline']),
+          stages: new Set([stageKey]),
+        })
+        return
+      }
 
-    const existing = stateMap.get(normalizedStateKey)
-    if (!existing) return
-    existing.count = Math.max(existing.count, stageCounts[stageKey])
-    existing.sources.add('Pipeline')
-    existing.stages.add(stageKey)
-  })
+      const existing = stateMap.get(normalizedStateKey)
+      if (!existing) return
+      existing.count = Math.max(existing.count, stageCounts[stageKey])
+      existing.sources.add('Pipeline')
+      existing.stages.add(stageKey)
+    })
 
   return [...stateMap.values()]
     .filter((item) => !scope || item.stages.has(scope))
@@ -3042,7 +4625,7 @@ const getApiPipelineStateOptions = (scope: EmsColumnKey | null = null): ApiPipel
       count: item.count,
       sources: [...item.sources].sort((first, second) => first.localeCompare(second, 'es')),
       stages: [...item.stages],
-      isRegistered: registeredKeys.has(item.stateKey) || registeredKeys.has(normalizeApiPipelineStateKey(item.title)),
+      isRegistered: scopeAllowedStates.includes(item.stateKey),
     }))
     .sort((first, second) => {
       if (second.count !== first.count) {
@@ -3058,6 +4641,10 @@ const ensureApiPipelineStateSourcesLoaded = async () => {
 
   if (state.trackingApiCatalogPackages.length === 0 && state.trackingApiCatalogState !== 'loading') {
     pendingLoads.push(loadTrackingApiCatalogPackages())
+  }
+
+  if (!state.contactPackagesCatalogLoaded) {
+    pendingLoads.push(loadAllContactPackages())
   }
 
   if (state.contactPackages.length === 0 && state.contactPackagesState !== 'loading') {
@@ -3093,8 +4680,8 @@ const toggleAiAssistanceForConversation = async (contactId: number, enabled: boo
     if (!response.ok) {
       throw new Error(
         (payload as { error?: string; message?: string } | null)?.error ||
-          (payload as { error?: string; message?: string } | null)?.message ||
-          'No se pudo actualizar la IA de la conversacion.',
+        (payload as { error?: string; message?: string } | null)?.message ||
+        'No se pudo actualizar la IA de la conversacion.',
       )
     }
 
@@ -3174,7 +4761,9 @@ const detectPhoneCountryFromNumber = (value: string) => {
     return null
   }
 
-  const phoneNumber = parsePhoneNumberFromString(`+${digits}`)
+  const phoneNumber =
+    parsePhoneNumberFromString(digits, defaultWhatsAppCountry.iso2) ??
+    parsePhoneNumberFromString(`+${digits}`)
   const detectedCountry = findPhoneCountryByIso2(phoneNumber?.country)
 
   if (!detectedCountry || !phoneNumber?.isPossible()) {
@@ -3226,6 +4815,19 @@ const buildWhatsAppReference = () => {
   const detectedPhone = detectPhoneCountryFromNumber(rawNumber)
 
   if (detectedPhone) {
+    const parsedPhone = parsePossiblePhoneNumber(
+      `+${detectedPhone.country.dialCode}${detectedPhone.localNumber}`,
+    )
+
+    if (!parsedPhone) {
+      throw new Error('El numero de WhatsApp debe ser un celular valido.')
+    }
+
+    const phoneType = parsedPhone.getType?.()
+    if (phoneType !== 'MOBILE' && phoneType !== 'FIXED_LINE_OR_MOBILE') {
+      throw new Error('El numero de WhatsApp debe ser un celular valido.')
+    }
+
     return `+${detectedPhone.country.dialCode}${detectedPhone.localNumber}`
   }
 
@@ -3233,6 +4835,17 @@ const buildWhatsAppReference = () => {
 
   if (!localDigits) {
     throw new Error('Escribe el numero de WhatsApp del contacto.')
+  }
+
+  const defaultPhone = parsePossiblePhoneNumber(`+${defaultWhatsAppCountry.dialCode}${localDigits}`)
+
+  if (!defaultPhone) {
+    throw new Error('El numero de WhatsApp debe ser un celular valido.')
+  }
+
+  const defaultPhoneType = defaultPhone.getType?.()
+  if (defaultPhoneType !== 'MOBILE' && defaultPhoneType !== 'FIXED_LINE_OR_MOBILE') {
+    throw new Error('El numero de WhatsApp debe ser un celular valido.')
   }
 
   return `+${defaultWhatsAppCountry.dialCode}${localDigits}`
@@ -3332,7 +4945,10 @@ const persistUiState = () => {
   try {
     localStorage.setItem(STORAGE_KEYS.sidebarCollapsed, String(state.isSidebarCollapsed))
     localStorage.setItem(STORAGE_KEYS.globalAiAgentEnabled, String(state.globalAiAgentEnabled))
-    localStorage.setItem(STORAGE_KEYS.emsMonthFilter, state.emsMonthFilter)
+    saveStoredJson(STORAGE_KEYS.emsStageOverrides, state.emsStageOverrides)
+    localStorage.setItem(STORAGE_KEYS.trackingApiServiceFilter, state.trackingApiServiceFilter)
+    localStorage.setItem(STORAGE_KEYS.trackingApiOriginFilter, state.trackingApiOriginFilter)
+    localStorage.setItem(STORAGE_KEYS.trackingApiDestinationFilter, state.trackingApiDestinationFilter)
     if (state.activeView) {
       localStorage.setItem(STORAGE_KEYS.activeView, state.activeView)
     } else {
@@ -3417,12 +5033,89 @@ const authFetch = async (
       headers,
       signal: abortController.signal,
     })
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new Error('La consulta tardo demasiado. Intenta nuevamente en unos segundos.')
+    }
+
+    throw error
   } finally {
     clearTimeout(timeoutId)
   }
 }
 
 const getApiUrl = (path: string) => `${API_BASE}${path}`
+
+let automationConfigLoaded = false
+let automationConfigLoading = false
+
+const loadAutomationConfig = async ({ force = false } = {}) => {
+  if ((!force && automationConfigLoaded) || automationConfigLoading || !state.authToken) return
+  automationConfigLoading = true
+  try {
+    const response = await authFetch('/api/settings/automation')
+    const payload = await parseApiPayload(response)
+  const data = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {}
+  if (!response.ok) throw new Error(typeof data.message === 'string' ? data.message : 'No se pudo cargar la configuracion.')
+  const returnedConfig = data.config
+  if (!returnedConfig || typeof returnedConfig !== 'object') throw new Error('La configuracion recibida no es valida.')
+  state.automationConfig = returnedConfig as typeof state.automationConfig
+    state.automationWatcherStatus =
+      data.watcher && typeof data.watcher === 'object'
+        ? data.watcher as typeof state.automationWatcherStatus
+        : null
+    state.latestInboundReplyStatus =
+      data.inboundReply && typeof data.inboundReply === 'object'
+        ? data.inboundReply as typeof state.latestInboundReplyStatus
+        : null
+    state.automationReconciliationStatus =
+      data.reconciliation && typeof data.reconciliation === 'object'
+        ? data.reconciliation as typeof state.automationReconciliationStatus
+        : null
+    automationConfigLoaded = true
+    renderApp()
+  } catch (error) {
+    state.automationConfigError = error instanceof Error ? error.message : 'No se pudo cargar la configuracion.'
+  } finally {
+    automationConfigLoading = false
+  }
+}
+
+const saveAutomationSettings = async (config: {
+  automaticWelcome: boolean
+  automaticStatusUpdates: boolean
+  aiAutoReply: boolean
+  welcomeResponseIntervalMs: number
+  eventChangeResponseIntervalMs: number
+  automaticReconciliation: boolean
+  reconciliationIntervalMs: number
+}) => {
+  if (state.automationConfigState === 'saving') return
+  state.automationConfigError = null
+  state.automationConfigNotice = null
+  state.automationConfigState = 'saving'
+  renderApp()
+  try {
+    const response = await authFetch('/api/settings/automation', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config),
+    })
+    const payload = await parseApiPayload(response)
+    const data = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {}
+    if (!response.ok) throw new Error(typeof data.message === 'string' ? data.message : 'No se pudo guardar la configuracion.')
+    const returnedConfig = data.config
+    if (!returnedConfig || typeof returnedConfig !== 'object') throw new Error('La configuracion recibida no es valida.')
+    state.automationConfig = returnedConfig as typeof state.automationConfig
+    state.automationConfigState = 'idle'
+    state.automationConfigNotice = 'Configuracion guardada correctamente.'
+    renderApp()
+  } catch (error) {
+    state.automationConfigState = 'idle'
+    state.automationConfigError = error instanceof Error ? error.message : 'No se pudo guardar la configuracion.'
+    renderApp()
+  }
+}
 
 const parseApiPayload = async (response: Response) => {
   const contentType = response.headers.get('content-type') ?? ''
@@ -3456,7 +5149,7 @@ const getStatusClass = (status: string) => {
   return 'badge'
 }
 
-const getEmsStatusKey = (contact: Contact): Exclude<EmsStatusFilter, 'all'> => {
+const getEmsStatusKey = (contact: Contact): BaseEmsColumnKey => {
   const latestMessage = String(contact.lastMessageText ?? '').trim().toLowerCase()
   const normalizedContactStatus = String(contact.status ?? '').trim().toLowerCase()
 
@@ -3504,6 +5197,16 @@ const getEmsStatusKey = (contact: Contact): Exclude<EmsStatusFilter, 'all'> => {
   }
 
   if (
+    latestMessage.includes('cancel') ||
+    latestMessage.includes('anul') ||
+    latestMessage.includes('rechaz') ||
+    normalizedContactStatus.includes('cancel') ||
+    normalizedContactStatus.includes('anul')
+  ) {
+    return 'cancelled'
+  }
+
+  if (
     normalizedContactStatus === 'activo' ||
     normalizedContactStatus === 'entregado' ||
     normalizedContactStatus.includes('entregado')
@@ -3521,6 +5224,7 @@ const getEmsStatusKey = (contact: Contact): Exclude<EmsStatusFilter, 'all'> => {
   if (contact.status === 'Nuevo') return 'received'
   if (contact.status === 'En seguimiento') return 'transit'
   if (contact.status === 'Propuesta') return 'transit'
+  if (contact.status === 'Cancelado') return 'cancelled'
   if (contact.status === 'Activo' || contact.status === 'Entregado') return 'delivered'
   return isContactConnected(contact) ? 'transit' : 'received'
 }
@@ -3530,13 +5234,41 @@ const getEmsStatusLabel = (status: Exclude<EmsStatusFilter, 'all'>) => {
   if (status === 'transit') return 'En Camino'
   if (status === 'regional') return 'Recibido Destino'
   if (status === 'courier') return 'Cartero'
+  if (status === 'cancelled') return 'Cancelado'
   return 'Entregado'
+}
+
+const isNewChatContact = (contact: Contact) => String(contact.status ?? '').trim().toLowerCase() === 'nuevo'
+
+const getChatStatusLabel = (contact: Contact) => {
+  if (isNewChatContact(contact)) {
+    return 'Nuevo'
+  }
+
+  return getEmsStatusLabel(getEmsStatusKey(contact))
+}
+
+const getChatPhaseLabel = (contact: Contact) => {
+  if (isNewChatContact(contact)) {
+    return 'Nuevo'
+  }
+
+  return getEmsPhaseLabel(contact)
+}
+
+const getChatPhaseDescription = (contact: Contact) => {
+  if (isNewChatContact(contact)) {
+    return 'Contacto sin paquete registrado todavía.'
+  }
+
+  return getEmsPhaseDescription(contact)
 }
 
 const getEmsStatusToneClass = (status: Exclude<EmsStatusFilter, 'all'>) => {
   if (status === 'received') return 'is-received'
   if (status === 'regional') return 'is-regional'
   if (status === 'transit') return 'is-transit'
+  if (status === 'cancelled') return 'is-cancelled'
   return 'is-delivered'
 }
 
@@ -3546,6 +5278,8 @@ const getEmsPhaseLabel = (contact: Contact) => {
   if (statusKey === 'transit') return 'Fase 2 (En Camino)'
   if (statusKey === 'regional') return 'Fase 3 (Recibido Destino)'
   if (statusKey === 'courier') return 'Fase 4 (Cartero)'
+  if (statusKey === 'delivered') return 'Fase 5 (Entregado)'
+  if (statusKey === 'cancelled') return 'Fase 6 (Cancelado)'
   return 'Fase 5 (Entregado)'
 }
 
@@ -3560,6 +5294,9 @@ const getEmsPhaseDescription = (contact: Contact) => {
   if (statusKey === 'courier') {
     return 'Paquete asignado a distribución y en proceso de entrega al destinatario.'
   }
+  if (statusKey === 'cancelled') {
+    return 'Envio cancelado o anulado. No continuara su flujo operativo.'
+  }
   if (statusKey === 'transit') {
     return 'Monitoreando trÃ¡nsito, guÃ­a y seguimiento operativo del paquete.'
   }
@@ -3571,6 +5308,32 @@ const getWhatsAppReference = (contact: Contact) =>
 
 const hasWhatsAppChannel = (contact: Contact) =>
   contact.socialProfiles?.some((profile) => profile.channel === 'WhatsApp') ?? false
+
+const isAutoReplyPausedContact = (contact: Contact | null | undefined) => {
+  const pausedUntil = contact?.autoReplyPause?.pausedUntil
+  if (!contact?.autoReplyPause?.isPaused || !pausedUntil) return false
+
+  const pausedUntilTime = new Date(pausedUntil).getTime()
+  return Number.isFinite(pausedUntilTime) && pausedUntilTime > Date.now()
+}
+
+const getAutoReplyPausedContacts = () => getChatContacts().filter(isAutoReplyPausedContact)
+
+const formatAutoReplyPauseRemaining = (contact: Contact | null | undefined) => {
+  const pausedUntil = contact?.autoReplyPause?.pausedUntil
+  if (!pausedUntil) return ''
+
+  const remainingMs = new Date(pausedUntil).getTime() - Date.now()
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) return ''
+
+  const totalMinutes = Math.ceil(remainingMs / 60000)
+  const hours = Math.floor(totalMinutes / 60)
+  const minutes = totalMinutes % 60
+
+  if (hours <= 0) return `${minutes} min`
+  if (minutes <= 0) return `${hours} h`
+  return `${hours} h ${minutes} min`
+}
 
 const getWhatsAppNumberCandidates = (value: unknown) => {
   const digits = normalizePhoneDigits(value)
@@ -3638,9 +5401,8 @@ const renderExpandableConversationText = (
   return `
     <div class="conversation-message-copy">
       <p class="${className}">${escapeHtml(visibleText)}</p>
-      ${
-        shouldCollapse
-          ? `
+      ${shouldCollapse
+      ? `
             <button
               class="conversation-message-toggle"
               data-toggle-message-expand="${messageId}"
@@ -3649,8 +5411,8 @@ const renderExpandableConversationText = (
               ${isExpanded ? 'Ver menos' : 'Ver mas'}
             </button>
           `
-          : ''
-      }
+      : ''
+    }
     </div>
   `
 }
@@ -3784,38 +5546,77 @@ const syncPipelineConfigFromDashboard = (data: DashboardData | null) => {
       received: {
         ...defaults.columns.received,
         ...(nextConfig?.columns?.received ?? {}),
+        allowedStates: normalizeAllowedStates(
+          nextConfig?.columns?.received?.allowedStates ?? defaults.columns.received.allowedStates,
+          defaults.columns.received.allowedStates,
+        ),
       },
       transit: {
         ...defaults.columns.transit,
         ...(nextConfig?.columns?.transit ?? {}),
+        allowedStates: normalizeAllowedStates(
+          nextConfig?.columns?.transit?.allowedStates ?? defaults.columns.transit.allowedStates,
+          defaults.columns.transit.allowedStates,
+        ),
       },
       regional: {
         ...defaults.columns.regional,
         ...(nextConfig?.columns?.regional ?? {}),
+        allowedStates: normalizeAllowedStates(
+          nextConfig?.columns?.regional?.allowedStates ?? defaults.columns.regional.allowedStates,
+          defaults.columns.regional.allowedStates,
+        ),
       },
       courier: {
         ...defaults.columns.courier,
         ...(nextConfig?.columns?.courier ?? {}),
+        allowedStates: normalizeAllowedStates(
+          nextConfig?.columns?.courier?.allowedStates ?? defaults.columns.courier.allowedStates,
+          defaults.columns.courier.allowedStates,
+        ),
       },
       delivered: {
         ...defaults.columns.delivered,
         ...(nextConfig?.columns?.delivered ?? {}),
+        allowedStates: normalizeAllowedStates(
+          nextConfig?.columns?.delivered?.allowedStates ?? defaults.columns.delivered.allowedStates,
+          defaults.columns.delivered.allowedStates,
+        ),
+      },
+      cancelled: {
+        ...defaults.columns.cancelled,
+        ...(nextConfig?.columns?.cancelled ?? {}),
+        allowedStates: normalizeAllowedStates(
+          nextConfig?.columns?.cancelled?.allowedStates ?? defaults.columns.cancelled.allowedStates,
+          defaults.columns.cancelled.allowedStates,
+        ),
       },
     },
     customColumns: Array.isArray(nextConfig?.customColumns)
       ? nextConfig.customColumns
-          .map((column) => ({
-            id: String(column?.id || '').trim(),
-            title: String(column?.title || '').trim(),
-            helper: String(column?.helper || '').trim(),
-          }))
-          .filter((column) => column.id && column.title)
+        .map((column) => ({
+          id: String(column?.id || '').trim(),
+          title: String(column?.title || '').trim(),
+          helper: String(column?.helper || '').trim(),
+          allowedStates: normalizeAllowedStates(column?.allowedStates ?? [], []),
+        }))
+        .filter((column) => column.id && column.title)
       : [],
   }
   state.pipelineConfigState = 'idle'
   state.pipelineConfigError = null
   state.customEmsColumnDraftName = ''
   state.customEmsColumnDraftHelper = ''
+}
+
+const syncEmsStageOverridesFromDashboard = (data: DashboardData | null) => {
+  const overrides = data?.emsStageOverrides ?? {}
+  state.emsStageOverrides = Object.fromEntries(
+    Object.entries(overrides)
+      .map(([packageCode, stage]) => [String(packageCode).trim().toUpperCase(), String(stage).trim().toLowerCase()])
+      .filter(([packageCode, stage]) => Boolean(packageCode) && ['received', 'transit', 'regional', 'courier', 'delivered', 'cancelled'].includes(stage)),
+  ) as EmsStageOverrideMap
+  saveStoredJson(STORAGE_KEYS.emsStageOverrides, state.emsStageOverrides)
 }
 
 const setPipelineColumnConfig = (column: EmsColumnKey, nextConfig: Partial<PipelineColumnConfig>) => {
@@ -3840,7 +5641,7 @@ const addCustomPipelineColumn = (title: string, helper: string) => {
     return false
   }
 
-  const baseIds = ['received', 'transit', 'regional', 'courier', 'delivered']
+  const baseIds = ['received', 'transit', 'regional', 'courier', 'delivered', 'cancelled']
   const nextIdBase = normalizedTitle
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
@@ -3880,6 +5681,8 @@ const removeCustomPipelineColumn = (columnId: string) => {
     ...state.pipelineConfig,
     customColumns: state.pipelineConfig.customColumns.filter((column) => column.id !== columnId),
   }
+  const { [columnId]: _removedPage, ...remainingPages } = state.emsPipelineColumns
+  state.emsPipelineColumns = remainingPages
   const { [columnId]: _removedConfig, ...restConfigs } = state.prontsConfigs
   state.prontsConfigs = restConfigs
   if (state.prontsActiveColumn === columnId) {
@@ -3908,6 +5711,22 @@ const getFilteredContacts = () => {
   })
 }
 
+const getContactsPagination = () => {
+  const items = getFilteredContacts()
+  const totalItems = items.length
+  const totalPages = Math.max(1, Math.ceil(totalItems / CONTACT_LIST_PAGE_SIZE))
+  const currentPage = Math.min(Math.max(state.contactListPage, 1), totalPages)
+  const startIndex = (currentPage - 1) * CONTACT_LIST_PAGE_SIZE
+
+  return {
+    items: items.slice(startIndex, startIndex + CONTACT_LIST_PAGE_SIZE),
+    currentPage,
+    totalPages,
+    totalItems,
+    pageSize: CONTACT_LIST_PAGE_SIZE,
+  }
+}
+
 const getContactPreviewLine = (contact: Contact) => {
   const pieces = [contact.company, getWhatsAppReference(contact)].filter((value) => value && value.trim().length > 0)
   return pieces.length > 0 ? pieces.join(' · ') : 'Sin referencia disponible'
@@ -3928,15 +5747,255 @@ const getContactLastMessagePreview = (contact: Contact) => {
   return 'Sin mensajes recientes'
 }
 
+const getContactReminderState = (contact: Contact) => {
+  const lastMessage = String(contact.lastMessageText ?? '').trim()
+  const lastDirection = String(contact.lastMessageDirection ?? '').trim().toLowerCase()
+  const pending = lastDirection === 'outbound' && lastMessage.length > 0
+  const lastMessageAt = String(contact.lastMessageAt ?? '').trim()
+
+  if (!pending) {
+    return {
+      active: false,
+      label: 'Sin recordatorio',
+      note: 'Esperando un nuevo mensaje para activar seguimiento.',
+      timestamp: '',
+      preview: '',
+    }
+  }
+
+  return {
+    active: true,
+    label: 'Recordatorio pendiente',
+    note: truncateText(lastMessage, 96),
+    timestamp: lastMessageAt ? formatConversationTimestamp(lastMessageAt) : 'Sin hora',
+    preview: lastMessage,
+  }
+}
+
+const buildMessageNotificationKey = (contactId: number, timestamp: string, preview: string) =>
+  `${contactId}|${timestamp}|${preview}`
+
+const ensureMessageNotificationAudioContext = () => {
+  if (typeof window === 'undefined') {
+    return null
+  }
+
+  if (messageNotificationAudioContext) {
+    return messageNotificationAudioContext
+  }
+
+  const AudioContextCtor = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+
+  if (!AudioContextCtor) {
+    return null
+  }
+
+  try {
+    messageNotificationAudioContext = new AudioContextCtor()
+    return messageNotificationAudioContext
+  } catch {
+    return null
+  }
+}
+
+const playMessageNotificationTone = () => {
+  if (!messageNotificationToneUnlocked) {
+    return
+  }
+
+  const audioContext = ensureMessageNotificationAudioContext()
+  if (!audioContext) {
+    return
+  }
+
+  try {
+    const now = audioContext.currentTime
+    const oscillator = audioContext.createOscillator()
+    const gainNode = audioContext.createGain()
+
+    oscillator.type = 'sine'
+    oscillator.frequency.setValueAtTime(880, now)
+    oscillator.frequency.exponentialRampToValueAtTime(740, now + 0.16)
+
+    gainNode.gain.setValueAtTime(0.0001, now)
+    gainNode.gain.exponentialRampToValueAtTime(0.16, now + 0.02)
+    gainNode.gain.exponentialRampToValueAtTime(0.0001, now + 0.2)
+
+    oscillator.connect(gainNode)
+    gainNode.connect(audioContext.destination)
+    oscillator.start(now)
+    oscillator.stop(now + 0.22)
+    oscillator.onended = () => {
+      gainNode.disconnect()
+      oscillator.disconnect()
+    }
+  } catch {
+    // If the browser blocks audio, the visual toast still appears.
+  }
+}
+
+const showBrowserMessageNotification = (notification: MessageNotification) => {
+  if (typeof window === 'undefined' || typeof Notification === 'undefined') {
+    return
+  }
+
+  if (Notification.permission !== 'granted') {
+    return
+  }
+
+  // 1. Verificar soporte y permisos
+  if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+    try {
+      // Acceso directo con optional chaining para no romper los tipos del objeto
+      const contactName = notification?.contactName || 'Nuevo mensaje';
+      const preview = notification?.preview || '';
+      const contactAvatar = notification?.contactAvatar || '/default-avatar.png';
+      const contactId = notification?.contactId || '';
+
+      // Cast seguro (as any) en las opciones para evitar que TypeScript reclame por 'renotify'
+      const notificationOptions = {
+        body: preview,
+        icon: contactAvatar,
+        tag: `crm-message-${contactId}`,
+        renotify: true,
+        silent: true,
+        data: {
+          url: `/chat/${contactId}`
+        }
+      };
+
+      const browserNotification = new Notification(contactName, notificationOptions);
+
+      const autoCloseTimer = setTimeout(() => {
+        browserNotification.close();
+      }, MESSAGE_NOTIFICATION_DURATION_MS);
+
+      browserNotification.onclick = () => {
+        clearTimeout(autoCloseTimer);
+
+        if (typeof window.focus === 'function') {
+          window.focus();
+        }
+
+        if (contactId) {
+          openConversationModal(contactId);
+        }
+
+        browserNotification.close();
+      };
+
+    } catch (error) {
+      console.debug('Error al instanciar la notificación:', error);
+    }
+  }
+}
+
+const dismissMessageNotification = (notificationId: string) => {
+  const existingTimer = messageNotificationCleanupTimers.get(notificationId)
+  if (existingTimer) {
+    clearTimeout(existingTimer)
+    messageNotificationCleanupTimers.delete(notificationId)
+  }
+
+  const nextNotifications = state.messageNotifications.filter((item) => item.id !== notificationId)
+  if (nextNotifications.length === state.messageNotifications.length) {
+    return
+  }
+
+  state.messageNotifications = nextNotifications
+  renderApp()
+}
+
+const enqueueMessageNotification = (payload: {
+  contactId: number
+  contactName: string
+  preview: string
+  timestamp: string
+}) => {
+  const preview = truncateText(String(payload.preview ?? '').replace(/\s+/g, ' ').trim(), 96)
+  const normalizedTimestamp = String(payload.timestamp ?? '').trim()
+  const displayTimestamp = normalizedTimestamp ? formatConversationTimestamp(normalizedTimestamp) : ''
+  const notificationKey = buildMessageNotificationKey(payload.contactId, normalizedTimestamp, preview)
+
+  if (!preview || seenMessageNotificationKeys.has(notificationKey)) {
+    return
+  }
+
+  seenMessageNotificationKeys.add(notificationKey)
+  if (seenMessageNotificationKeys.size > 200) {
+    seenMessageNotificationKeys.clear()
+  }
+
+  const notification: MessageNotification = {
+    id: `message-notification-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    contactId: payload.contactId,
+    contactName: payload.contactName,
+    preview,
+    timestamp: displayTimestamp,
+    createdAt: new Date().toISOString(),
+  }
+
+  state.messageNotifications = [notification, ...state.messageNotifications].slice(0, 3)
+  renderApp()
+  playMessageNotificationTone()
+  showBrowserMessageNotification(notification)
+
+  const cleanupTimer = setTimeout(() => {
+    dismissMessageNotification(notification.id)
+  }, MESSAGE_NOTIFICATION_DURATION_MS)
+
+  messageNotificationCleanupTimers.set(notification.id, cleanupTimer)
+}
+
+const maybeNotifyIncomingMessage = (
+  previousSnapshot: { lastMessageAt?: string | null; lastMessageText?: string | null } | null,
+  nextContact: Contact,
+  nextLatestMessage: { direction: string; message: string; createdAt: string } | null,
+) => {
+  if (!nextLatestMessage) {
+    return
+  }
+
+  const nextDirection = String(nextLatestMessage.direction ?? '').trim().toLowerCase()
+  const nextMessage = String(nextLatestMessage.message ?? '').trim()
+  const nextTimestamp = String(nextLatestMessage.createdAt ?? '').trim()
+
+  if (nextDirection !== 'inbound' || !nextMessage || !nextTimestamp) {
+    return
+  }
+
+  const previousTimestamp = String(previousSnapshot?.lastMessageAt ?? '').trim()
+  const previousMessage = String(previousSnapshot?.lastMessageText ?? '').trim()
+
+  if (previousTimestamp === nextTimestamp && previousMessage === nextMessage) {
+    return
+  }
+
+  enqueueMessageNotification({
+    contactId: nextContact.id,
+    contactName: nextContact.name || 'Contacto',
+    preview: nextMessage,
+    timestamp: nextTimestamp,
+  })
+}
+
 const getEmsStatusContacts = () => {
   const contacts = getChatContacts()
+  const buckets = createEmsStageBuckets(
+    contacts.map((contact) => ({
+      ...contact,
+      stage: getEmsStatusKey(contact),
+    })),
+  )
   return {
     all: contacts,
-    received: contacts.filter((contact) => getEmsStatusKey(contact) === 'received'),
-    regional: contacts.filter((contact) => getEmsStatusKey(contact) === 'regional'),
-    transit: contacts.filter((contact) => getEmsStatusKey(contact) === 'transit'),
-    delivered: contacts.filter((contact) => getEmsStatusKey(contact) === 'delivered'),
-    courier: contacts.filter((contact) => getEmsStatusKey(contact) === 'courier'),
+    paused: contacts.filter(isAutoReplyPausedContact),
+    received: buckets.received,
+    regional: buckets.regional,
+    transit: buckets.transit,
+    delivered: buckets.delivered,
+    courier: buckets.courier,
+    cancelled: buckets.cancelled,
   }
 }
 
@@ -3946,60 +6005,63 @@ const getEmsApiContactTimestamp = (value: unknown) => {
   return Number.isFinite(parsed) ? new Date(parsed).toISOString() : new Date().toISOString()
 }
 
-const getEmsMonthKeyFromValue = (value: unknown) => {
-  const normalized = normalizeReference(value)
-  if (!normalized) return ''
+const getEffectiveContactPackages = () =>
+  state.contactPackagesCatalog.length > 0 ? state.contactPackagesCatalog : state.contactPackages
 
-  const parsed = Date.parse(normalized)
-  if (!Number.isFinite(parsed)) return ''
-
-  const date = new Date(parsed)
-  const year = date.getUTCFullYear()
-  const month = String(date.getUTCMonth() + 1).padStart(2, '0')
-  return `${year}-${month}`
+const getEmsPipelineDateKey = (value: unknown) => {
+  const parsed = Date.parse(normalizeReference(value))
+  return Number.isFinite(parsed) ? getBoliviaDateInputValue(new Date(parsed)) : ''
 }
 
-const formatEmsMonthLabel = (monthKey: string) => {
-  if (!monthKey || monthKey === 'all') {
-    return 'Todos los meses'
-  }
+const getEmsPipelineEventLocation = (item: TrackingApiPackage | ContactPackagesApiItem | null | undefined) => {
+  const latestEvent = item && 'eventos' in item ? getTrackingLatestEvent(item as TrackingApiPackage) : null
+  const locationEvent = latestEvent as
+    | (TrackingApiEvent & {
+        ubicacion?: string | null
+        lugar?: string | null
+        regional?: string | null
+        departamento?: string | null
+        ciudad?: string | null
+      })
+    | null
+  const eventLocation = [
+    locationEvent?.oficina,
+    locationEvent?.ubicacion,
+    locationEvent?.lugar,
+    locationEvent?.regional,
+    locationEvent?.departamento,
+    locationEvent?.ciudad,
+    locationEvent?.detalle,
+  ].map(normalizeText).find(Boolean)
 
-  const [yearPart, monthPart] = monthKey.split('-')
-  const year = Number(yearPart)
-  const month = Number(monthPart)
-
-  if (!Number.isFinite(year) || !Number.isFinite(month) || month < 1 || month > 12) {
-    return monthKey
-  }
-
-  const date = new Date(Date.UTC(year, month - 1, 1))
-  return new Intl.DateTimeFormat('es-BO', {
-    month: 'long',
-    year: 'numeric',
-    timeZone: 'America/La_Paz',
-  }).format(date)
+  return eventLocation || normalizeText((item as Record<string, any> | undefined)?.ubicacion) || ''
 }
 
-const getEmsMonthOptions = () => {
-  const trackingItems = state.trackingApiCatalogPackages.length > 0 ? state.trackingApiCatalogPackages : state.trackingApiPackages
-  const contactItems = state.contactPackagesCatalogLoaded ? state.contactPackagesCatalog : state.contactPackages
-  const monthMap = new Map<string, number>()
+const getBolivianDepartmentKey = (value: unknown) => {
+  const normalized = normalizeText(String(value ?? ''))
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+  const departments: Array<[string, string[]]> = [
+    ['la-paz', ['la paz', 'el alto', 'viacha', 'achocalla', 'lpz']],
+    ['cochabamba', ['cochabamba', 'cbba', 'sacaba', 'quillacollo']],
+    ['santa-cruz', ['santa cruz', 'scz', 'montero', 'warnes']],
+    ['oruro', ['oruro']],
+    ['potosi', ['potosi']],
+    ['tarija', ['tarija']],
+    ['chuquisaca', ['chuquisaca', 'sucre']],
+    ['beni', ['beni', 'trinidad', 'riberalta']],
+    ['pando', ['pando', 'cobija']],
+  ]
 
-  const registerMonth = (value: unknown) => {
-    const key = getEmsMonthKeyFromValue(value)
-    if (!key) return
-    monthMap.set(key, (monthMap.get(key) ?? 0) + 1)
-  }
+  return departments.find(([, aliases]) => aliases.some((alias) => normalized.includes(alias)))?.[0] ?? ''
+}
 
-  trackingItems.forEach((item) => registerMonth(item?.fecha_registro || item?.eventos?.[0]?.fecha))
-  contactItems.forEach((item) => registerMonth(item?.fecha_registro))
-
-  return [...monthMap.entries()]
-    .sort((first, second) => second[0].localeCompare(first[0]))
-    .map(([value, count]) => ({
-      value,
-      label: `${formatEmsMonthLabel(value)} (${count})`,
-    }))
+const matchesEmsPipelineFilters = (dateValue: unknown, departmentValue: unknown) => {
+  const dateKey = getEmsPipelineDateKey(dateValue)
+  if (!dateKey || dateKey < state.emsPipelineDateStart || dateKey > state.emsPipelineDateEnd) return false
+  if (state.emsPipelineDepartment === 'all') return true
+  return getBolivianDepartmentKey(departmentValue) === state.emsPipelineDepartment
 }
 
 const buildEmsApiContact = (
@@ -4031,9 +6093,31 @@ const buildEmsApiContact = (
     },
   }) as Contact
 
+const createEmsStageBuckets = <T extends { stage: EmsColumnKey }>(items: T[]) => {
+  const buckets: Record<
+    'all' | 'received' | 'transit' | 'regional' | 'courier' | 'delivered' | 'cancelled',
+    T[]
+  > = {
+    all: [],
+    received: [],
+    transit: [],
+    regional: [],
+    courier: [],
+    delivered: [],
+    cancelled: [],
+  }
+
+  for (const item of items) {
+    buckets.all.push(item)
+    buckets[item.stage]?.push(item)
+  }
+
+  return buckets
+}
+
 const getEmsApiStatusContacts = () => {
-  const trackingItems = state.trackingApiCatalogPackages.length > 0 ? state.trackingApiCatalogPackages : state.trackingApiPackages
-  const contactItems = state.contactPackagesCatalogLoaded ? state.contactPackagesCatalog : state.contactPackages
+  const trackingItems = getTrackingApiSourcePackages().filter(isNationalTrackingPackage)
+  const contactItems = getEffectiveContactPackages().filter(isNationalContactPackage)
 
   const received = trackingItems
     .filter((item) => getTrackingPipelineStage(item) === 'received')
@@ -4196,13 +6280,45 @@ const getEmsApiStatusContacts = () => {
         }),
     )
 
+  const cancelled = trackingItems
+    .filter((item) => getTrackingPipelineStage(item) === 'cancelled')
+    .map((item, index) => {
+      const code = normalizeReference(item?.codigo_s10) || normalizeReference(item?.codigo) || `TR-X-${index + 1}`
+      return buildEmsApiContact(
+        1500000 + index,
+        `Tracking ${code}`,
+        getTrackingDestinationPhoneValue(item) || getTrackingOriginPhoneValue(item) || 'Sin referencia',
+        'Cancelado',
+        getEmsApiContactTimestamp(item?.fecha_registro || item?.eventos?.[0]?.fecha),
+        normalizeReference(item?.estado?.nombre) || normalizeReference(item?.estado_postal) || 'Cancelado',
+        code,
+      )
+    })
+    .concat(
+      contactItems
+        .filter((item) => getContactPackagePipelineStage(item) === 'cancelled')
+        .map((item, index) => {
+          const code = normalizeReference(item?.codigo) || `CP-X-${index + 1}`
+          return buildEmsApiContact(
+            2500000 + index,
+            getContactPackageDestinatarioName(item) || `Paquete ${code}`,
+            getContactPackageRemitenteName(item) || getContactPackageRemitentePhone(item) || 'Paquetes-Contactos',
+            'Cancelado',
+            getEmsApiContactTimestamp(item?.fecha_registro),
+            normalizeReference(getContactPackageEstado(item)) || 'Cancelado',
+            code,
+          )
+        }),
+    )
+
   return {
-    all: [...received, ...transit, ...regional, ...courier, ...delivered],
+    all: [...received, ...transit, ...regional, ...courier, ...delivered, ...cancelled],
     received,
     transit,
     regional,
     courier,
     delivered,
+    cancelled,
   }
 }
 
@@ -4270,6 +6386,307 @@ const setEmsSearchQueryForColumn = (column: EmsColumnKey, value: string) => {
   state.emsDeliveredSearchQuery = value
 }
 
+const EMS_PIPELINE_PAGE_SIZE = 8
+
+const emsPipelineScopeLoadTokens = new Map<string, number>()
+
+const getEmsPipelineScopeSearchQuery = (scope: string) =>
+  scope === 'received' ||
+    scope === 'regional' ||
+    scope === 'transit' ||
+    scope === 'courier' ||
+    scope === 'delivered' ||
+    scope === 'cancelled'
+    ? getEmsSearchQueryForColumn(scope as EmsColumnKey)
+    : ''
+
+const getEmsPipelineScopePageState = (scope: string): EmsPipelineColumnPage => {
+  return (
+    state.emsPipelineColumns[scope] ?? {
+      items: [],
+      currentPage: 1,
+      totalPages: 1,
+      totalItems: 0,
+      pageSize: EMS_PIPELINE_PAGE_SIZE,
+      state: 'idle',
+      error: null,
+      syncedAt: null,
+      requestSignature: null,
+    }
+  )
+}
+
+const getLocalEmsPipelineScopeCards = (scope: string): EmsPackageCard[] => {
+  const stagedPackages = getEmsApiStatusPackages()
+  const normalizedScope = scope.trim().toLowerCase()
+
+  if (!normalizedScope || normalizedScope === 'all') {
+    return stagedPackages.all ?? []
+  }
+
+  if (
+    normalizedScope === 'received' ||
+    normalizedScope === 'transit' ||
+    normalizedScope === 'regional' ||
+    normalizedScope === 'courier' ||
+    normalizedScope === 'delivered' ||
+    normalizedScope === 'cancelled'
+  ) {
+    return stagedPackages[normalizedScope] ?? []
+  }
+
+  const customColumn = state.pipelineConfig.customColumns.find(
+    (column) => column.id === normalizedScope || normalizeText(column.title).trim().toLowerCase() === normalizedScope,
+  )
+
+  if (!customColumn) {
+    return []
+  }
+
+  const normalizedTitle = normalizeText(customColumn.title).trim().toLowerCase()
+  const allowedStates = new Set(
+    normalizeAllowedStates(customColumn.allowedStates ?? [], [customColumn.title]).map((value) => value.toLowerCase()),
+  )
+
+  return (stagedPackages.all ?? []).filter((card) => {
+    const normalizedStatus = normalizeText(card.status).trim().toLowerCase()
+    return (
+      normalizedStatus === normalizedTitle ||
+      allowedStates.has(card.stage) ||
+      allowedStates.has(normalizedStatus)
+    )
+  })
+}
+
+const getLocalEmsPipelineScopePage = async (
+  scope: string,
+  page: number,
+  pageSize: number,
+  query: string,
+) => {
+  await ensureApiPipelineStateSourcesLoaded()
+
+  const normalizedQuery = query.trim().toLowerCase()
+  const sourceCards = getLocalEmsPipelineScopeCards(scope)
+
+  const filteredCards = sourceCards.filter((card) => {
+    if (!matchesEmsPipelineFilters(card.updatedAt, card.currentLocation ?? card.destination)) return false
+
+    if (!normalizedQuery) {
+      return true
+    }
+
+    return [
+      card.code,
+      card.title,
+      card.summary,
+      card.senderName,
+      card.senderReference,
+      card.recipientName,
+      card.recipientReference,
+      card.destination,
+      card.status,
+    ].some((value) => normalizeText(value).trim().toLowerCase().includes(normalizedQuery))
+  })
+
+  filteredCards.sort((firstCard, secondCard) => {
+    const firstTime = Date.parse(firstCard.updatedAt || '')
+    const secondTime = Date.parse(secondCard.updatedAt || '')
+
+    if (Number.isFinite(firstTime) && Number.isFinite(secondTime) && firstTime !== secondTime) {
+      return secondTime - firstTime
+    }
+
+    if (Number.isFinite(firstTime) && !Number.isFinite(secondTime)) {
+      return -1
+    }
+
+    if (!Number.isFinite(firstTime) && Number.isFinite(secondTime)) {
+      return 1
+    }
+
+    return String(firstCard.code).localeCompare(String(secondCard.code), 'es')
+  })
+
+  const totalItems = filteredCards.length
+  const totalPages = Math.max(1, Math.ceil(totalItems / pageSize))
+  const currentPage = Math.min(Math.max(page, 1), totalPages)
+  const fromIndex = (currentPage - 1) * pageSize
+
+  return {
+    items: filteredCards.slice(fromIndex, fromIndex + pageSize),
+    currentPage,
+    totalItems,
+    totalPages,
+  }
+}
+
+const getEmsPipelineScopeSignature = (scope: string, page: number, pageSize: number, query: string) =>
+  [
+    scope,
+    state.emsPipelineDateStart,
+    state.emsPipelineDateEnd,
+    state.emsPipelineDepartment,
+    page,
+    pageSize,
+    query.trim().toLowerCase(),
+  ].join('|')
+
+void getLocalEmsPipelineScopePage
+
+const saveEmsPipelineScopePageState = (scope: string, nextState: EmsPipelineColumnPage) => {
+  state.emsPipelineColumns = {
+    ...state.emsPipelineColumns,
+    [scope]: nextState,
+  }
+}
+
+const loadEmsPipelineScopePage = async (
+  scope: string,
+  page = 1,
+  options: { pageSize?: number; silent?: boolean; timeoutMs?: number } = {},
+) => {
+  const pageSize = Math.max(1, options.pageSize ?? EMS_PIPELINE_PAGE_SIZE)
+  const timeoutMs = Math.max(1000, options.timeoutMs ?? 45000)
+  const query = getEmsPipelineScopeSearchQuery(scope)
+  const signature = getEmsPipelineScopeSignature(scope, page, pageSize, query)
+  const currentState = getEmsPipelineScopePageState(scope)
+  const isSameRequest =
+    currentState.requestSignature === signature &&
+    currentState.state === 'idle' &&
+    currentState.currentPage === page &&
+    currentState.pageSize === pageSize
+
+  if (isSameRequest) {
+    return
+  }
+
+  const requestToken = (emsPipelineScopeLoadTokens.get(scope) ?? 0) + 1
+  emsPipelineScopeLoadTokens.set(scope, requestToken)
+
+  if (!options.silent) {
+    saveEmsPipelineScopePageState(scope, {
+      ...currentState,
+      state: 'loading',
+      error: null,
+      requestSignature: signature,
+      pageSize,
+      currentPage: page,
+    })
+    renderApp()
+  } else {
+    saveEmsPipelineScopePageState(scope, {
+      ...currentState,
+      state: currentState.state === 'error' ? 'loading' : currentState.state,
+      error: null,
+      requestSignature: signature,
+      pageSize,
+      currentPage: page,
+    })
+  }
+
+  try {
+    const response = await authFetch(
+      `/api/ems/pipeline?scope=${encodeURIComponent(scope)}&page=${page}&per_page=${pageSize}&date_start=${encodeURIComponent(
+        state.emsPipelineDateStart,
+      )}&date_end=${encodeURIComponent(state.emsPipelineDateEnd)}&department=${encodeURIComponent(
+        state.emsPipelineDepartment,
+      )}&query=${encodeURIComponent(query)}`,
+      {
+        timeoutMs,
+      },
+    )
+    const payload = await parseApiPayload(response)
+    const payloadAny = payload as any
+
+    if (emsPipelineScopeLoadTokens.get(scope) !== requestToken) {
+      return
+    }
+
+    if (response.status === 401) {
+      clearSession()
+      state.loginError = 'Tu sesion expiro. Vuelve a iniciar sesion.'
+      saveEmsPipelineScopePageState(scope, {
+        ...currentState,
+        state: 'idle',
+        error: null,
+        requestSignature: signature,
+        pageSize,
+        currentPage: page,
+      })
+      renderApp()
+      return
+    }
+
+    if (!response.ok) {
+      throw new Error(
+        (payloadAny?.message as string) ||
+        (payloadAny?.error as string) ||
+        'No se pudo cargar la pagina del pipeline EMS.',
+      )
+    }
+
+    const pageItems = Array.isArray(payloadAny?.data) ? (payloadAny.data as EmsPackageCard[]) : []
+    const paginationData = (payloadAny?.pagination ?? payloadAny?.meta ?? null) as
+      | {
+        page?: number
+        total_pages?: number
+        total_items?: number
+        total?: number
+        per_page?: number
+      }
+      | null
+    const totalItems = Number(
+      paginationData?.total_items ??
+      paginationData?.total ??
+      payloadAny?.total ??
+      payloadAny?.count ??
+      pageItems.length,
+    )
+    const totalPages = Number(
+      paginationData?.total_pages ??
+      payloadAny?.total_pages ??
+      Math.max(1, Math.ceil((Number.isFinite(totalItems) ? totalItems : pageItems.length) / pageSize)),
+    )
+    const currentPage = Number(paginationData?.page ?? payloadAny?.page ?? page)
+
+    saveEmsPipelineScopePageState(scope, {
+      items: pageItems,
+      currentPage: Number.isFinite(currentPage) && currentPage > 0 ? currentPage : page,
+      totalPages: Number.isFinite(totalPages) && totalPages > 0 ? totalPages : 1,
+      totalItems: Number.isFinite(totalItems) ? totalItems : pageItems.length,
+      pageSize,
+      state: 'idle',
+      error: null,
+      syncedAt: new Date().toISOString(),
+      requestSignature: signature,
+    })
+  } catch (error) {
+    if (emsPipelineScopeLoadTokens.get(scope) !== requestToken) {
+      return
+    }
+
+    saveEmsPipelineScopePageState(scope, {
+      ...currentState,
+      state: 'error',
+      error: error instanceof Error ? error.message : 'No se pudo cargar la pagina del pipeline EMS.',
+      requestSignature: signature,
+      pageSize,
+      currentPage: page,
+    })
+  } finally {
+    if (emsPipelineScopeLoadTokens.get(scope) === requestToken) {
+      renderApp()
+    }
+  }
+}
+
+const goToEmsPipelineScopePage = (scope: string, nextPage: number) => {
+  const pagination = getEmsPipelineScopePageState(scope)
+  const targetPage = Math.min(Math.max(nextPage, 1), pagination.totalPages || 1)
+  void loadEmsPipelineScopePage(scope, targetPage)
+}
+
 const getEmsColumnContacts = (column: EmsColumnKey) => {
   const query = getEmsSearchQueryForColumn(column).trim().toLowerCase()
 
@@ -4289,6 +6706,59 @@ const getEmsColumnContacts = (column: EmsColumnKey) => {
       getContactLastMessagePreview(contact).toLowerCase().includes(query)
     )
   })
+}
+
+const getEmsStageOverride = (packageCode: string) => state.emsStageOverrides[packageCode.trim().toUpperCase()] ?? null
+
+const setEmsStageOverride = (packageCode: string, nextStage: EmsColumnKey) => {
+  state.emsStageOverrides = {
+    ...state.emsStageOverrides,
+    [packageCode.trim().toUpperCase()]: nextStage,
+  }
+  persistUiState()
+}
+
+const moveEmsPackageToStage = async (packageCode: string, nextStage: EmsColumnKey) => {
+  const normalizedPackageCode = packageCode.trim().toUpperCase()
+  const currentStage = getEmsStageOverride(normalizedPackageCode)
+  if (currentStage === nextStage) {
+    return false
+  }
+
+  try {
+    const response = await authFetch('/api/ems/stage-overrides', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        packageCode: normalizedPackageCode,
+        stage: nextStage,
+      }),
+    })
+
+    const payload = await parseApiPayload(response)
+
+    if (response.status === 401) {
+      clearSession()
+      state.loginError = 'Tu sesion expiro. Inicia sesion nuevamente.'
+      renderApp()
+      return false
+    }
+
+    if (!response.ok) {
+      throw new Error((payload?.message as string) || (payload?.error as string) || 'No se pudo guardar el estado del paquete.')
+    }
+
+    setEmsStageOverride(normalizedPackageCode, nextStage)
+    state.notice = `El paquete se movio a ${getEmsStatusLabel(nextStage)}.`
+    renderApp()
+    return true
+  } catch (error) {
+    state.notice = error instanceof Error ? error.message : 'No se pudo guardar el estado del paquete.'
+    renderApp()
+    return false
+  }
 }
 
 const prontsPresetMeta: Record<
@@ -4376,18 +6846,35 @@ const prontsPresetMeta: Record<
     accentClass: 'is-delivered',
     icon: '?',
   },
+  cancelled: {
+    badge: '6',
+    title: 'Columna 6: Cancelado',
+    subtitle: 'Anulaciones y cierres',
+    systemLabel: 'Prompt Columna 6: Cancelación y Cierre',
+    systemPrompt:
+      'Eres un coordinador de excepciones EMS. Informas cancelaciones, anulaciones y rechazos con tono claro y directo, sin dejar dudas sobre el estado final.',
+    userTemplate:
+      'Genera una actualización para un envio cancelado:\n- Cliente: {cliente}\n- Tracking: {tracking}\n- Destino: {destino}\n- Estado: {estado}\n- Grupo: {grupoNombre}',
+    temperature: 0.2,
+    action: 'Registrar cancelación y notificar WhatsApp',
+    accentClass: 'is-cancelled',
+    icon: 'X',
+  },
 }
 
 const getPipelineColumnConfig = (column: ProntsColumnKey): PipelineColumnConfig => {
-  if (column in state.pipelineConfig.columns) {
-    return state.pipelineConfig.columns[column as EmsColumnKey]
+  const baseColumns = state.pipelineConfig?.columns ?? createDefaultPipelineConfig().columns
+
+  if (column in baseColumns) {
+    return baseColumns[column as EmsColumnKey] ?? createDefaultPipelineConfig().columns.received
   }
 
-  const customColumn = state.pipelineConfig.customColumns.find((item) => item.id === column)
+  const customColumn = (state.pipelineConfig?.customColumns ?? []).find((item) => item.id === column)
   return (
     customColumn ?? {
       title: 'Columna personalizada',
       helper: 'Configura una nueva etapa del pipeline',
+      allowedStates: [],
     }
   )
 }
@@ -4398,12 +6885,14 @@ const getProntsColumnKeys = (): ProntsColumnKey[] => [
   'regional',
   'courier',
   'delivered',
+  'cancelled',
   ...state.pipelineConfig.customColumns.map((column) => column.id),
 ]
 
 const getProntsMetaForColumn = (column: ProntsColumnKey) => {
   const pipelineColumn = getPipelineColumnConfig(column)
-  const defaultPreset = state.prontsConfigs[column]?.presetKey ?? 'received'
+  const storedPreset = state.prontsConfigs[column]?.presetKey
+  const defaultPreset = isProntsPresetKey(storedPreset) ? storedPreset : 'received'
 
   if (column in prontsPresetMeta) {
     return prontsPresetMeta[column as ProntsPresetKey]
@@ -4421,7 +6910,9 @@ const getProntsMetaForColumn = (column: ProntsColumnKey) => {
 }
 
 const getProntsColumnConfig = (column: ProntsColumnKey) =>
-  state.prontsConfigs[column] ?? createProntsConfigFromPreset('received')
+  state.prontsConfigs[column] && isProntsPresetKey(state.prontsConfigs[column].presetKey)
+    ? state.prontsConfigs[column]
+    : createProntsConfigFromPreset('received')
 
 const setProntsColumnConfig = (column: ProntsColumnKey, nextConfig: Partial<ProntsColumnConfig>) => {
   state.prontsConfigs = {
@@ -4488,8 +6979,8 @@ const saveProntsConfigToServer = async () => {
     if (!response.ok) {
       throw new Error(
         (payload?.error as string) ||
-          (payload?.message as string) ||
-          'No se pudo guardar la configuracion de prompts.',
+        (payload?.message as string) ||
+        'No se pudo guardar la configuracion de prompts.',
       )
     }
 
@@ -4543,8 +7034,8 @@ const savePipelineConfigToServer = async () => {
     if (!response.ok) {
       throw new Error(
         (payload?.error as string) ||
-          (payload?.message as string) ||
-          'No se pudo guardar la configuracion del pipeline.',
+        (payload?.message as string) ||
+        'No se pudo guardar la configuracion del pipeline.',
       )
     }
 
@@ -4562,6 +7053,9 @@ const savePipelineConfigToServer = async () => {
       prontsConfig: state.prontsConfigs,
       pipelineConfig: payload?.config as PipelineConfig,
     })
+    if (state.activeView === 'ems') {
+      void reloadEmsPipelinePages()
+    }
     state.notice = 'Pipeline guardado en el sistema.'
     return true
   } catch (error) {
@@ -4661,8 +7155,8 @@ const runProntsSimulationLive = async () => {
     if (!response.ok) {
       throw new Error(
         (payload?.error as string) ||
-          (payload?.message as string) ||
-          'No se pudo ejecutar la simulacion real del prompt.',
+        (payload?.message as string) ||
+        'No se pudo ejecutar la simulacion real del prompt.',
       )
     }
 
@@ -4816,7 +7310,9 @@ const buildProntsSimulationResponse = (column: ProntsColumnKey, contact: Contact
 const getFilteredEmsContacts = () => {
   const contacts = getChatContacts().filter((contact) => {
     const matchesFilter =
-      state.emsStatusFilter === 'all' || getEmsStatusKey(contact) === state.emsStatusFilter
+      state.emsStatusFilter === 'all' ||
+      (state.emsStatusFilter === 'paused' && isAutoReplyPausedContact(contact)) ||
+      getEmsStatusKey(contact) === state.emsStatusFilter
     const query = state.searchQuery.trim().toLowerCase()
     const matchesQuery =
       query.length === 0 ||
@@ -4828,6 +7324,44 @@ const getFilteredEmsContacts = () => {
   })
 
   return contacts
+}
+
+const getChatListPagination = () => {
+  const items = getFilteredEmsContacts()
+  const totalItems = items.length
+  const totalPages = Math.max(1, Math.ceil(totalItems / CHAT_LIST_PAGE_SIZE))
+  const currentPage = Math.min(Math.max(state.chatListPage, 1), totalPages)
+  const startIndex = (currentPage - 1) * CHAT_LIST_PAGE_SIZE
+
+  return {
+    items: items.slice(startIndex, startIndex + CHAT_LIST_PAGE_SIZE),
+    currentPage,
+    totalPages,
+    totalItems,
+    pageSize: CHAT_LIST_PAGE_SIZE,
+  } satisfies ChatListPagination
+}
+
+const setChatListPage = (nextPage: number) => {
+  const pagination = getChatListPagination()
+  state.chatListPage = Math.min(Math.max(nextPage, 1), pagination.totalPages)
+  renderApp()
+}
+
+const setContactsListPage = (nextPage: number) => {
+  const pagination = getContactsPagination()
+  state.contactListPage = Math.min(Math.max(nextPage, 1), pagination.totalPages)
+  renderApp()
+}
+
+const setChatListPageForContact = (contactId: number) => {
+  const contacts = getFilteredEmsContacts()
+  const contactIndex = contacts.findIndex((contact) => contact.id === contactId)
+  if (contactIndex < 0) {
+    return
+  }
+
+  state.chatListPage = Math.floor(contactIndex / CHAT_LIST_PAGE_SIZE) + 1
 }
 
 const getContactLastActivityTime = (contact: Contact) => {
@@ -4947,10 +7481,10 @@ const getGroupContactPickerOptions = () => {
   const currentGroupMemberIds =
     state.groupModalMode === 'add-members' && state.groupActiveId
       ? new Set(
-          (
-            state.data?.contactGroups.find((group) => group.id === state.groupActiveId)?.members ?? []
-          ).map((member) => member.id),
-        )
+        (
+          state.data?.contactGroups.find((group) => group.id === state.groupActiveId)?.members ?? []
+        ).map((member) => member.id),
+      )
       : null
   const availableContacts = (state.data?.contacts ?? []).filter(
     (contact) =>
@@ -4986,8 +7520,8 @@ const getGroupPickerResultsMarkup = () => {
     return `
       <div class="group-combobox-list group-dropzone" data-group-dropzone="available">
         ${pickerOptions
-          .map(
-            (contact) => `
+        .map(
+          (contact) => `
               <button
                 class="group-combobox-option group-drag-card"
                 data-group-contact-option="${contact.id}"
@@ -5000,8 +7534,8 @@ const getGroupPickerResultsMarkup = () => {
                 <small>${escapeHtml(`${contact.company} · ${getWhatsAppReference(contact)}`)}</small>
               </button>
             `,
-          )
-          .join('')}
+        )
+        .join('')}
       </div>
     `
   }
@@ -5153,7 +7687,7 @@ const closeCustomEmsStateModal = () => {
   renderApp()
 }
 
-const registerApiPipelineState = async (stateKey: string) => {
+const includeApiPipelineStateInColumn = async (scope: EmsColumnKey | null, stateKey: string) => {
   const selectedState = getApiPipelineStateOptions().find((item) => item.stateKey === stateKey)
 
   if (!selectedState) {
@@ -5162,20 +7696,37 @@ const registerApiPipelineState = async (stateKey: string) => {
     return
   }
 
-  if (selectedState.isRegistered) {
-    state.notice = `El estado ${selectedState.title} ya esta registrado en el pipeline.`
+  if (!scope) {
+    state.pipelineConfigError = 'Selecciona una columna del pipeline para incluir estados.'
     renderApp()
     return
   }
 
-  const created = addCustomPipelineColumn(selectedState.title, selectedState.helper)
-  if (!created) {
+  const column = state.pipelineConfig.columns[scope]
+  if (!column) {
+    state.pipelineConfigError = 'No se encontro la columna del pipeline seleccionada.'
     renderApp()
     return
   }
 
-  upsertRelatedProntsColumn(created, 'received')
-  state.notice = `Estado ${selectedState.title} registrado en el pipeline.`
+  const currentAllowedStates = normalizeAllowedStates(column.allowedStates ?? [], [column.title])
+  if (currentAllowedStates.includes(selectedState.stateKey)) {
+    state.notice = `El estado ${selectedState.title} ya esta incluido en ${column.title}.`
+    renderApp()
+    return
+  }
+
+  state.pipelineConfig = {
+    ...state.pipelineConfig,
+    columns: {
+      ...state.pipelineConfig.columns,
+      [scope]: {
+        ...column,
+        allowedStates: [...currentAllowedStates, selectedState.stateKey],
+      },
+    },
+  }
+  state.notice = `Estado ${selectedState.title} incluido en ${column.title}.`
   await savePipelineAndProntsConfig()
 }
 
@@ -5297,8 +7848,8 @@ const submitCreateContactGroup = async () => {
     if (!response.ok) {
       throw new Error(
         (payload?.error as string) ||
-          (payload?.message as string) ||
-          'No se pudo crear el grupo de contactos.',
+        (payload?.message as string) ||
+        'No se pudo crear el grupo de contactos.',
       )
     }
 
@@ -5362,8 +7913,8 @@ const addSelectedContactsToGroup = async (groupId: number) => {
     if (!response.ok) {
       throw new Error(
         (payload?.error as string) ||
-          (payload?.message as string) ||
-          'No se pudo actualizar el grupo.',
+        (payload?.message as string) ||
+        'No se pudo actualizar el grupo.',
       )
     }
 
@@ -5408,8 +7959,8 @@ const removeMemberFromGroup = async (groupId: number, contactId: number) => {
     if (!response.ok) {
       throw new Error(
         (payload?.error as string) ||
-          (payload?.message as string) ||
-          'No se pudo quitar el contacto del grupo.',
+        (payload?.message as string) ||
+        'No se pudo quitar el contacto del grupo.',
       )
     }
 
@@ -5457,8 +8008,8 @@ const submitGroupSendMessage = async () => {
     if (!response.ok) {
       throw new Error(
         (payload?.error as string) ||
-          (payload?.message as string) ||
-          'No se pudo enviar el mensaje al grupo.',
+        (payload?.message as string) ||
+        'No se pudo enviar el mensaje al grupo.',
       )
     }
 
@@ -5476,21 +8027,36 @@ const submitGroupSendMessage = async () => {
 }
 
 const setActiveView = (view: ViewKey) => {
+  if (!isValidView(view)) {
+    return
+  }
+
   state.activeView = view
+  syncViewToLocation(view)
   state.collapsedFlyoutGroup = null
-  if (view === 'chat' && !state.conversationData.contact.id) {
+  syncSidebarGroupWithActiveView()
+  if (state.activeView === 'chat' && !state.conversationData.contact.id) {
     const firstChatContact = getChatContacts()[0]
     if (firstChatContact) {
       void openConversationModal(firstChatContact.id)
       return
     }
   }
-  if (
-    (view === 'internacionales' || view === 'internacionales-pipeline') &&
-    state.trackingApiPackages.length === 0 &&
-    state.trackingApiState !== 'loading'
-  ) {
+  if (view === 'internacionales' && state.trackingApiPackages.length === 0 && state.trackingApiState !== 'loading') {
     void loadTrackingApiPackages()
+  }
+  if (view === 'internacionales' && state.trackingApiState !== 'loading' && state.trackingApiPackages.length > 0) {
+    state.trackingApiPage = 1
+    void loadTrackingApiPackages()
+  }
+  if (view === 'internacionales' && state.trackingApiCatalogPackages.length === 0 && state.trackingApiCatalogState !== 'loading') {
+    void loadTrackingApiCatalogPackages()
+  }
+  if (
+    view === 'internacionales-tablero' &&
+    !Object.values(state.internationalPipelineColumns).some((column) => column.state === 'loading')
+  ) {
+    void loadInternationalPipeline()
   }
   if (view === 'internacionales-paquetes' && state.contactPackages.length === 0 && state.contactPackagesState !== 'loading') {
     void loadContactPackages()
@@ -5503,6 +8069,7 @@ const setActiveView = (view: ViewKey) => {
   }
   if (view === 'ems' && state.emsPipelineSyncState !== 'loading') {
     void refreshEmsPipelineFromApis()
+    bootstrapEmsPipelineView()
   }
   persistUiState()
   renderApp()
@@ -5531,6 +8098,12 @@ const toggleGroup = (groupKey: MenuGroupKey) => {
   }
 
   renderApp()
+}
+
+const syncSidebarGroupWithActiveView = () => {
+  if (state.activeView === 'chat' || state.activeView === 'contactos' || state.activeView === 'agrupaciones') {
+    state.expandedGroups.add('clientes')
+  }
 }
 
 const openCreateContactModal = () => {
@@ -5671,8 +8244,8 @@ const loadUsers = async () => {
     if (!response.ok) {
       throw new Error(
         (payload?.message as string) ||
-          (payload?.error as string) ||
-          'No se pudo cargar la lista de usuarios.',
+        (payload?.error as string) ||
+        'No se pudo cargar la lista de usuarios.',
       )
     }
 
@@ -5694,36 +8267,205 @@ const loadLogsReport = async () => {
   renderApp()
 
   try {
-    const query = new URLSearchParams({ hours: String(state.logsHours), limit: '100' })
-    if (state.logsLevel) query.set('level', state.logsLevel)
-    const response = await authFetch(`/api/logs/report?${query.toString()}`)
-    const payload = await parseApiPayload(response)
-
-    if (response.status === 401) {
-      clearSession()
-      state.loginError = 'Tu sesion expiro. Vuelve a iniciar sesion.'
-      state.logsState = 'idle'
-      renderApp()
+    const result = await fetchLogsReportPage(state.logsPage, state.logsPageSize)
+    if (!result) {
       return
     }
 
-    if (!response.ok) {
-      throw new Error((payload?.message as string) || 'No se pudo cargar el reporte de logs.')
-    }
-
-    state.logsReport = payload as unknown as LogsReport
+    const { payload } = result
+    state.logsReport = payload
+    state.logsPage = state.logsReport.pagination?.page ?? state.logsPage
     state.logsState = 'idle'
   } catch (error) {
-    state.logsState = 'error'
-    state.logsError = error instanceof Error ? error.message : 'No se pudo cargar el reporte de logs.'
+    if (shouldUseEmptyLogsFallback(error)) {
+      state.logsReport = state.logsReport ?? createEmptyLogsReport()
+      state.logsState = 'idle'
+      state.logsError = 'El reporte de logs tardo en responder. Puedes seguir usando esta pantalla y reintentar.'
+    } else {
+      state.logsState = 'error'
+      state.logsError = error instanceof Error ? error.message : 'No se pudo cargar el reporte de logs.'
+    }
   }
 
   renderApp()
 }
 
+const buildLogsReportQuery = (page: number, perPage: number) => {
+  const query = new URLSearchParams({
+    hours: String(state.logsHours),
+    limit: '100',
+    page: String(page),
+    per_page: String(perPage),
+  })
+
+  if (state.logsLevel) query.set('level', state.logsLevel)
+  if (state.logsMonthFilter && state.logsMonthFilter !== 'all') query.set('month', state.logsMonthFilter)
+
+  return query
+}
+
+const fetchLogsReportPage = async (page: number, perPage: number) => {
+  const query = buildLogsReportQuery(page, perPage)
+  const response = await authFetch(`/api/logs/report?${query.toString()}`, { timeoutMs: 60000 })
+  const payload = await parseApiPayload(response)
+
+  if (response.status === 401) {
+    clearSession()
+    state.loginError = 'Tu sesion expiro. Vuelve a iniciar sesion.'
+    state.logsState = 'idle'
+    renderApp()
+    return null
+  }
+
+  if (!response.ok) {
+    throw new Error((payload?.message as string) || 'No se pudo cargar el reporte de logs.')
+  }
+
+  return { response, payload: payload as unknown as LogsReport }
+}
+
+const createEmptyLogsReport = (): LogsReport => ({
+  generatedAt: new Date().toISOString(),
+  period: { hours: state.logsHours, level: state.logsLevel || null, path: null, month: state.logsMonthFilter },
+  totals: { total: 0, info: 0, warn: 0, error: 0 },
+  months: [],
+  byEndpoint: [],
+  recent: [],
+  pagination: {
+    page: Math.max(state.logsPage, 1),
+    perPage: state.logsPageSize,
+    totalItems: 0,
+    totalPages: 1,
+  },
+})
+
+const shouldUseEmptyLogsFallback = (error: unknown) =>
+  error instanceof Error &&
+  (error.message.includes('tardo demasiado') ||
+    error.message.toLowerCase().includes('aborted') ||
+    error.message.toLowerCase().includes('abort'))
+
+const exportLogsReportToExcel = async () => {
+  const exportButton = document.querySelector<HTMLButtonElement>('#export-logs-report')
+  if (exportButton) {
+    exportButton.disabled = true
+  }
+
+  state.notice = 'Preparando el archivo Excel del reporte de logs...'
+  renderApp()
+
+  try {
+    const apiPageSize = 50
+    const firstResult = await fetchLogsReportPage(1, apiPageSize)
+
+    if (!firstResult) {
+      return
+    }
+
+    const firstReport = firstResult.payload
+    const allRecentLogs = [...firstReport.recent]
+    const totalPages = firstReport.pagination?.totalPages ?? 1
+
+    for (let page = 2; page <= totalPages; page += 1) {
+      const result = await fetchLogsReportPage(page, apiPageSize)
+      if (!result) {
+        return
+      }
+
+      allRecentLogs.push(...result.payload.recent)
+    }
+
+    const summaryRows = [
+      {
+        'Periodo (horas)': firstReport.period.hours,
+        Nivel: firstReport.period.level ?? 'Todos',
+        Mes: firstReport.period.month ?? 'Todos',
+        Ruta: firstReport.period.path ?? 'Todas',
+        'Total de eventos': firstReport.totals.total,
+        Informacion: firstReport.totals.info,
+        Advertencias: firstReport.totals.warn,
+        Errores: firstReport.totals.error,
+        'Generado en': firstReport.generatedAt,
+      },
+    ]
+
+    const endpointRows = firstReport.byEndpoint.map((item) => ({
+      Ruta: item.path,
+      Eventos: item.count,
+      'Promedio ms': item.average_duration_ms ?? 0,
+      Errores: item.errors,
+    }))
+
+    const monthRows = firstReport.months.map((item) => ({
+      Mes: item.label,
+      Valor: item.value,
+      Registros: item.count,
+    }))
+
+    const eventRows = allRecentLogs.map((item) => ({
+      ID: item.id,
+      Hora: item.created_at,
+      Nivel: item.level,
+      Evento: item.event,
+      Metodo: item.method ?? '',
+      Ruta: item.path ?? '',
+      Resultado: item.status_code ?? '',
+      'Duracion ms': item.duration_ms ?? 0,
+      'Usuario ID': item.user_id ?? '',
+      Detalles: JSON.stringify(item.details ?? {}),
+    }))
+
+    const workbook = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(summaryRows), 'Resumen')
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(endpointRows), 'Endpoints')
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(monthRows), 'Meses')
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(eventRows), 'Eventos')
+
+    const workbookData = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' })
+    const downloadUrl = URL.createObjectURL(
+      new Blob([workbookData], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
+    )
+    const downloadLink = document.createElement('a')
+    downloadLink.href = downloadUrl
+    downloadLink.download = `reporte-logs-${new Date().toISOString().slice(0, 10)}.xlsx`
+    document.body.appendChild(downloadLink)
+    downloadLink.click()
+    downloadLink.remove()
+    URL.revokeObjectURL(downloadUrl)
+
+    state.notice = `Excel generado correctamente con ${allRecentLogs.length} eventos.`
+  } catch (error) {
+    console.error('No se pudo generar el Excel del reporte de logs:', error)
+    state.notice = error instanceof Error ? error.message : 'No se pudo exportar el reporte de logs.'
+  } finally {
+    if (exportButton) {
+      exportButton.disabled = false
+    }
+    renderApp()
+  }
+}
+
 const updateLogsFilter = (field: 'hours' | 'level', value: string) => {
   if (field === 'hours') state.logsHours = Number(value) || 24
   if (field === 'level') state.logsLevel = value
+  state.logsPage = 1
+}
+
+const updateLogsMonthFilter = (value: string) => {
+  state.logsMonthFilter = value
+  state.logsPage = 1
+}
+
+const setLogsPage = (nextPage: number) => {
+  if (!state.logsReport) {
+    state.logsPage = Math.max(1, nextPage)
+    renderApp()
+    return
+  }
+
+  const totalPages = state.logsReport.pagination?.totalPages ?? 1
+  state.logsPage = Math.min(Math.max(nextPage, 1), totalPages)
+  void loadLogsReport()
 }
 
 const submitUserForm = async () => {
@@ -5760,8 +8502,8 @@ const submitUserForm = async () => {
     if (!response.ok) {
       throw new Error(
         (payload?.message as string) ||
-          (payload?.error as string) ||
-          'No se pudo guardar el usuario.',
+        (payload?.error as string) ||
+        'No se pudo guardar el usuario.',
       )
     }
 
@@ -5906,6 +8648,7 @@ const openConversationModal = async (contactId: number) => {
 
   state.isConversationModalOpen = false
   state.activeView = 'chat'
+  setChatListPageForContact(contact.id)
   persistUiState()
   syncSendMessageFormWithContact(contact)
   state.conversationState = 'loading'
@@ -5956,6 +8699,7 @@ const hasConversationChanged = (
 
 const loadConversation = async (contactId: number, options: { silent?: boolean } = {}) => {
   try {
+    const previousLatestMessage = getConversationMessagesChronological(state.conversationData.messages).at(-1) ?? null
     const response = await authFetch(`/api/contacts/${contactId}/messages`)
     const payload = await parseApiPayload(response)
 
@@ -5969,8 +8713,8 @@ const loadConversation = async (contactId: number, options: { silent?: boolean }
     if (!response.ok) {
       throw new Error(
         (payload?.error as string) ||
-          (payload?.message as string) ||
-          'No se pudo cargar la conversacion del contacto.',
+        (payload?.message as string) ||
+        'No se pudo cargar la conversacion del contacto.',
       )
     }
 
@@ -5986,20 +8730,53 @@ const loadConversation = async (contactId: number, options: { silent?: boolean }
       ...state.conversationData.contact,
       status: latestContactStatus || state.conversationData.contact.status,
     }
+    const activeContact = state.conversationData.contact as Contact
+    const currentComposerMessage =
+      state.sendMessageForm.contactId === activeContact.id ? state.sendMessageForm.message : ''
+    state.sendMessageForm = {
+      contactId: activeContact.id,
+      contactName: activeContact.name,
+      targetReference: getWhatsAppReference(activeContact),
+      message: currentComposerMessage,
+      attachment: state.sendMessageForm.contactId === activeContact.id ? state.sendMessageForm.attachment : null,
+      attachmentName: state.sendMessageForm.contactId === activeContact.id ? state.sendMessageForm.attachmentName : '',
+      attachmentType: state.sendMessageForm.contactId === activeContact.id ? state.sendMessageForm.attachmentType : '',
+    }
     if (state.data) {
       state.data = {
         ...state.data,
         contacts: state.data.contacts.map((contact) =>
           contact.id === contactId
             ? {
-                ...contact,
-                status: latestContactStatus || contact.status,
-                lastMessageText: latestMessage?.message ?? null,
-                lastMessageDirection: latestMessage?.direction ?? null,
-              }
+              ...contact,
+              status: latestContactStatus || contact.status,
+              lastMessageText: latestMessage?.message ?? null,
+              lastMessageDirection: latestMessage?.direction ?? null,
+              lastMessageAt: latestMessage?.createdAt ?? contact.lastMessageAt ?? null,
+            }
             : contact,
         ),
       }
+    }
+
+    if (options.silent) {
+      const nextLatestMessage = getConversationMessagesChronological(nextConversation.messages).at(-1) ?? null
+      maybeNotifyIncomingMessage(
+        previousLatestMessage
+          ? {
+            lastMessageAt: previousLatestMessage.createdAt,
+            lastMessageText: previousLatestMessage.message,
+          }
+          : null,
+        nextConversation.contact as Contact,
+        nextLatestMessage
+          ? {
+            direction: nextLatestMessage.direction,
+            message: nextLatestMessage.message,
+            createdAt: nextLatestMessage.createdAt,
+          }
+          : null,
+      )
     }
 
     if (shouldRenderConversation) {
@@ -6009,6 +8786,58 @@ const loadConversation = async (contactId: number, options: { silent?: boolean }
     state.conversationState = 'idle'
     state.conversationError =
       error instanceof Error ? error.message : 'No se pudo cargar la conversacion del contacto.'
+    renderApp()
+  }
+}
+
+const unpauseAutoReplyForContact = async (contactId: number) => {
+  try {
+    state.notice = 'Desactivando baneo de IA...'
+    renderApp()
+
+    const response = await authFetch(`/api/contacts/${contactId}/auto-reply-unpause`, {
+      method: 'POST',
+    })
+    const payload = await parseApiPayload(response)
+
+    if (response.status === 401) {
+      clearSession()
+      state.loginError = 'Tu sesion expiro. Inicia sesion nuevamente.'
+      renderApp()
+      return
+    }
+
+    if (!response.ok) {
+      throw new Error(
+        (payload?.error as string) ||
+        (payload?.message as string) ||
+        'No se pudo desactivar el baneo de IA.',
+      )
+    }
+
+    if (state.data) {
+      state.data = {
+        ...state.data,
+        contacts: state.data.contacts.map((contact) =>
+          contact.id === contactId
+            ? {
+                ...contact,
+                autoReplyPause: {
+                  isPaused: false,
+                  pausedUntil: null,
+                  reason: null,
+                },
+              }
+            : contact,
+        ),
+      }
+    }
+
+    state.notice = 'Baneo de IA desactivado. El agente puede responder nuevamente.'
+    await loadConversation(contactId, { silent: true })
+    void loadDashboard({ silent: true })
+  } catch (error) {
+    state.notice = error instanceof Error ? error.message : 'No se pudo desactivar el baneo de IA.'
     renderApp()
   }
 }
@@ -6091,8 +8920,8 @@ const deleteConversation = async () => {
     if (!response.ok) {
       throw new Error(
         (payload?.error as string) ||
-          (payload?.message as string) ||
-          'No se pudo borrar la conversacion del contacto.',
+        (payload?.message as string) ||
+        'No se pudo borrar la conversacion del contacto.',
       )
     }
 
@@ -6154,9 +8983,14 @@ const closeContactProfileModal = () => {
 }
 
 const openTrackingInfoModal = (trackingId: string | number) => {
+  const pipelinePackages = Object.values(state.internationalPipelineColumns)
+    .flatMap((column) => column.items)
+  const packages = [...state.trackingApiPackages, ...pipelinePackages]
   const selectedPackage =
-    state.trackingApiPackages.find(
-      (item) => String(item.mailitm_pid) === String(trackingId) || item.codigo_s10 === String(trackingId),
+    packages.find(
+      (item) =>
+        String(item.mailitm_pid ?? '') === String(trackingId) ||
+        String(item.codigo_s10 ?? item.codigo ?? '') === String(trackingId),
     ) ?? null
 
   if (!selectedPackage) {
@@ -6203,6 +9037,16 @@ const syncDashboardRefreshLoop = () => {
     clearInterval(dashboardRefreshTimer)
     dashboardRefreshTimer = null
   }
+
+  const shouldRefreshDashboard = Boolean(state.authToken) && Boolean(state.sessionUser)
+
+  if (!shouldRefreshDashboard) {
+    return
+  }
+
+  dashboardRefreshTimer = setInterval(() => {
+    void loadDashboard({ silent: true })
+  }, DASHBOARD_REFRESH_INTERVAL_MS)
 }
 
 const isTextEditingElement = (
@@ -6403,6 +9247,7 @@ const clearSession = () => {
   state.searchQuery = ''
   state.segmentFilter = 'Todos'
   state.statusFilter = 'Todos'
+  state.chatListPage = 1
   state.selectedContactIds.clear()
   state.groupCreateForm = defaultGroupCreateForm()
   state.groupCreateError = null
@@ -6416,6 +9261,12 @@ const clearSession = () => {
   state.sendMessageForm = defaultWhatsAppMessageForm()
   state.isConversationModalOpen = false
   state.conversationData = defaultContactConversation()
+  state.messageNotifications = []
+  seenMessageNotificationKeys.clear()
+  for (const timer of messageNotificationCleanupTimers.values()) {
+    clearTimeout(timer)
+  }
+  messageNotificationCleanupTimers.clear()
   state.collapsedFlyoutGroup = null
   state.topbarProfileOpen = false
   state.users = []
@@ -6434,11 +9285,14 @@ const clearSession = () => {
   } catch {
     // ignore storage issues
   }
+
+  syncLoginToLocation({ replace: true })
 }
 
 const createRenderContext = () => ({
   state,
   menuGroups,
+  getViewHref,
   escapeHtml,
   getBrandIcon,
   getMenuGroupIcon,
@@ -6449,6 +9303,7 @@ const createRenderContext = () => ({
   getContactLastMessagePreview,
   getContactConnectionLabel,
   getContactConnectionClass,
+  getContactsPagination,
   formatConversationTimestamp,
   getStatusClass,
   getFilteredEmsContacts,
@@ -6457,16 +9312,23 @@ const createRenderContext = () => ({
   getEmsStatusContacts,
   getEmsApiStatusContacts,
   getEmsApiStatusPackages,
-  getEmsMonthOptions,
   getEmsApiCustomColumnContacts,
   getEmsApiCustomColumnPackages,
+  getEmsReferenceChannelState,
+  getContactReminderState,
+  getChatListPagination,
   getCustomEmsColumnContacts,
   getEmsStatusKey,
   getEmsStatusLabel,
+  getChatStatusLabel,
   getEmsStatusToneClass,
   getEmsPhaseLabel,
+  getChatPhaseLabel,
+  getChatPhaseDescription,
   getEmsPhaseDescription,
   getChatContacts,
+  getAutoReplyPausedContacts,
+  formatAutoReplyPauseRemaining,
   isAutoCreatedChatContact,
   getConversationMessagesChronological,
   renderConversationMessageMedia,
@@ -6478,8 +9340,13 @@ const createRenderContext = () => ({
   hasWhatsAppChannel,
   isContactConnected,
   getTrackingApiPagination,
+  getTrackingApiAvailableStates,
+  getTrackingApiAvailableServices,
+  getTrackingApiAvailableCountries,
+  getTrackingApiTableHead,
   renderTrackingApiRows,
   renderTrackingApiPagination,
+  exportTrackingApiToExcel,
   getContactPackagesPagination,
   getContactPackageTypeOptions,
   getContactPackageStatusOptions,
@@ -6487,6 +9354,7 @@ const createRenderContext = () => ({
   renderContactPackagesRows,
   renderContactPackagesPagination,
   exportContactPackagesToExcel,
+  exportLogsReportToExcel,
   getTrackingPipelineColumns,
   getTrackingPipelineStage,
   getContactPackagePipelineStage,
@@ -6502,6 +9370,8 @@ const createRenderContext = () => ({
   findContactByWhatsAppReferenceValue,
   getEmsStatePackagesForScope,
   getEmsStatePackagesModalPagination,
+  getEmsPipelineScopePageState,
+  goToEmsPipelineScopePage,
   getProntsColumnConfig,
   getProntsColumnKeys,
   getProntsColumnContacts,
@@ -6534,7 +9404,6 @@ const createRenderContext = () => ({
 
 
 let renderAppFrame: ReturnType<typeof requestAnimationFrame> | null = null
-let topbarProfileGlobalListenersInstalled = false
 
 const closeTopbarProfileMenu = () => {
   if (!state.topbarProfileOpen) return
@@ -6545,6 +9414,10 @@ const closeTopbarProfileMenu = () => {
 const renderAppNow = () => {
   const focusedFieldState = captureFocusedFieldState()
   const conversationThreadScrollState = captureConversationThreadScrollState()
+  if (!isValidView(state.activeView)) {
+    state.activeView = 'ems'
+  }
+  syncSidebarGroupWithActiveView()
 
   if (state.authLoading) {
     app.innerHTML = `
@@ -6595,6 +9468,32 @@ const renderAppNow = () => {
     return
   }
 
+  void loadAutomationConfig()
+  document.querySelector<HTMLButtonElement>('[data-refresh-automation-status]')?.addEventListener('click', () => {
+    void loadAutomationConfig({ force: true })
+  })
+  document.querySelector<HTMLButtonElement>('[data-save-automation-settings]')?.addEventListener('click', () => {
+    const getSetting = (key: string) =>
+      document.querySelector<HTMLInputElement>(`[data-automation-setting="${key}"]`)?.checked ?? false
+    const getIntervalMs = (key: string, fallbackMs: number) => {
+      const value = Number(document.querySelector<HTMLInputElement>(`[data-automation-interval-value="${key}"]`)?.value)
+      const unit = document.querySelector<HTMLSelectElement>(`[data-automation-interval-unit="${key}"]`)?.value
+      const multiplier = unit === 'hours' ? 60 * 60 * 1000 : 60 * 1000
+      if (!Number.isFinite(value) || value <= 0) return fallbackMs
+      return Math.round(value * multiplier)
+    }
+
+    void saveAutomationSettings({
+      automaticWelcome: getSetting('automaticWelcome'),
+      automaticStatusUpdates: getSetting('automaticStatusUpdates'),
+      aiAutoReply: getSetting('aiAutoReply'),
+      automaticReconciliation: getSetting('automaticReconciliation'),
+      welcomeResponseIntervalMs: getIntervalMs('welcomeResponseIntervalMs', state.automationConfig?.welcomeResponseIntervalMs ?? 5 * 60 * 1000),
+      eventChangeResponseIntervalMs: getIntervalMs('eventChangeResponseIntervalMs', state.automationConfig?.eventChangeResponseIntervalMs ?? 15 * 60 * 1000),
+      reconciliationIntervalMs: getIntervalMs('reconciliationIntervalMs', state.automationConfig?.reconciliationIntervalMs ?? 30 * 60 * 1000),
+    })
+  })
+
   if (!topbarProfileGlobalListenersInstalled) {
     document.addEventListener(
       'click',
@@ -6616,6 +9515,47 @@ const renderAppNow = () => {
     topbarProfileGlobalListenersInstalled = true
   }
 
+  if (!messageNotificationInteractionListenersInstalled) {
+    const unlockMessageNotificationTone = () => {
+      messageNotificationToneUnlocked = true
+      const audioContext = ensureMessageNotificationAudioContext()
+      if (audioContext && audioContext.state === 'suspended') {
+        void audioContext.resume().catch(() => undefined)
+      }
+      if (typeof window !== 'undefined' && typeof Notification !== 'undefined' && Notification.permission === 'default') {
+        void Notification.requestPermission().catch(() => undefined)
+      }
+    }
+
+    document.addEventListener('pointerdown', unlockMessageNotificationTone, { once: true, passive: true })
+    document.addEventListener('keydown', unlockMessageNotificationTone, { once: true })
+    messageNotificationInteractionListenersInstalled = true
+  }
+
+  if (!locationSyncListenerInstalled) {
+    window.addEventListener('popstate', () => {
+      const nextView = getViewFromLocation()
+      if (!nextView) {
+        if (state.sessionUser) {
+          syncViewToLocation(state.activeView, { replace: true })
+        }
+        return
+      }
+
+      if (nextView === state.activeView) {
+        return
+      }
+
+      state.activeView = nextView
+      state.collapsedFlyoutGroup = null
+      syncSidebarGroupWithActiveView()
+      persistUiState()
+      renderApp()
+    })
+
+    locationSyncListenerInstalled = true
+  }
+
   document.querySelector<HTMLButtonElement>('#sidebar-toggle')?.addEventListener('click', toggleSidebar)
   document
     .querySelector<HTMLButtonElement>('#open-create-contact')
@@ -6626,6 +9566,12 @@ const renderAppNow = () => {
   document
     .querySelector<HTMLButtonElement>('#header-ai-agent-toggle')
     ?.addEventListener('click', toggleGlobalAiAgent)
+  document
+    .querySelector<HTMLButtonElement>('[data-settings-action="toggle-test-mode"]')
+    ?.addEventListener('click', () => void toggleWhatsAppTestMode())
+  document
+    .querySelector<HTMLButtonElement>('[data-settings-action="toggle-ai-agent"]')
+    ?.addEventListener('click', () => void toggleGlobalAiAgent())
   document
     .querySelector<HTMLButtonElement>('#profile-toggle')
     ?.addEventListener('click', () => {
@@ -6669,11 +9615,26 @@ const renderAppNow = () => {
   })
 
   document
-    .querySelectorAll<HTMLButtonElement>('.menu-item, .menu-flyout-item')
+    .querySelectorAll<HTMLAnchorElement>('.menu-item, .menu-flyout-item')
     .forEach((button) => {
-      button.addEventListener('click', () => {
-        const view = button.dataset.view as ViewKey
-        setActiveView(view)
+      button.addEventListener('click', (event) => {
+        if (
+          event.button !== 0 ||
+          event.metaKey ||
+          event.ctrlKey ||
+          event.shiftKey ||
+          event.altKey
+        ) {
+          return
+        }
+
+        const view = button.dataset.view
+        if (!view) {
+          return
+        }
+
+        event.preventDefault()
+        setActiveView(view as ViewKey)
       })
     })
 
@@ -6682,13 +9643,50 @@ const renderAppNow = () => {
     void loadLogsReport()
   })
 
+  document.querySelector<HTMLSelectElement>('#logs-month-filter')?.addEventListener('change', (event) => {
+    updateLogsMonthFilter((event.target as HTMLSelectElement).value)
+    void loadLogsReport()
+  })
+
   document.querySelector<HTMLSelectElement>('#logs-level-filter')?.addEventListener('change', (event) => {
     updateLogsFilter('level', (event.target as HTMLSelectElement).value)
     void loadLogsReport()
   })
 
+  document.querySelector<HTMLInputElement>('#ems-search-input')?.addEventListener('input', (event) => {
+    state.searchQuery = (event.currentTarget as HTMLInputElement).value
+    state.chatListPage = 1
+    renderApp()
+  })
+
   document.querySelector<HTMLButtonElement>('#refresh-logs-report')?.addEventListener('click', () => {
     void loadLogsReport()
+  })
+
+  document.querySelector<HTMLButtonElement>('#export-logs-report')?.addEventListener('click', () => {
+    void exportLogsReportToExcel()
+  })
+
+  document.querySelectorAll<HTMLButtonElement>('[data-export-tracking-api-excel]').forEach((button) => {
+    button.addEventListener('click', () => {
+      void exportTrackingApiToExcel()
+    })
+  })
+
+  document.querySelectorAll<HTMLButtonElement>('[data-logs-page]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const action = button.dataset.logsPage
+      const pagination = state.logsReport?.pagination ?? { page: 1, totalPages: 1 }
+
+      if (action === 'prev') {
+        setLogsPage(pagination.page - 1)
+        return
+      }
+
+      if (action === 'next') {
+        setLogsPage(pagination.page + 1)
+      }
+    })
   })
 
   document
@@ -6742,6 +9740,68 @@ const renderAppNow = () => {
       if (!column) return
       setEmsSearchQueryForColumn(column, input.value)
       renderApp()
+      void loadEmsPipelineScopePage(column, 1)
+    })
+  })
+
+  document.querySelectorAll<HTMLElement>('[data-ems-drag-package]').forEach((item) => {
+    item.addEventListener('dragstart', (event) => {
+      const target = event.currentTarget as HTMLElement
+      const packageCode = target.dataset.emsDragPackage
+      const source = target.dataset.emsDragSource as EmsColumnKey | undefined
+
+      if (!packageCode || !source) {
+        return
+      }
+
+      event.dataTransfer?.setData('text/plain', JSON.stringify({ packageCode, source }))
+      if (event.dataTransfer) {
+        event.dataTransfer.effectAllowed = 'move'
+      }
+
+      target.classList.add('is-dragging')
+    })
+
+    item.addEventListener('dragend', () => {
+      item.classList.remove('is-dragging')
+    })
+  })
+
+  document.querySelectorAll<HTMLElement>('[data-ems-dropzone]').forEach((zone) => {
+    zone.addEventListener('dragover', (event) => {
+      event.preventDefault()
+      if (event.dataTransfer) {
+        event.dataTransfer.dropEffect = 'move'
+      }
+      zone.classList.add('is-drag-over')
+    })
+
+    zone.addEventListener('dragleave', () => {
+      zone.classList.remove('is-drag-over')
+    })
+
+    zone.addEventListener('drop', (event) => {
+      event.preventDefault()
+      zone.classList.remove('is-drag-over')
+      const raw = event.dataTransfer?.getData('text/plain')
+      const targetStage = zone.dataset.emsDropzone as EmsColumnKey | undefined
+
+      if (!raw || !targetStage) {
+        return
+      }
+
+      try {
+        const payload = JSON.parse(raw) as { packageCode?: string; source?: string }
+        const packageCode = payload.packageCode?.trim()
+
+        if (!packageCode) {
+          return
+        }
+
+        void moveEmsPackageToStage(packageCode, targetStage)
+      } catch {
+        // ignore malformed drag payloads
+      }
     })
   })
 
@@ -6873,6 +9933,7 @@ const renderAppNow = () => {
       const filter = button.dataset.emsStatusFilter as EmsStatusFilter | undefined
       if (!filter) return
       state.emsStatusFilter = filter
+      state.chatListPage = 1
       renderApp()
     })
   })
@@ -6882,6 +9943,7 @@ const renderAppNow = () => {
     ?.addEventListener('click', () => {
       state.emsStatusFilter = 'all'
       state.searchQuery = ''
+      state.chatListPage = 1
       renderApp()
     })
 
@@ -6896,6 +9958,7 @@ const renderAppNow = () => {
     button.addEventListener('click', () => {
       const scope = button.dataset.openEmsStatePackages
       openEmsStatePackagesModal(scope && scope !== 'all' ? (scope as EmsColumnKey) : null)
+      openEmsStatePackagesModal(scope ? (scope as EmsColumnKey) : null)
     })
   })
 
@@ -6925,10 +9988,40 @@ const renderAppNow = () => {
     })
   })
 
-  document.querySelector<HTMLSelectElement>('[data-ems-month-filter]')?.addEventListener('change', (event) => {
-    state.emsMonthFilter = (event.currentTarget as HTMLSelectElement).value || 'all'
-    persistUiState()
+  const updateEmsPipelineDateRange = (changedField: 'start' | 'end', value: string) => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return
+
+    const today = getBoliviaDateInputValue(new Date())
+    let start = changedField === 'start' ? (value > today ? today : value) : state.emsPipelineDateStart
+    let end = changedField === 'end' ? (value > today ? today : value) : state.emsPipelineDateEnd
+    const startTime = Date.parse(`${start}T00:00:00Z`)
+    const endTime = Date.parse(`${end}T00:00:00Z`)
+
+    if (changedField === 'start' && (endTime < startTime || endTime - startTime > 29 * 86400000)) {
+      const adjustedEnd = new Date(startTime + 29 * 86400000).toISOString().slice(0, 10)
+      end = adjustedEnd > today ? today : adjustedEnd
+    } else if (changedField === 'end' && (endTime < startTime || endTime - startTime > 29 * 86400000)) {
+      start = new Date(endTime - 29 * 86400000).toISOString().slice(0, 10)
+    }
+
+    state.emsPipelineDateStart = start
+    state.emsPipelineDateEnd = end
     renderApp()
+    void reloadEmsPipelinePages()
+  }
+
+  document.querySelector<HTMLInputElement>('[data-ems-pipeline-date-start]')?.addEventListener('change', (event) => {
+    updateEmsPipelineDateRange('start', (event.currentTarget as HTMLInputElement).value)
+  })
+
+  document.querySelector<HTMLInputElement>('[data-ems-pipeline-date-end]')?.addEventListener('change', (event) => {
+    updateEmsPipelineDateRange('end', (event.currentTarget as HTMLInputElement).value)
+  })
+
+  document.querySelector<HTMLSelectElement>('[data-ems-pipeline-department]')?.addEventListener('change', (event) => {
+    state.emsPipelineDepartment = (event.currentTarget as HTMLSelectElement).value || 'all'
+    renderApp()
+    void reloadEmsPipelinePages()
   })
 
   document.querySelector<HTMLButtonElement>('[data-create-custom-ems-column]')?.addEventListener('click', () => {
@@ -7000,7 +10093,7 @@ const renderAppNow = () => {
     button.addEventListener('click', () => {
       const stateKey = button.dataset.registerApiPipelineState
       if (!stateKey) return
-      void registerApiPipelineState(stateKey)
+      void includeApiPipelineStateInColumn(state.customEmsStateModalScope, stateKey)
     })
   })
 
@@ -7014,8 +10107,91 @@ const renderAppNow = () => {
     })
   })
 
-  document.querySelector<HTMLButtonElement>('#refresh-tracking-packages')?.addEventListener('click', () => {
-    void loadTrackingApiPackages()
+  document.querySelector<HTMLSelectElement>('#international-pipeline-sort')?.addEventListener('change', (event) => {
+    state.internationalPipelineSort = (event.currentTarget as HTMLSelectElement).value === 'oldest' ? 'oldest' : 'newest'
+    state.internationalPipelinePage = {}
+    void loadInternationalPipeline()
+  })
+
+  const updateInternationalPipelineDateRange = (changedField: 'start' | 'end', value: string) => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return
+
+    const today = getBoliviaDateInputValue(new Date())
+    let start = changedField === 'start' ? (value > today ? today : value) : state.internationalPipelineDateStart
+    let end = changedField === 'end' ? (value > today ? today : value) : state.internationalPipelineDateEnd
+    const startTime = Date.parse(`${start}T00:00:00Z`)
+    const endTime = Date.parse(`${end}T00:00:00Z`)
+
+    if (changedField === 'start' && (endTime < startTime || endTime - startTime > 30 * 86400000)) {
+      const adjustedEnd = new Date(startTime + 30 * 86400000).toISOString().slice(0, 10)
+      end = adjustedEnd > today ? today : adjustedEnd
+    } else if (changedField === 'end' && (endTime < startTime || endTime - startTime > 30 * 86400000)) {
+      start = new Date(endTime - 30 * 86400000).toISOString().slice(0, 10)
+    }
+
+    state.internationalPipelineDateStart = start
+    state.internationalPipelineDateEnd = end
+    state.internationalPipelinePage = {}
+    renderApp()
+    void loadInternationalPipeline()
+  }
+
+  document
+    .querySelector<HTMLInputElement>('[data-international-pipeline-date-start]')
+    ?.addEventListener('change', (event) => {
+      updateInternationalPipelineDateRange('start', (event.currentTarget as HTMLInputElement).value)
+    })
+
+  document
+    .querySelector<HTMLInputElement>('[data-international-pipeline-date-end]')
+    ?.addEventListener('change', (event) => {
+      updateInternationalPipelineDateRange('end', (event.currentTarget as HTMLInputElement).value)
+    })
+
+  document
+    .querySelector<HTMLSelectElement>('[data-international-pipeline-department]')
+    ?.addEventListener('change', (event) => {
+      state.internationalPipelineDepartment = (event.currentTarget as HTMLSelectElement).value || 'all'
+      state.internationalPipelinePage = {}
+      renderApp()
+      void loadInternationalPipeline()
+  })
+
+  document.querySelectorAll<HTMLInputElement>('[data-international-pipeline-search]').forEach((input) => {
+    input.addEventListener('input', (event) => {
+      const stage = input.dataset.internationalPipelineSearch
+      if (!stage) return
+
+      state.internationalPipelineSearch[stage] = (event.currentTarget as HTMLInputElement).value
+      state.internationalPipelinePage[stage] = 1
+      if (internationalPipelineSearchTimer) clearTimeout(internationalPipelineSearchTimer)
+      internationalPipelineSearchTimer = setTimeout(() => {
+        void loadInternationalPipelineColumn(stage as EmsColumnKey, 1)
+      }, 350)
+    })
+  })
+
+  document.querySelectorAll<HTMLButtonElement>('[data-international-pipeline-page]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const [stage, direction] = String(button.dataset.internationalPipelinePage ?? '').split(':')
+      if (!stage || !direction) return
+
+      const currentPage = Number(state.internationalPipelinePage[stage] ?? 1)
+      const nextPage = direction === 'prev' ? Math.max(1, currentPage - 1) : currentPage + 1
+      state.internationalPipelinePage[stage] = nextPage
+      void loadInternationalPipelineColumn(stage as EmsColumnKey, nextPage)
+    })
+  })
+
+  document.querySelectorAll<HTMLButtonElement>('[data-international-pipeline-show-all]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const stage = button.dataset.internationalPipelineShowAll
+      if (!stage) return
+
+      state.internationalPipelineSearch[stage] = ''
+      state.internationalPipelinePage[stage] = 1
+      void loadInternationalPipelineColumn(stage as EmsColumnKey, 1)
+    })
   })
 
   document
@@ -7097,20 +10273,170 @@ const renderAppNow = () => {
     })
   })
 
+  document.querySelectorAll<HTMLButtonElement>('[data-ems-column-page]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const payload = button.dataset.emsColumnPage
+      if (!payload) return
+
+      const [scope, direction] = payload.split(':')
+      if (!scope || !direction) return
+
+      const pageState = getEmsPipelineScopePageState(scope)
+      const nextPage = direction === 'prev' ? pageState.currentPage - 1 : pageState.currentPage + 1
+      goToEmsPipelineScopePage(scope, nextPage)
+    })
+  })
+
   document
     .querySelector<HTMLButtonElement>('#clear-package-code-lookup-filter')
     ?.addEventListener('click', clearPackageCodeLookupFilter)
 
+  document.querySelector<HTMLButtonElement>('#tracking-api-refresh')?.addEventListener('click', () => {
+    void refreshTrackingApiPackages()
+  })
+
   document.querySelector<HTMLButtonElement>('#tracking-page-prev')?.addEventListener('click', () => {
-    if (state.trackingApiPage <= 1 || state.trackingApiState === 'loading') return
+    if (state.trackingApiState === 'loading') return
+    if (state.trackingApiPage <= 1) return
     state.trackingApiPage -= 1
-    void loadTrackingApiPackages()
+    const isFiltered = hasTrackingApiFilters()
+
+    if (!isFiltered) {
+      void loadTrackingApiPackages()
+      return
+    }
+
+    renderApp()
   })
 
   document.querySelector<HTMLButtonElement>('#tracking-page-next')?.addEventListener('click', () => {
-    if (!state.trackingApiHasMore || state.trackingApiState === 'loading') return
+    if (state.trackingApiState === 'loading') return
+    const pagination = getTrackingApiPagination()
+    const isFiltered = hasTrackingApiFilters()
+
+    if (!isFiltered) {
+      if (!state.trackingApiHasMore) return
+      state.trackingApiPage += 1
+      void loadTrackingApiPackages()
+      return
+    }
+
+    if (pagination.currentPage >= pagination.totalPages) return
     state.trackingApiPage += 1
-    void loadTrackingApiPackages()
+    renderApp()
+  })
+
+  document.querySelector<HTMLSelectElement>('#tracking-api-state-filter')?.addEventListener('change', (event) => {
+    state.trackingApiStateFilter = (event.currentTarget as HTMLSelectElement).value
+    state.trackingApiPage = 1
+    if (state.trackingApiCatalogPackages.length === 0 && state.trackingApiCatalogState !== 'loading') {
+      void loadTrackingApiCatalogPackages()
+      return
+    }
+    renderApp()
+    void loadTrackingApiCatalogPackages()
+  })
+
+  document.querySelector<HTMLSelectElement>('#tracking-api-service-filter')?.addEventListener('change', (event) => {
+    state.trackingApiServiceFilter = (event.currentTarget as HTMLSelectElement).value
+    state.trackingApiPage = 1
+    void loadTrackingApiCatalogPackages()
+  })
+
+  document.querySelector<HTMLSelectElement>('#tracking-api-origin-filter')?.addEventListener('change', (event) => {
+    state.trackingApiOriginFilter = (event.currentTarget as HTMLSelectElement).value
+    state.trackingApiPage = 1
+    void loadTrackingApiCatalogPackages()
+  })
+
+  document.querySelector<HTMLSelectElement>('#tracking-api-destination-filter')?.addEventListener('change', (event) => {
+    state.trackingApiDestinationFilter = (event.currentTarget as HTMLSelectElement).value
+    state.trackingApiPage = 1
+    void loadTrackingApiCatalogPackages()
+  })
+
+  document.querySelector<HTMLFormElement>('#tracking-api-code-form')?.addEventListener('submit', (event) => {
+    event.preventDefault()
+    state.packageCodeLookupQuery = state.packageCodeLookupQuery.trim()
+    state.trackingApiPage = 1
+    void lookupPackageCode()
+  })
+
+  document.querySelector<HTMLInputElement>('#tracking-api-code-search')?.addEventListener('input', (event) => {
+    state.packageCodeLookupQuery = (event.currentTarget as HTMLInputElement).value
+  })
+
+  document.querySelector<HTMLButtonElement>('#tracking-api-code-clear')?.addEventListener('click', () => {
+    state.packageCodeLookupQuery = ''
+    state.trackingApiPage = 1
+    state.packageCodeLookupResult = null
+    renderApp()
+  })
+
+  // Eventos de Terminal Escáner Internacional
+  document.querySelectorAll<HTMLFormElement>('[data-scanner-form]').forEach((form) => {
+    form.addEventListener('submit', (event) => {
+      event.preventDefault()
+      const input = form.querySelector<HTMLInputElement>('[data-scanner-input]')
+      const code = input?.value?.trim() || ''
+      if (code) {
+        void performScannerSearch(code)
+      }
+    })
+  })
+
+  document.querySelectorAll<HTMLInputElement>('[data-scanner-input]').forEach((input) => {
+    input.addEventListener('input', (event) => {
+      state.scannerQuery = (event.currentTarget as HTMLInputElement).value
+    })
+  })
+
+  document.querySelectorAll<HTMLButtonElement>('[data-scanner-quick-code]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const code = btn.dataset.scannerQuickCode
+      if (code) {
+        state.scannerQuery = code
+        void performScannerSearch(code)
+      }
+    })
+  })
+
+  document.querySelectorAll<HTMLButtonElement>('[data-scanner-page]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      if (state.trackingApiState === 'loading') return
+      if (btn.dataset.scannerPage === 'prev' && state.trackingApiPage > 1) {
+        state.trackingApiPage -= 1
+        void loadTrackingApiPackages()
+      }
+      if (btn.dataset.scannerPage === 'next' && state.trackingApiHasMore) {
+        state.trackingApiPage += 1
+        void loadTrackingApiPackages()
+      }
+    })
+  })
+
+  document.querySelectorAll<HTMLDivElement>('[data-scanner-select-log]').forEach((item) => {
+    item.addEventListener('click', () => {
+      const code = item.dataset.scannerSelectLog
+      if (code) {
+        const found = state.scannerSessionLog.find((l: any) => l.codigo === code)
+        if (found?.pkg) {
+          state.scannerResult = found.pkg
+          state.scannerQuery = code
+          renderApp()
+        } else {
+          void performScannerSearch(code)
+        }
+      }
+    })
+  })
+
+  document.querySelectorAll<HTMLButtonElement>('[data-scanner-stage-filter]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const filterKey = btn.dataset.scannerStageFilter || 'all'
+      state.scannerStageFilter = state.scannerStageFilter === filterKey ? 'all' : filterKey
+      renderApp()
+    })
   })
 
   document.querySelector<HTMLButtonElement>('#contact-packages-page-prev')?.addEventListener('click', () => {
@@ -7127,7 +10453,7 @@ const renderAppNow = () => {
 
   document.querySelector<HTMLSelectElement>('#contact-packages-type-filter')?.addEventListener('change', (event) => {
     state.contactPackagesTypeFilter = (event.currentTarget as HTMLSelectElement).value
-    if (state.contactPackagesTypeFilter !== 'all' || state.contactPackagesStatusFilter !== 'all') {
+    if (state.contactPackagesTypeFilter !== 'all') {
       void ensureAllContactPackagesForFilters()
       return
     }
@@ -7141,6 +10467,20 @@ const renderAppNow = () => {
       return
     }
     renderApp()
+  })
+
+  document.querySelectorAll<HTMLButtonElement>('[data-contact-packages-status-chip]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const status = button.dataset.contactPackagesStatusChip
+      if (!status) return
+
+      state.contactPackagesStatusFilter = status
+      if (state.contactPackagesTypeFilter !== 'all' || state.contactPackagesStatusFilter !== 'all') {
+        void ensureAllContactPackagesForFilters()
+        return
+      }
+      renderApp()
+    })
   })
 
   document.querySelector<HTMLButtonElement>('#export-contact-packages')?.addEventListener('click', () => {
@@ -7159,6 +10499,7 @@ const renderAppNow = () => {
     .querySelector<HTMLSelectElement>('#segment-filter')
     ?.addEventListener('change', (event) => {
       state.segmentFilter = (event.currentTarget as HTMLSelectElement).value
+      state.contactListPage = 1
       renderApp()
     })
 
@@ -7166,6 +10507,7 @@ const renderAppNow = () => {
     .querySelector<HTMLSelectElement>('#status-filter')
     ?.addEventListener('change', (event) => {
       state.statusFilter = (event.currentTarget as HTMLSelectElement).value
+      state.contactListPage = 1
       renderApp()
     })
 
@@ -7275,6 +10617,16 @@ const renderAppNow = () => {
       void suggestConversationReply()
     })
 
+  document.querySelectorAll<HTMLButtonElement>('[data-auto-reply-unpause]').forEach((button) => {
+    button.addEventListener('click', (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      const contactId = Number(button.dataset.autoReplyUnpause)
+      if (!Number.isFinite(contactId)) return
+      void unpauseAutoReplyForContact(contactId)
+    })
+  })
+
   document
     .querySelector<HTMLDivElement>('#message-modal-backdrop')
     ?.addEventListener('click', (event) => {
@@ -7383,7 +10735,7 @@ const renderAppNow = () => {
     .querySelector<HTMLFormElement>('#send-message-form')
     ?.addEventListener('submit', (event) => {
       event.preventDefault()
-      void submitSendWhatsAppMessage()
+      void submitSendWhatsAppMessage({ useAiSuggestion: false })
     })
 
   document
@@ -7398,7 +10750,14 @@ const renderAppNow = () => {
     .querySelector<HTMLFormElement>('#chat-composer-form')
     ?.addEventListener('submit', (event) => {
       event.preventDefault()
-      void submitSendWhatsAppMessage()
+      void submitChatComposerMessage()
+    })
+
+  document
+    .querySelector<HTMLButtonElement>('#chat-composer-send')
+    ?.addEventListener('click', (event) => {
+      event.preventDefault()
+      void submitChatComposerMessage()
     })
 
   document.querySelectorAll<HTMLButtonElement>('[data-send-whatsapp]').forEach((button) => {
@@ -7409,11 +10768,51 @@ const renderAppNow = () => {
     })
   })
 
+  document.querySelectorAll<HTMLButtonElement>('[data-chat-list-page]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const action = button.dataset.chatListPage
+      const pagination = getChatListPagination()
+
+      if (action === 'prev') {
+        setChatListPage(pagination.currentPage - 1)
+        return
+      }
+
+      if (action === 'next') {
+        setChatListPage(pagination.currentPage + 1)
+      }
+    })
+  })
+
+  document.querySelectorAll<HTMLButtonElement>('[data-contacts-list-page]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const action = button.dataset.contactsListPage
+      const pagination = getContactsPagination()
+
+      if (action === 'prev') {
+        setContactsListPage(pagination.currentPage - 1)
+        return
+      }
+
+      if (action === 'next') {
+        setContactsListPage(pagination.currentPage + 1)
+      }
+    })
+  })
+
   document.querySelectorAll<HTMLButtonElement>('[data-open-chat]').forEach((button) => {
     button.addEventListener('click', () => {
       const contactId = Number(button.dataset.openChat)
       if (!Number.isFinite(contactId)) return
       void openConversationModal(contactId)
+    })
+  })
+
+  document.querySelectorAll<HTMLButtonElement>('[data-dismiss-message-notification]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const notificationId = button.dataset.dismissMessageNotification
+      if (!notificationId) return
+      dismissMessageNotification(notificationId)
     })
   })
 
@@ -7699,14 +11098,33 @@ const renderApp = () => {
   })
 }
 
-const loadDashboard = async () => {
-  const shouldBlockWorkspace = state.data === null
-  state.loading = shouldBlockWorkspace
-  state.error = null
-  renderApp()
+const loadDashboard = async (options: { silent?: boolean } = {}) => {
+  if (!state.authToken) {
+    state.loading = false
+    state.error = null
+    if (!options.silent) {
+      state.loginError = 'Inicia sesion para cargar el dashboard.'
+      renderApp()
+    }
+    return
+  }
+
+  if (dashboardRefreshInFlight) {
+    return
+  }
+
+  dashboardRefreshInFlight = true
+
+  const shouldBlockWorkspace = state.data === null && !options.silent
+  if (shouldBlockWorkspace) {
+    state.loading = true
+    state.error = null
+    renderApp()
+  }
 
   try {
-    const response = await authFetch('/api/dashboard')
+    const previousContacts = state.data?.contacts ?? []
+    const response = await authFetch('/api/dashboard', { timeoutMs: 60000 })
     const payload = await parseApiPayload(response)
 
     if (response.status === 401) {
@@ -7723,6 +11141,7 @@ const loadDashboard = async () => {
     }
 
     state.data = payload as DashboardData
+    const nextContacts = state.data.contacts ?? []
     const validIds = new Set(state.data.contacts.map((contact) => contact.id))
     state.selectedContactIds = new Set(
       [...state.selectedContactIds].filter((contactId) => validIds.has(contactId)),
@@ -7730,9 +11149,45 @@ const loadDashboard = async () => {
     syncWhatsAppConfigFromDashboard(state.data)
     syncProntsConfigFromDashboard(state.data)
     syncPipelineConfigFromDashboard(state.data)
+    syncEmsStageOverridesFromDashboard(state.data)
+
+    if (previousContacts.length > 0 && nextContacts.length > 0) {
+      const previousContactsById = new Map(previousContacts.map((contact) => [contact.id, contact] as const))
+
+      nextContacts.forEach((nextContact) => {
+        const previousContact = previousContactsById.get(nextContact.id) ?? null
+        const nextDirection = String(nextContact.lastMessageDirection ?? '').trim().toLowerCase()
+        const nextTimestamp = String(nextContact.lastMessageAt ?? '').trim()
+        const nextPreview = String(nextContact.lastMessageText ?? '').trim()
+
+        if (nextDirection !== 'inbound' || !nextTimestamp || !nextPreview) {
+          return
+        }
+
+        const previousTimestamp = String(previousContact?.lastMessageAt ?? '').trim()
+        const previousPreview = String(previousContact?.lastMessageText ?? '').trim()
+
+        if (previousTimestamp === nextTimestamp && previousPreview === nextPreview) {
+          return
+        }
+
+        enqueueMessageNotification({
+          contactId: nextContact.id,
+          contactName: nextContact.name,
+          preview: nextPreview,
+          timestamp: nextTimestamp,
+        })
+      })
+    }
 
     if (state.activeView === 'internacionales' && state.trackingApiState !== 'loading') {
       void loadTrackingApiPackages()
+    }
+    if (
+      state.activeView === 'internacionales-tablero' &&
+      Object.keys(state.internationalPipelineColumns).length === 0
+    ) {
+      void loadInternationalPipeline()
     }
     if (state.activeView === 'internacionales-paquetes' && state.contactPackagesState !== 'loading') {
       void loadContactPackages()
@@ -7755,6 +11210,7 @@ const loadDashboard = async () => {
         : 'Ocurrio un error inesperado al cargar el CRM.'
   } finally {
     state.loading = false
+    dashboardRefreshInFlight = false
     renderApp()
   }
 }
@@ -7767,6 +11223,7 @@ const finishLogin = async (token: string, user: SessionUser) => {
   state.loginError = null
   persistAuthState()
   scheduleSessionExpiry()
+  syncViewToLocation(state.activeView, { replace: true })
   renderApp()
   await loadDashboard()
   if (state.activeView === 'ems') {
@@ -7855,8 +11312,8 @@ const submitCreateContact = async () => {
     if (!response.ok) {
       throw new Error(
         (payload?.error as string) ||
-          (payload?.message as string) ||
-          'No se pudo guardar el contacto.',
+        (payload?.message as string) ||
+        'No se pudo guardar el contacto.',
       )
     }
 
@@ -7904,8 +11361,8 @@ const submitWhatsAppConfig = async () => {
     if (!response.ok) {
       throw new Error(
         (payload?.error as string) ||
-          (payload?.message as string) ||
-          'No se pudo guardar la configuracion de WhatsApp.',
+        (payload?.message as string) ||
+        'No se pudo guardar la configuracion de WhatsApp.',
       )
     }
 
@@ -7968,8 +11425,8 @@ const submitWhatsAppTestMessage = async () => {
     if (!response.ok) {
       throw new Error(
         (payload?.error as string) ||
-          (payload?.message as string) ||
-          'No se pudo enviar la prueba de WhatsApp.',
+        (payload?.message as string) ||
+        'No se pudo enviar la prueba de WhatsApp.',
       )
     }
 
@@ -7989,14 +11446,14 @@ const submitWhatsAppTestMessage = async () => {
   }
 }
 
-const submitSendWhatsAppMessage = async () => {
+const submitSendWhatsAppMessage = async ({ useAiSuggestion = false } = {}) => {
   state.sendMessageState = 'submitting'
   state.sendMessageError = null
   renderApp()
 
   try {
     const targetContactId = state.sendMessageForm.contactId
-    const aiEnabled = targetContactId !== null && isAiAssistedConversation(targetContactId)
+    const aiEnabled = useAiSuggestion && targetContactId !== null && isAiAssistedConversation(targetContactId)
     const attachment = state.sendMessageForm.attachment
     const hasAttachment = Boolean(attachment)
     const attachmentType = attachment?.type ?? ''
@@ -8023,23 +11480,6 @@ const submitSendWhatsAppMessage = async () => {
 
     if (hasAttachment && attachmentType.startsWith('audio/') && finalMessage) {
       throw new Error('Los audios no admiten texto adicional. Envia solo el archivo de audio.')
-    }
-
-    const normalizedTarget = normalizePhoneDigits(state.sendMessageForm.targetReference)
-
-    if (state.whatsappTestModeEnabled) {
-      await ensureWhatsAppTestModeSourcesLoaded()
-
-      const normalizedTargetNumber = normalizeBoliviaTestPhoneDigits(normalizedTarget)
-      if (!state.whatsappTestModeNumbers.includes(normalizedTargetNumber)) {
-        throw new Error('El modo prueba esta activo. Solo puedes enviar a los numeros de prueba autorizados.')
-      }
-
-      if (!isWhatsAppTestNumberAvailableInLoadedApis(normalizedTargetNumber)) {
-        throw new Error(
-          'El modo prueba esta activo, pero ese numero no aparece en los datos cargados de Internacionales o Paquetes.',
-        )
-      }
     }
 
     const requestBody = hasAttachment ? new FormData() : null
@@ -8077,8 +11517,8 @@ const submitSendWhatsAppMessage = async () => {
     if (!response.ok) {
       throw new Error(
         (payload?.error as string) ||
-          (payload?.message as string) ||
-          'No se pudo enviar el mensaje por WhatsApp.',
+        (payload?.message as string) ||
+        'No se pudo enviar el mensaje por WhatsApp.',
       )
     }
 
@@ -8105,6 +11545,28 @@ const submitSendWhatsAppMessage = async () => {
   }
 }
 
+const submitChatComposerMessage = async () => {
+  const activeContact = state.conversationData.contact as Contact
+  const textarea = document.querySelector<HTMLTextAreaElement>('#chat-composer-input')
+  const message = textarea?.value ?? state.sendMessageForm.message
+
+  if (!activeContact?.id) {
+    state.sendMessageError = 'Selecciona un chat antes de enviar.'
+    renderApp()
+    return
+  }
+
+  state.sendMessageForm = {
+    ...state.sendMessageForm,
+    contactId: activeContact.id,
+    contactName: activeContact.name,
+    targetReference: getWhatsAppReference(activeContact),
+    message,
+  }
+
+  await submitSendWhatsAppMessage({ useAiSuggestion: false })
+}
+
 const logout = async (expiredBySchedule = false) => {
   try {
     await authFetch('/api/auth/logout', {
@@ -8125,12 +11587,13 @@ const logout = async (expiredBySchedule = false) => {
 const restoreSession = async () => {
   if (!state.authToken) {
     state.authLoading = false
+    syncLoginToLocation({ replace: true })
     renderApp()
     return
   }
 
   try {
-    const response = await authFetch('/api/auth/session')
+    const response = await authFetch('/api/auth/session', { timeoutMs: 4000 })
     const payload = await parseApiPayload(response)
 
     if (!response.ok) {
@@ -8144,19 +11607,22 @@ const restoreSession = async () => {
     scheduleSessionExpiry()
   } catch {
     clearSession()
+    state.loginError = 'La sesion no se pudo validar a tiempo. Inicia sesion nuevamente.'
+    syncLoginToLocation({ replace: true })
   } finally {
     state.authLoading = false
     renderApp()
   }
 
   if (state.sessionUser) {
+    syncViewToLocation(state.activeView, { replace: true })
     await loadDashboard()
     if (state.activeView === 'ems') {
       void refreshEmsPipelineFromApis()
+      bootstrapEmsPipelineView()
     }
   }
 }
 
 renderApp()
 void restoreSession()
-

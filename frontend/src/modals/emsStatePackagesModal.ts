@@ -5,24 +5,24 @@ export const renderEmsStatePackagesModal = (ctx: any) => {
     state,
     escapeHtml,
     formatConversationTimestamp,
-    getEmsStatePackagesModalPagination,
     getEmsStatusToneClass,
     getEmsStatusLabel,
-    getEmsStatusKey,
-    openEmsPackageDetailModal,
+    getEmsPipelineScopePageState,
   } = ctx
 
   if (!state.isEmsStatePackagesModalOpen) {
     return ''
   }
 
-  const pagination = getEmsStatePackagesModalPagination()
-  const scope = pagination.scope
+  const scope = state.emsStatePackagesModalScope
+  const pageState = scope ? getEmsPipelineScopePageState(scope) : null
   const scopeLabel = scope
-    ? state.pipelineConfig.columns[scope]?.title ?? getEmsStatusLabel(scope)
+    ? state.pipelineConfig.columns[scope]?.title ??
+      state.pipelineConfig.customColumns.find((column: any) => column.id === scope)?.title ??
+      getEmsStatusLabel(scope)
     : 'Todos los estados'
 
-  const sourceItems = pagination.items
+  const sourceItems = pageState?.items ?? []
 
   const renderReferenceTone = (reference: string) => {
     if (!reference || reference === 'Sin referencia') {
@@ -30,7 +30,7 @@ export const renderEmsStatePackagesModal = (ctx: any) => {
     }
 
     return reference.startsWith('+') || /^\d+$/.test(reference.replace(/[^\d]/g, ''))
-      ? 'Solo teléfono'
+      ? 'Solo telÃ©fono'
       : 'Referencia'
   }
 
@@ -41,10 +41,10 @@ export const renderEmsStatePackagesModal = (ctx: any) => {
           <div class="pipeline-state-modal-title">
             <p class="section-kicker">EMS</p>
             <h3>Paquetes en ${escapeHtml(scopeLabel)}</h3>
-            <small>Lista paginada con todos los paquetes detectados para este estado.</small>
+            <small>Lista paginada con los paquetes de esta columna.</small>
           </div>
           <div class="pipeline-state-modal-actions">
-            <span class="pipeline-state-modal-chip">${escapeHtml(`${pagination.totalItems} paquetes`)}</span>
+            <span class="pipeline-state-modal-chip">${escapeHtml(`${pageState?.totalItems ?? 0} paquetes`)}</span>
             <button class="modal-close" id="close-ems-state-packages-modal" type="button">Cerrar</button>
           </div>
         </div>
@@ -55,12 +55,12 @@ export const renderEmsStatePackagesModal = (ctx: any) => {
             <strong>${escapeHtml(scopeLabel)}</strong>
           </div>
           <div class="pipeline-state-summary-card">
-            <span class="pipeline-state-summary-label">Registros</span>
-            <strong>${pagination.totalItems}</strong>
+            <span class="pipeline-state-summary-label">Paquetes</span>
+            <strong>${pageState?.totalItems ?? 0}</strong>
           </div>
           <div class="pipeline-state-summary-card">
-            <span class="pipeline-state-summary-label">Página</span>
-            <strong>${pagination.currentPage} / ${pagination.totalPages}</strong>
+            <span class="pipeline-state-summary-label">PÃ¡gina</span>
+            <strong>${pageState?.currentPage ?? 1} / ${pageState?.totalPages ?? 1}</strong>
           </div>
         </div>
 
@@ -86,11 +86,11 @@ export const renderEmsStatePackagesModal = (ctx: any) => {
                         <div class="ems-state-package-meta">
                           <div>
                             <strong>${escapeHtml(item.senderName)}</strong>
-                            <small>${escapeHtml(item.senderReference)} · ${escapeHtml(renderReferenceTone(item.senderReference))}</small>
+                            <small>${escapeHtml(item.senderReference)} Â· ${escapeHtml(renderReferenceTone(item.senderReference))}</small>
                           </div>
                           <div>
                             <strong>${escapeHtml(item.recipientName)}</strong>
-                            <small>${escapeHtml(item.recipientReference)} · ${escapeHtml(renderReferenceTone(item.recipientReference))}</small>
+                            <small>${escapeHtml(item.recipientReference)} Â· ${escapeHtml(renderReferenceTone(item.recipientReference))}</small>
                           </div>
                           <span>${escapeHtml(formatConversationTimestamp(item.updatedAt))}</span>
                         </div>
@@ -112,16 +112,16 @@ export const renderEmsStatePackagesModal = (ctx: any) => {
               class="secondary-btn"
               data-ems-state-packages-page="prev"
               type="button"
-              ${pagination.currentPage <= 1 ? 'disabled' : ''}
+              ${!scope || (pageState?.currentPage ?? 1) <= 1 || pageState?.state === 'loading' ? 'disabled' : ''}
             >
               Anterior
             </button>
-            <span>Página ${pagination.currentPage} de ${pagination.totalPages}</span>
+            <span>PÃ¡gina ${pageState?.currentPage ?? 1} de ${pageState?.totalPages ?? 1}</span>
             <button
               class="secondary-btn"
               data-ems-state-packages-page="next"
               type="button"
-              ${pagination.currentPage >= pagination.totalPages ? 'disabled' : ''}
+              ${!scope || (pageState?.currentPage ?? 1) >= (pageState?.totalPages ?? 1) || pageState?.state === 'loading' ? 'disabled' : ''}
             >
               Siguiente
             </button>

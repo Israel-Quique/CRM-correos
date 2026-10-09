@@ -91,33 +91,28 @@ export const renderAuthenticatedApp = (ctx: any) => {
           <span>CRM comercial, marketing y automatizacion</span>
         </div>
         <div class="topbar-user">
-          <button
+          <div
             class="topbar-test-btn ${state.whatsappTestModeEnabled ? 'is-active' : 'is-inactive'}"
-            id="header-whatsapp-test-toggle"
-            type="button"
-            aria-pressed="${state.whatsappTestModeEnabled ? 'true' : 'false'}"
-            ${state.whatsappTestModeState === 'submitting' ? 'disabled' : ''}
-            title="Activa el modo prueba para permitir envios solo al +59164229403 cuando aparezca en las APIs."
+            role="status"
+            aria-label="Estado del modo prueba de WhatsApp"
           >
             <span class="topbar-test-dot" aria-hidden="true"></span>
             <span class="topbar-test-copy">
               <strong>Prueba</strong>
               <small>${state.whatsappTestModeEnabled ? 'ON' : 'OFF'} · ${escapeHtml(formatBoliviaTestPhone(state.whatsappTestModeNumber))}</small>
             </span>
-          </button>
-          <button
+          </div>
+          <div
             class="topbar-agent-btn ${state.globalAiAgentEnabled ? 'is-active' : ''}"
-            id="header-ai-agent-toggle"
-            type="button"
-            aria-pressed="${state.globalAiAgentEnabled ? 'true' : 'false'}"
-            title="Activar agente IA para todas las conversaciones"
+            role="status"
+            aria-label="Estado del agente IA"
           >
             <span class="topbar-agent-icon">${getRobotIcon()}</span>
             <span class="topbar-agent-copy">
               <strong>Agente IA</strong>
               <small>${state.globalAiAgentEnabled ? 'Activo' : 'Manual'}</small>
             </span>
-          </button>
+          </div>
           <div class="topbar-chip">${state.data?.metrics.hotLeads ?? 0} leads calientes</div>
           <div class="topbar-profile-wrap ${state.topbarProfileOpen ? 'is-open' : ''}">
           <button
@@ -134,7 +129,6 @@ export const renderAuthenticatedApp = (ctx: any) => {
                 <span>${escapeHtml(state.sessionUser?.role ?? 'Administradores')}</span>
               </div>
             </div>
-            <span class="topbar-profile-caret" aria-hidden="true">v</span>
           </button>
           <div class="topbar-profile-menu" role="menu" aria-label="Perfil de usuario">
             <button
@@ -151,6 +145,30 @@ export const renderAuthenticatedApp = (ctx: any) => {
       ${renderWorkspace(ctx)}
     </div>
   </div>
+  ${
+    state.messageNotifications.length > 0
+      ? `
+        <div class="message-notification-stack" aria-live="polite" aria-label="Nuevas notificaciones de mensajes">
+          ${state.messageNotifications
+            .map(
+              (notification: any) => `
+                <article class="message-notification-card">
+                  <div class="message-notification-badge">Mensaje nuevo</div>
+                  <strong>${escapeHtml(notification.contactName)}</strong>
+                  <p>${escapeHtml(notification.preview)}</p>
+                  <small>${escapeHtml(notification.timestamp || 'Sin hora registrada')}</small>
+                  <div class="message-notification-actions">
+                    <button class="message-notification-open" data-open-chat="${notification.contactId}" type="button">Ver chat</button>
+                    <button class="message-notification-dismiss" data-dismiss-message-notification="${notification.id}" type="button">Cerrar</button>
+                  </div>
+                </article>
+              `,
+            )
+            .join('')}
+        </div>
+      `
+      : ''
+  }
   ${renderCreateContactModal(ctx)}
   ${renderSendMessageModal(ctx)}
   ${state.isConversationModalOpen ? renderConversationModal(ctx) : ''}
@@ -166,6 +184,5 @@ export const renderAuthenticatedApp = (ctx: any) => {
   ${renderCreatePipelineColumnModal(ctx)}
 `
 }
-
 
 

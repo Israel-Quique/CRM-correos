@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch index.js",
-    "start": "node index.js"
+    "start": "node index.js",
+    "import:ips": "node scripts/import-ips-packages.mjs"
   },
   "dependencies": {
     "cors": "^2.8.5",

@@ -91,7 +91,7 @@ const aiDefaults = {
 }
 
 const getTrackingApiDefaults = () => ({
-  baseUrl: process.env.TRACKING_API_URL?.trim() ?? 'http://172.65.10.55:8103',
+  baseUrl: process.env.TRACKING_API_URL?.trim() ?? 'https://dev.correos.gob.bo:18100',
   token:
     process.env.TRACKING_SQLSERVER_TOKEN?.trim() ??
     process.env.TRACKING_API_TOKEN?.trim() ??
@@ -246,6 +246,88 @@ app.get('/api/tracking/paquetes', cors(), authMiddleware, async (request, respon
   try {
     reloadLocalEnv()
     const trackingApiDefaults = getTrackingApiDefaults()
+
+    if (String(request.query.all ?? '').trim() === '1') {
+      const allItems = []
+      const seenKeys = new Set()
+      const pageSize = 12
+      const maxPages = 500
+
+      for (let page = 1; page <= maxPages; page += 1) {
+        const upstreamUrl = new URL('/api/tracking/paquetes', trackingApiDefaults.baseUrl)
+        upstreamUrl.searchParams.set('page', String(page))
+        upstreamUrl.searchParams.set('per_page', String(pageSize))
+
+        const upstreamResponse = await fetchJsonWithTimeout(upstreamUrl, {
+          headers: {
+            Authorization: `Bearer ${trackingApiDefaults.token}`,
+            Accept: 'application/json',
+          },
+        })
+
+        if (!upstreamResponse.ok) {
+          const rawBody = await upstreamResponse.text()
+          let payload = null
+
+          try {
+            payload = rawBody ? JSON.parse(rawBody) : null
+          } catch {
+            payload = { raw: rawBody }
+          }
+
+          response.status(upstreamResponse.status).json(payload)
+          return
+        }
+
+        const payload = await upstreamResponse.json().catch(() => null)
+        const pageItems = Array.isArray(payload?.data) ? payload.data : []
+        if (!pageItems.length) {
+          break
+        }
+
+        for (const item of pageItems) {
+          const catalogKey = String(item?.mailitm_pid ?? item?.codigo_s10 ?? item?.codigo ?? '').trim()
+          if (!catalogKey || seenKeys.has(catalogKey)) {
+            continue
+          }
+
+          seenKeys.add(catalogKey)
+          allItems.push(item)
+        }
+      }
+
+      allItems.sort((firstItem, secondItem) => {
+        const firstDate = Date.parse(
+          String(firstItem?.fecha_registro ?? firstItem?.eventos?.[0]?.fecha ?? '').trim(),
+        )
+        const secondDate = Date.parse(
+          String(secondItem?.fecha_registro ?? secondItem?.eventos?.[0]?.fecha ?? '').trim(),
+        )
+
+        if (Number.isFinite(firstDate) && Number.isFinite(secondDate) && firstDate !== secondDate) {
+          return firstDate - secondDate
+        }
+
+        return String(firstItem?.codigo_s10 ?? firstItem?.codigo ?? '').localeCompare(
+          String(secondItem?.codigo_s10 ?? secondItem?.codigo ?? ''),
+          'es',
+        )
+      })
+
+      response.json({
+        data: allItems,
+        total: allItems.length,
+        paginacion: {
+          total_registros: allItems.length,
+          ultima_pagina: 1,
+          pagina_actual: 1,
+          por_pagina: allItems.length || 1,
+          per_page: allItems.length || 1,
+        },
+      })
+      return
+    }
+
     const upstreamUrl = new URL('/api/tracking/paquetes', trackingApiDefaults.baseUrl)
     const searchParams = new URLSearchParams()
 
@@ -499,7 +581,21 @@ const parsePhoneNumberCandidate = (value) => {
     return null
   }
 
-  return parsePhoneNumberFromString(`+${digits}`)
+  return (
+    parsePhoneNumberFromString(digits, 'BO') ??
+    parsePhoneNumberFromString(`+${digits}`)
+  )
+}
+
+const isCellPhoneNumber = (value) => {
+  const phoneNumber = parsePhoneNumberCandidate(value)
+
+  if (!phoneNumber) {
+    return false
+  }
+
+  const phoneType = phoneNumber.getType?.()
+  return phoneType === 'MOBILE' || phoneType === 'FIXED_LINE_OR_MOBILE'
 }
 
 const getWhatsAppNumberCandidates = (value) => {
@@ -745,6 +841,76 @@ const saveWhatsAppConfig = async (partialConfig) => {
   return nextConfig
 }
 
+const EmsStageKeys = ['received', 'transit', 'regional', 'courier', 'delivered']
+
+const normalizeEmsStageOverrideKey = (value) => normalizeReference(value).toUpperCase()
+
+const normalizeEmsStageOverrideValue = (value) => {
+  const normalized = normalizeReference(value).toLowerCase()
+
+  if (EmsStageKeys.includes(normalized)) {
+    return normalized
+  }
+
+  return normalizeEmsStatus(normalized)
+}
+
+const normalizeEmsStageOverrideMap = (settings = {}) =>
+  Object.entries(settings ?? {})
+    .map(([key, value]) => [normalizeEmsStageOverrideKey(key), normalizeEmsStageOverrideValue(value)])
+    .filter(([key, value]) => Boolean(key) && Boolean(value))
+    .reduce((accumulator, [key, value]) => {
+      accumulator[key] = value
+      return accumulator
+    }, {})
+
+const getStoredEmsStageOverrides = async (client = pool) => {
+  const result = await client.query(
+    `
+      select settings
+      from integration_settings
+      where integration_key = $1
+      limit 1;
+    `,
+    ['crm_ems_stage_overrides'],
+  )
+
+  const settings = result.rows[0]?.settings ?? {}
+  return normalizeEmsStageOverrideMap(settings)
+}
+
+const saveEmsStageOverrides = async (partialOverrides = {}) => {
+  const currentOverrides = await getStoredEmsStageOverrides()
+  const nextOverrides = {
+    ...currentOverrides,
+    ...normalizeEmsStageOverrideMap(partialOverrides),
+  }
+
+  await pool.query(
+    `
+      insert into integration_settings (integration_key, settings, updated_at)
+      values ($1, $2::jsonb, now())
+      on conflict (integration_key) do update
+      set settings = excluded.settings,
+          updated_at = now();
+    `,
+    ['crm_ems_stage_overrides', JSON.stringify(nextOverrides)],
+  )
+
+  return nextOverrides
+}
+
+const saveEmsStageOverride = async (packageCode, stage) => {
+  const key = normalizeEmsStageOverrideKey(packageCode)
+  const normalizedStage = normalizeEmsStageOverrideValue(stage)
+
+  if (!key || !normalizedStage) {
+    return getStoredEmsStageOverrides()
+  }
+
+  return saveEmsStageOverrides({ [key]: normalizedStage })
+}
+
 const extractTrackingApiPhoneCandidates = (item) => [
   item?.telefono,
   item?.phone,
@@ -786,20 +952,19 @@ const getPackageStageRank = (stage) => {
 
 const inferTrackingPackageStage = (item) => {
   const latestEvent = getTrackingLatestEvent(item)
-  return (
-    normalizeEmsStatus(
-      [
-        item?.estado_postal,
-        latestEvent?.evento_api,
-        latestEvent?.evento_original,
-        latestEvent?.detalle,
-        latestEvent?.movimiento_bolivia,
-      ]
-        .map(normalizeReference)
-        .filter(Boolean)
-        .join(' | '),
-    ) ?? 'received'
+  const eventStage = normalizeEmsStatus(
+    [
+      latestEvent?.evento_api,
+      latestEvent?.evento_original,
+      latestEvent?.detalle,
+      latestEvent?.movimiento_bolivia,
+    ]
+      .map(normalizeReference)
+      .filter(Boolean)
+      .join(' | '),
   )
+
+  return eventStage ?? normalizeEmsStatus(item?.estado_postal) ?? 'received'
 }
 
 const getPackageLifecycleInstruction = (stage) => {
@@ -970,6 +1135,7 @@ const fetchMatchingPackageContext = async (reference, packageCode = '') => {
 
   const trackingItems = Array.isArray(trackingPayload?.data) ? trackingPayload.data : []
   const contactItems = Array.isArray(contactPayload?.data) ? contactPayload.data : []
+  const stageOverrides = await getStoredEmsStageOverrides()
 
   const normalizedPackageCode = normalizeReference(packageCode).toUpperCase()
   const matchesCode = (item) => {
@@ -1107,7 +1273,13 @@ const fetchMatchingPackageContext = async (reference, packageCode = '') => {
       .slice()
       .sort((firstEntry, secondEntry) => getEntrySpecificityScore(secondEntry) - getEntrySpecificityScore(firstEntry))[0] ??
     latestPackageEntry
-  const stage = latestPackageEntry?.stage ?? null
+  const overrideStage =
+    normalizedPackageCode && stageOverrides[normalizedPackageCode]
+      ? stageOverrides[normalizedPackageCode]
+      : latestPackageEntry?.code
+        ? stageOverrides[normalizeReference(latestPackageEntry.code).toUpperCase()] ?? null
+        : null
+  const stage = overrideStage ?? mostSpecificEntry?.stage ?? latestPackageEntry?.stage ?? null
 
   const summarySections = []
 
@@ -1699,37 +1871,10 @@ const syncContactEmsStatus = async ({ contactId, currentContact = null, recentMe
   const packageContext = whatsappReference ? await fetchMatchingPackageContext(whatsappReference) : null
 
   const conversationContext = buildAiConversationContext(messages.slice().reverse())
-  const prompt = [
-    'Clasifica el estado EMS del contacto en una sola palabra exacta:',
-    '- received',
-    '- transit',
-    '- regional',
-    '- courier',
-    '- delivered',
-    '',
-    `Contacto: ${contact.name || 'Sin nombre'}`,
-    `Empresa: ${contact.company || 'No registrada'}`,
-    `Estado actual: ${contact.status || 'Sin estado'}`,
-    '',
-    conversationContext ? `Ultimas interacciones (hasta 4 chats recientes):\n${conversationContext}` : 'Sin historial reciente.',
-    '',
-      'Responde solo con una de estas palabras: received, transit, regional, courier, delivered.',
-  ].join('\n')
 
-  let inferredStatus =
-    packageContext?.matched && packageContext.stage
-      ? packageContext.stage
-      : inferEmsStatusFromText(conversationContext || contact.status) || 'received'
+  let inferredStatus = packageContext?.matched && packageContext.stage ? packageContext.stage : null
 
-  try {
-    const aiResult = await callOllamaGenerate({ prompt })
-    const aiStatus = normalizeEmsStatus(aiResult.response)
-    if (aiStatus) {
-      inferredStatus = aiStatus
-    }
-  } catch (error) {
-    console.warn('No se pudo clasificar el estado EMS con IA:', error.message)
-  }
+  inferredStatus = inferredStatus ?? inferEmsStatusFromText(conversationContext || contact.status) ?? 'received'
 
   const currentStage = normalizeEmsStatus(contact.status) || 'received'
   const nextStage =
@@ -1870,12 +2015,45 @@ const hasPackageCode = (messageBody) => {
   return Boolean(extractPackageCode(normalized)) || /\b\d{8,}\b/.test(normalized)
 }
 
+const isClosingWhatsAppMessage = (messageBody) => {
+  const normalized = normalizeReference(messageBody).toLowerCase()
+
+  if (!normalized) {
+    return false
+  }
+
+  return [
+    'gracias',
+    'muchas gracias',
+    'esta bien',
+    'está bien',
+    'perfecto',
+    'ok',
+    'de acuerdo',
+    'adios',
+    'adiós',
+    'hasta luego',
+    'chao',
+    'cerrado',
+    'cerrar',
+    'ya esta',
+    'ya está',
+    'listo',
+    'todo bien',
+    'no gracias',
+  ].some((phrase) => normalized.includes(phrase))
+}
+
 const wait = (ms) =>
   new Promise((resolve) => {
     setTimeout(resolve, ms)
   })
 
 const AUTO_REPLY_SETTLE_DELAY_MS = Number.parseInt(process.env.WHATSAPP_AUTO_REPLY_SETTLE_DELAY_MS || '2500', 10)
+const WHATSAPP_REMINDER_INTERVAL_MS = Number.parseInt(
+  process.env.WHATSAPP_REMINDER_INTERVAL_MS || String(2 * 60 * 60 * 1000),
+  10,
+)
 
 const shouldSkipAutoReplyBecauseNewerInboundExists = async ({ contactId, sender, inboundMessageId }) => {
   if (!Number.isInteger(inboundMessageId) || inboundMessageId <= 0) {
@@ -1902,6 +2080,41 @@ const shouldSkipAutoReplyBecauseNewerInboundExists = async ({ contactId, sender,
   )
 
   return Boolean(newerInboundResult.rows[0]?.id)
+}
+
+const shouldSkipAutoReplyBecauseCooldownIsActive = async ({ contactId, sender }) => {
+  const outboundHistoryResult = await pool.query(
+    `
+      select created_at, message_text
+      from message_logs
+      where channel = 'WhatsApp'
+        and direction = 'outbound'
+        and (
+          contact_id = $1
+          or regexp_replace(coalesce(recipient_reference, ''), '[^0-9]', '', 'g') = any($2::text[])
+        )
+      order by created_at desc, id desc
+      limit 1;
+    `,
+    [contactId ?? -1, getWhatsAppNumberCandidates(sender)],
+  )
+
+  const lastOutbound = outboundHistoryResult.rows[0] ?? null
+
+  if (!lastOutbound?.created_at) {
+    return false
+  }
+
+  const lastOutboundAt = new Date(lastOutbound.created_at).getTime()
+  if (!Number.isFinite(lastOutboundAt)) {
+    return false
+  }
+
+  if (Date.now() - lastOutboundAt < WHATSAPP_REMINDER_INTERVAL_MS) {
+    return true
+  }
+
+  return isClosingWhatsAppMessage(lastOutbound.message_text)
 }
 
 const buildInitialPackageOutreachMessage = ({ contactName, packageContext }) => {
@@ -2106,6 +2319,96 @@ const callOllamaGenerate = async ({ prompt }) => {
   }
 }
 
+const SPANISH_LANGUAGE_HINTS = [
+  'hola',
+  'gracias',
+  'buenos dias',
+  'buenas tardes',
+  'buenas noches',
+  'por favor',
+  'seguimiento',
+  'paquete',
+  'envio',
+  'envío',
+  'mensaje',
+  'codigo',
+  'código',
+  'estado',
+  'cliente',
+  'necesito',
+  'podria',
+  'podría',
+  'puede',
+]
+
+const FOREIGN_LANGUAGE_HINTS = [' the ', ' and ', ' you ', ' please ', ' hello ', ' thanks ', ' where ', ' shipment ', ' package ', ' tracking ', ' order ', ' merci ', ' danke ', ' bonjour ']
+
+const looksLikeSpanishText = (text) => {
+  const normalized = ` ${normalizeReference(text).toLowerCase().replace(/\s+/g, ' ')} `
+
+  if (!normalized.trim()) {
+    return true
+  }
+
+  if (/[áéíóúñü¿¡]/.test(normalized)) {
+    return true
+  }
+
+  if (
+    [
+      'hola',
+      'gracias',
+      'buenas',
+      'buenos dias',
+      'buenas tardes',
+      'buenas noches',
+      'por favor',
+      'claro',
+      'perfecto',
+      'si ',
+      'sí ',
+    ].some((token) => normalized.includes(` ${token} `) || normalized.trim().startsWith(token))
+  ) {
+    return true
+  }
+
+  const spanishHits = SPANISH_LANGUAGE_HINTS.reduce(
+    (count, token) => count + (normalized.includes(` ${token} `) || normalized.includes(token) ? 1 : 0),
+    0,
+  )
+
+  return spanishHits >= 2
+}
+
+const translateTextToSpanishForAi = async (text) => {
+  const normalized = normalizeReference(text)
+  if (!normalized) {
+    return ''
+  }
+
+  if (looksLikeSpanishText(normalized)) {
+    return normalized
+  }
+
+  try {
+    const aiResult = await callOllamaGenerate({
+      prompt: [
+        'Traduce al español neutro el siguiente texto para un agente de WhatsApp.',
+        'No expliques nada. Devuelve solo la traduccion final.',
+        'Si el texto ya esta en español, devuelvelo sin cambios.',
+        'Conserva nombres propios, codigos, numeros, fechas y URLs.',
+        '',
+        `Texto original:\n${normalized}`,
+      ].join('\n'),
+    })
+
+    return normalizeReference(aiResult.response) || normalized
+  } catch (error) {
+    console.warn('No se pudo traducir el texto al español para la IA:', error.message)
+    return normalized
+  }
+}
+
 const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody, inboundMessageId }) => {
   const agentConfig = await getStoredAiAgentConfig()
   const autoReplyEnabled =
@@ -2140,6 +2443,33 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
           contactId: contactId ?? null,
           sender: normalizePhoneNumber(sender),
           inboundMessageId: inboundMessageId ?? null,
+        },
+      })
+      return null
+    }
+
+    if (isClosingWhatsAppMessage(messageBody)) {
+      await writeSystemLog({
+        event: 'whatsapp_auto_reply_skipped',
+        statusCode: 200,
+        details: {
+          reason: 'conversation-closed',
+          contactId: contactId ?? null,
+          sender: normalizePhoneNumber(sender),
+        },
+      })
+      return null
+    }
+
+    if (await shouldSkipAutoReplyBecauseCooldownIsActive({ contactId, sender })) {
+      await writeSystemLog({
+        event: 'whatsapp_auto_reply_skipped',
+        statusCode: 200,
+        details: {
+          reason: 'cooldown-active',
+          contactId: contactId ?? null,
+          sender: normalizePhoneNumber(sender),
+          cooldownMs: WHATSAPP_REMINDER_INTERVAL_MS,
         },
       })
       return null
@@ -2215,10 +2545,13 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
       .filter(Boolean)
       .join('\n')
 
+    const translatedMessageBody = await translateTextToSpanishForAi(messageBody)
+    const translatedRecentConversation = await translateTextToSpanishForAi(recentConversation)
+
     const packageCode = extractPackageCode(messageBody)
     const packageContext = await fetchMatchingPackageContext(sender, packageCode)
-    const isGreetingOnly = isGreetingMessage(messageBody)
-    const isPackageInquiryWithoutCode = isPackageInquiryMessage(messageBody) && !hasPackageCode(messageBody)
+    const isGreetingOnly = isGreetingMessage(translatedMessageBody)
+    const isPackageInquiryWithoutCode = isPackageInquiryMessage(translatedMessageBody) && !hasPackageCode(messageBody)
     const packageCodeNotFound = Boolean(packageCode) && !packageContext.matched
 
     const prompt = [
@@ -2245,9 +2578,9 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
         ? `Contexto del paquete para ${normalizeReference(sender)}:\n${packageContext.summaryText}\n\nRegla de etapa:\n${packageContext.lifecycleInstruction}`
         : '',
       '',
-      recentConversation ? `Conversacion reciente:\n${recentConversation}` : 'No hay historial previo.',
+      translatedRecentConversation ? `Conversacion reciente:\n${translatedRecentConversation}` : 'No hay historial previo.',
       '',
-      `Mensaje del cliente: ${normalizeReference(messageBody)}`,
+      `Mensaje del cliente: ${translatedMessageBody}`,
       '',
       'Devuelve solo el texto final de la respuesta, sin comillas, sin explicaciones ni markdown.',
     ].join('\n')
@@ -2259,7 +2592,12 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
         : packageCodeNotFound
           ? `No pude localizar el paquete ${packageCode}. Verifique el código e inténtelo nuevamente, por favor.`
           : packageCode && packageContext.matched
-            ? buildFallbackAgentReply({ contact, messageBody, currentStatus: contact?.status ?? 'Nuevo', packageContext })
+            ? buildFallbackAgentReply({
+                contact,
+                messageBody: translatedMessageBody,
+                currentStatus: contact?.status ?? 'Nuevo',
+                packageContext,
+              })
         : ''
 
     try {
@@ -2283,7 +2621,7 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
     if (!finalReply) {
       finalReply = buildFallbackAgentReply({
         contact,
-        messageBody,
+        messageBody: translatedMessageBody,
         currentStatus: contact?.status ?? 'Nuevo',
         packageContext,
       })
@@ -2634,28 +2972,55 @@ app.get('/api/health', async (_request, response) => {
 app.get('/api/logs/report', authMiddleware, async (request, response) => {
   const requestedHours = Number(request.query.hours ?? 24)
   const requestedLimit = Number(request.query.limit ?? 100)
+  const requestedPage = Number(request.query.page ?? 1)
+  const requestedPerPage = Number(request.query.per_page ?? 10)
   const hours = Number.isFinite(requestedHours) ? Math.min(Math.max(requestedHours, 1), 720) : 24
   const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 500) : 100
+  const page = Number.isFinite(requestedPage) ? Math.max(1, Math.floor(requestedPage)) : 1
+  const perPage = Number.isFinite(requestedPerPage) ? Math.min(Math.max(Math.floor(requestedPerPage), 1), 50) : 10
   const level = String(request.query.level ?? '').trim().toLowerCase()
   const pathFilter = String(request.query.path ?? '').trim()
+  const monthFilter = String(request.query.month ?? '').trim()
+  const isMonthFilter = /^\d{4}-\d{2}$/.test(monthFilter)
   const filters = ['created_at >= now() - ($1 * interval \'1 hour\')']
   const params = [hours]
+  const baseFilters = ['created_at >= now() - ($1 * interval \'1 hour\')']
+  const baseParams = [hours]
 
   if (['info', 'warn', 'error'].includes(level)) {
     params.push(level)
     filters.push(`level = $${params.length}`)
+    baseParams.push(level)
+    baseFilters.push(`level = $${baseParams.length}`)
   }
 
   if (pathFilter) {
     params.push(`%${pathFilter}%`)
     filters.push(`path ilike $${params.length}`)
+    baseParams.push(`%${pathFilter}%`)
+    baseFilters.push(`path ilike $${baseParams.length}`)
+  }
+
+  if (isMonthFilter) {
+    const [yearRaw, monthRaw] = monthFilter.split('-')
+    const year = Number(yearRaw)
+    const month = Number(monthRaw)
+
+    if (Number.isFinite(year) && Number.isFinite(month) && month >= 1 && month <= 12) {
+      const monthStart = new Date(Date.UTC(year, month - 1, 1))
+      const nextMonthStart = new Date(Date.UTC(year, month, 1))
+      params.push(monthStart, nextMonthStart)
+      filters.push(`created_at >= $${params.length - 1} and created_at < $${params.length}`)
+    }
   }
 
   try {
     await ensureDatabaseReady()
 
     const whereClause = filters.join(' and ')
-    const [summaryResult, endpointResult, recentResult] = await Promise.all([
+    const baseWhereClause = baseFilters.join(' and ')
+    const offset = (page - 1) * perPage
+    const [summaryResult, endpointResult, recentResult, countResult, monthResult] = await Promise.all([
       pool.query(
         `
           select level, count(*)::integer as count
@@ -2686,21 +3051,60 @@ app.get('/api/logs/report', authMiddleware, async (request, response) => {
           from system_logs
           where ${whereClause}
           order by created_at desc, id desc
-          limit $${params.length + 1};
+          limit $${params.length + 1}
+          offset $${params.length + 2};
         `,
-        [...params, limit],
+        [...params, perPage, offset],
+      ),
+      pool.query(
+        `
+          select count(*)::integer as total
+          from system_logs
+          where ${whereClause};
+        `,
+        params,
+      ),
+      pool.query(
+        `
+          select to_char(date_trunc('month', created_at), 'YYYY-MM') as month_key,
+                 count(*)::integer as count
+          from system_logs
+          where ${baseWhereClause}
+          group by month_key
+          order by month_key desc
+          limit 12;
+        `,
+        baseParams,
       ),
     ])
 
+    const totalItems = Number(countResult.rows?.[0]?.total ?? 0)
+    const totalPages = Math.max(1, Math.ceil(totalItems / perPage))
+
     response.json({
       generatedAt: new Date().toISOString(),
-      period: { hours, level: level || null, path: pathFilter || null },
+      period: { hours, level: level || null, path: pathFilter || null, month: isMonthFilter ? monthFilter : null },
       totals: summaryResult.rows.reduce(
         (totals, row) => ({ ...totals, total: totals.total + row.count, [row.level]: row.count }),
         { total: 0, info: 0, warn: 0, error: 0 },
       ),
       byEndpoint: endpointResult.rows,
+      months: monthResult.rows.map((row) => ({
+        value: row.month_key,
+        count: row.count,
+        label: new Intl.DateTimeFormat('es-BO', {
+          month: 'long',
+          year: 'numeric',
+          timeZone: 'America/La_Paz',
+        }).format(new Date(`${row.month_key}-01T00:00:00.000Z`)),
+      })),
       recent: recentResult.rows,
+      pagination: {
+        page,
+        perPage,
+        totalItems,
+        totalPages,
+      },
     })
   } catch (error) {
     response.status(500).json({
@@ -2944,7 +3348,15 @@ app.get('/api/dashboard', authMiddleware, async (request, response) => {
       }).catch(() => {})
     })
 
-    const [contactsResult, dealsResult, campaignsResult, agentsResult, whatsappConfig, contactGroups] = await Promise.all([
+    const [
+      contactsResult,
+      dealsResult,
+      campaignsResult,
+      agentsResult,
+      whatsappConfig,
+      contactGroups,
+      emsStageOverrides,
+    ] = await Promise.all([
       pool.query(`
         select
           c.id,
@@ -3043,6 +3455,7 @@ app.get('/api/dashboard', authMiddleware, async (request, response) => {
       `),
       getStoredWhatsAppConfig(),
       getContactGroups(),
+      getStoredEmsStageOverrides(),
     ])
 
     const contacts = contactsResult.rows.map((row) => ({
@@ -3094,6 +3507,7 @@ app.get('/api/dashboard', authMiddleware, async (request, response) => {
       campaigns,
       agents,
       contactGroups,
+      emsStageOverrides,
       integrations: defaultIntegrations,
       siteBlocks,
       channelConfig: {
@@ -3103,6 +3517,45 @@ app.get('/api/dashboard', authMiddleware, async (request, response) => {
   } catch (error) {
     response.status(500).json({
       message: 'No se pudo cargar el dashboard desde PostgreSQL.',
+      error: error.message,
+    })
+  }
+})
+
+app.get('/api/ems/stage-overrides', authMiddleware, async (_request, response) => {
+  try {
+    await ensureDatabaseReady()
+    const overrides = await getStoredEmsStageOverrides()
+    response.json({ ok: true, overrides })
+  } catch (error) {
+    response.status(500).json({
+      message: 'No se pudo cargar el estado de los paquetes EMS.',
+      error: error.message,
+    })
+  }
+})
+
+app.put('/api/ems/stage-overrides', authMiddleware, async (request, response) => {
+  const packageCode = normalizeReference(request.body?.packageCode)
+  const stage = normalizeEmsStageOverrideValue(request.body?.stage)
+
+  if (!packageCode) {
+    response.status(400).json({ message: 'Debes indicar el codigo del paquete.' })
+    return
+  }
+
+  if (!['received', 'transit', 'regional', 'courier', 'delivered'].includes(stage)) {
+    response.status(400).json({ message: 'El estado indicado no es valido.' })
+    return
+  }
+
+  try {
+    await ensureDatabaseReady()
+    const overrides = await saveEmsStageOverride(packageCode, stage)
+    response.json({ ok: true, packageCode: packageCode.toUpperCase(), stage, overrides })
+  } catch (error) {
+    response.status(500).json({
+      message: 'No se pudo guardar el estado del paquete.',
       error: error.message,
     })
   }
@@ -3609,6 +4062,11 @@ app.post('/api/integrations/whatsapp/webhook', async (request, response) => {
     await persistInboundWhatsAppWebhook(request.body)
   } catch (error) {
     console.error('No se pudo guardar el webhook de WhatsApp:', error.message)
+    response.status(500).json({
+      received: false,
+      message: 'No se pudo procesar el webhook de WhatsApp.',
+    })
+    return
   }
   response.status(200).json({ received: true })
 })
@@ -3982,8 +4440,9 @@ app.post('/api/ai/suggest-reply', authMiddleware, async (request, response) => {
     const conversationContext = buildAiConversationContext(conversationMessages)
     const whatsappReference = resolveWhatsAppReference(contact)
     const packageContext = await fetchMatchingPackageContext(whatsappReference)
+    const translatedConversationContext = await translateTextToSpanishForAi(conversationContext)
 
-    if (!conversationContext && !packageContext.matched) {
+    if (!translatedConversationContext && !packageContext.matched) {
       response.status(400).json({
         message: 'No hay contexto suficiente para generar una sugerencia de respuesta.',
       })
@@ -4005,7 +4464,7 @@ app.post('/api/ai/suggest-reply', authMiddleware, async (request, response) => {
         : 'Sin contexto de paquete en APIs.',
       '',
       'Conversacion reciente:',
-      conversationContext || 'Sin historial reciente.',
+      translatedConversationContext || 'Sin historial reciente.',
       '',
       customInstruction
         ? `Instruccion adicional: ${customInstruction}`
@@ -4214,6 +4673,15 @@ app.post('/api/contacts', authMiddleware, async (request, response) => {
     return
   }
 
+  const whatsappProfile = socialProfiles.find(
+    (profile) => normalizeReference(profile.channel).toLowerCase() === 'whatsapp',
+  )
+
+  if (whatsappProfile && !isCellPhoneNumber(whatsappProfile.reference)) {
+    response.status(400).json({ message: 'El numero de WhatsApp debe ser un celular valido.' })
+    return
+  }
+
   try {
     await ensureDatabaseReady()
 
@@ -4281,6 +4749,15 @@ app.put('/api/contacts/:id', authMiddleware, async (request, response) => {
     response
       .status(400)
       .json({ message: 'Completa el dato de referencia o contacto para cada red seleccionada.' })
+    return
+  }
+
+  const whatsappProfile = socialProfiles.find(
+    (profile) => normalizeReference(profile.channel).toLowerCase() === 'whatsapp',
+  )
+
+  if (whatsappProfile && !isCellPhoneNumber(whatsappProfile.reference)) {
+    response.status(400).json({ message: 'El numero de WhatsApp debe ser un celular valido.' })
     return
   }
 

@@ -1,0 +1,36 @@
+{
+  "tariffs": {
+    "genericMissingFields": [
+      "Para darte la tarifa exacta de tu envio, ayudame con el peso del paquete y el servicio que buscas:",
+      "• EMS Nacional e Internacional: Envios dentro y fuera del pais por peso.",
+      "• Delivery Express: Entrega rapida de paquetes a nivel nacional; no aplica para provincia ni para paquetes que excedan los 5 kg. Si supera ese peso, debe enviarse por EMS Nacional.",
+      "¡Dime cual necesitas y te doy el precio de inmediato!"
+    ],
+    "deliveryModeOptions": [
+      "Perfecto, Delivery Express. Para darte el precio exacto, indicame la modalidad:",
+      "• Puerta a puerta: recogemos el paquete en tu casa y lo llevamos a la casa destino en cualquier departamento.",
+      "• Puerta a ventanilla: recogemos el paquete en tu casa y lo llevamos a ventanilla de cualquier sucursal.",
+      "• Ventanilla a ventanilla: dejas el paquete en una sucursal y lo recogen en ventanilla de cualquier sucursal."
+    ],
+    "exactQuote": "{intro} {quote}",
+    "deliveryProvinceNotAllowed": "Delivery Express no aplica para envios a provincia o comunidades. Para ese destino corresponde EMS Nacional; te puedo ayudar a cotizarlo por EMS si me confirmas el peso del paquete.",
+    "deliveryWeightExceeded": "Delivery Express solo aplica para paquetes de hasta {maxWeightKg} kg. Para un paquete de {weightKg} kg corresponde cotizarlo por EMS Nacional e Internacional; te puedo ayudar con esa tarifa si confirmas que seguimos por EMS.",
+    "deliveryDimensionsPolicy": "Para Delivery Express la validacion principal de esta cotizacion es el peso: aplica hasta {maxWeightKg} kg. Las medidas alto/ancho/largo no cambian el precio en esta tarifa; si el paquete no supera ese peso, puede continuar por Delivery Express segun cobertura.",
+    "multipleTariffQuoteRequest": "Puedo ayudarte a cotizar varios envios, pero necesito tener origen, destino, peso y servicio de cada uno. Enviamelos numerados y los revisamos uno por uno.",
+    "unsupportedTariffService": "No tengo registrado el servicio \"{serviceName}\". Los servicios disponibles para cotizar son EMS Nacional e Internacional y Delivery Express. Indicame cual de esos dos deseas usar para continuar.",
+    "unsupportedDeliveryMode": "Esa modalidad de Delivery Express no esta registrada. Las modalidades validas son: puerta a puerta, puerta a ventanilla o ventanilla a ventanilla. Confirmame cual corresponde y te cotizo.",
+    "seniorDiscountUnavailable": "Por ahora no tengo registrado un descuento automatico por tercera edad para envios. Para cotizarte {route} con la tarifa vigente, confirmame el peso del paquete y el servicio que deseas usar.",
+    "noActiveDeliveryRate": "Entendido: Delivery Express {modeLabel}. No tengo una tarifa activa para esa ruta en este momento; te derivamos con un asesor para confirmarte el precio exacto.",
+    "noActiveGenericRate": "No encontre una tarifa activa para esa combinacion de peso, destino y servicio. Te puedo ayudar si me confirmas esos datos nuevamente."
+  },
+  "personalizedIntros": {
+    "deliveryHomePickupNeed": "Claro, para ese caso te conviene Delivery Express puerta a puerta: recogemos el paquete en tu casa y lo entregamos en el domicilio destino.",
+    "deliveryDoorToCounter": "Perfecto, con Delivery Express puerta a ventanilla recogemos el paquete en tu casa y lo dejamos disponible en una sucursal destino.",
+    "deliveryCounterToCounter": "Perfecto, con Delivery Express ventanilla a ventanilla dejas el paquete en una sucursal y lo recogen en una sucursal destino."
+  },
+  "tracking": {
+    "missingCode": "¡Perfecto! Dejame tu numero de guia y lo revisamos de inmediato.",
+    "notFound": "No pude localizar el paquete {packageCode}. Verifica el codigo e intentalo nuevamente, por favor.",
+    "foundSummary": "Tu paquete {packageCode} figura como {status}. Ultimo evento: {latestEvent}."
+  }
+}
