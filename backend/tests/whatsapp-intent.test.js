@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { isPackageTrackingRequest, selectLatestPackageEntry } from '../services/whatsapp-intent.js'
+import {
+  buildCustomsTrackingReply,
+  buildNationalDistributionTrackingReply,
+  buildPackageDeclarationReply,
+  isPackageDeclarationQuestion,
+  isPackageTrackingRequest,
+  selectLatestPackageEntry,
+} from '../services/whatsapp-intent.js'
 
 test('prioriza consulta de estado con guia sobre una tarifa reciente', () => {
   assert.equal(
@@ -70,6 +77,87 @@ test('no cambia el enrutamiento a seguimiento si no hay intencion de rastreo o g
       packageCode: 'EN000005573LPZ',
     }),
     false,
+  )
+})
+
+test('reconoce consultas de declaración y departamento para una guía', () => {
+  assert.equal(isPackageDeclarationQuestion('¿En qué departamento está declarada esta guía?'), true)
+  assert.equal(isPackageDeclarationQuestion('¿Tiene declaración aduanera?'), true)
+  assert.equal(isPackageDeclarationQuestion('¿Dónde está mi paquete?'), false)
+  assert.equal(isPackageDeclarationQuestion('¿Mi paquete está en aduana?'), false)
+})
+
+test('responde el destino declarado CDS sin confundirlo con la ubicación actual', () => {
+  assert.equal(
+    buildPackageDeclarationReply({
+      packageCode: 'LP666718164MY',
+      declaration: { estado: 'declarada' },
+      destinations: [{ departamento: 'Cercado', ciudad: 'Tarija' }],
+    }),
+    'La declaración aduanera de la guía LP666718164MY indica como destino declarado: departamento Cercado, ciudad Tarija. Esto no confirma la ubicación actual del paquete.',
+  )
+})
+
+test('no inventa departamento si una declaración no informa el destino', () => {
+  assert.equal(
+    buildPackageDeclarationReply({
+      packageCode: 'EY467201535US',
+      declaration: { estado: 'declarada' },
+      destinations: [],
+    }),
+    'La guía EY467201535US figura declarada en CDS, pero la respuesta no informa el departamento de destino.',
+  )
+})
+
+test('explica claramente cuando SITRA no pudo consultar CDS', () => {
+  assert.match(
+    buildPackageDeclarationReply({
+      packageCode: 'EY467201535US',
+      declaration: { estado: 'consulta_incompleta' },
+    }),
+    /no puedo confirmar su departamento/,
+  )
+})
+
+test('responde claramente cuando el paquete esta en aduana', () => {
+  assert.equal(
+    buildCustomsTrackingReply({
+      packageCode: 'EC256732418BE',
+      latestEventLabel: 'Registrar informacion de aduanas sobre el envio (entrada)',
+      latestEventLocation: 'Aduana postal La Paz',
+    }),
+    [
+      '📦 Tu paquete *EC256732418BE* se encuentra en aduana.',
+      '🛃 Está en revisión u observación aduanera; te notificaremos cuando registre un nuevo movimiento.',
+    ].join('\n'),
+  )
+})
+
+test('responde claramente cuando el paquete se clasifica para distribucion nacional', () => {
+  assert.equal(
+    buildNationalDistributionTrackingReply({
+      packageCode: 'RV265219436ES',
+      latestEventId: 35,
+      latestEventLabel: 'Enviar envio a ubicacion nacional (entrada)',
+    }),
+    [
+      '📦 Tu paquete *RV265219436ES* ya está en Bolivia.',
+      '🔄 Se está clasificando para su distribución nacional; te notificaremos cuando registre un nuevo movimiento.',
+    ].join('\n'),
+  )
+})
+
+test('detecta distribucion nacional desde la firma del evento del pipeline', () => {
+  assert.equal(
+    buildNationalDistributionTrackingReply({
+      packageCode: 'RV265219436ES',
+      latestEventLabel: 'Enviar envio a ubicacion nacional (entrada)',
+      latestEventSignature: '35|ENVIAR ENVIO A UBICACION NACIONAL (ENTRADA)|13/10/2026',
+    }),
+    [
+      '📦 Tu paquete *RV265219436ES* ya está en Bolivia.',
+      '🔄 Se está clasificando para su distribución nacional; te notificaremos cuando registre un nuevo movimiento.',
+    ].join('\n'),
   )
 })
 

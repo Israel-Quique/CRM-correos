@@ -2,6 +2,8 @@
 
 import {
   renderChatView,
+  renderCustomMessagesView,
+  renderPersonalizedMessagesView,
   renderContactsView,
   renderEmsView,
   renderGroupsView,
@@ -110,6 +112,7 @@ export const renderWorkspace = (ctx: any) => {
     if (state.activeView === 'internacionales-paquetes') return renderInternationalContactPackagesView(ctx)
     if (state.activeView === 'internacionales-tablero') return renderInternationalPipelineView(ctx)
     if (state.activeView === 'chat') return renderChatView(ctx)
+    if (state.activeView === 'mensajes-personalizados') return renderPersonalizedMessagesView(ctx)
     if (state.activeView === 'contactos') return renderContactsView(ctx)
     if (state.activeView === 'agrupaciones') return renderGroupsView(ctx)
     if (state.activeView === 'usuarios') return renderUsersView(ctx)

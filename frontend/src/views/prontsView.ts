@@ -69,17 +69,12 @@ export const renderProntsView = (ctx: any) => {
     getCountryIso2FromLabel,
     getGroupPickerResultsMarkup
   } = ctx
+  const isCustomMessagesView = state.activeView === 'mensajes-personalizados'
   const isNationalScope = state.activeView === 'pronts-nacional'
-  const scopeLabel = isNationalScope ? 'Nacional' : 'Internacional'
-  const scopeKicker = isNationalScope
-    ? 'Gestor Prompt Ops para Nacional'
-    : 'Gestor Prompt Ops para Internacionales'
-  const scopeTitle = isNationalScope
-    ? 'Gestión y Configuración de Prompts IA Nacional'
-    : 'Gestión y Configuración de Prompts IA Internacional'
-  const scopeDescription = isNationalScope
-    ? 'Administra los prompts operativos para el flujo nacional y sus estados del tablero.'
-    : 'Administra los prompts operativos para el flujo internacional y su seguimiento por estados.'
+  const scopeLabel = isCustomMessagesView ? 'Todos los flujos' : isNationalScope ? 'Nacional' : 'Internacional'
+  const scopeKicker = isCustomMessagesView ? 'Módulo de mensajería' : isNationalScope ? 'Gestor Prompt Ops para Nacional' : 'Gestor Prompt Ops para Internacionales'
+  const scopeTitle = isCustomMessagesView ? 'Mensajes personalizados' : isNationalScope ? 'Gestión y Configuración de Prompts IA Nacional' : 'Gestión y Configuración de Prompts IA Internacional'
+  const scopeDescription = isCustomMessagesView ? 'Configura los mensajes para responder sobre los paquetes existentes en el sistema.' : isNationalScope ? 'Administra los prompts operativos para el flujo nacional y sus estados del tablero.' : 'Administra los prompts operativos para el flujo internacional y su seguimiento por estados.'
   const activeColumn = state.prontsActiveColumn
   const activeConfig = getProntsColumnConfig(activeColumn)
   const activeMeta = getProntsMetaForColumn(activeColumn)
@@ -127,7 +122,7 @@ export const renderProntsView = (ctx: any) => {
   const simulationResponse = activeConfig.response
 
   return `
-    <section class="section-panel pronts-board-panel ${(state.activeView === 'pronts-nacional' || state.activeView === 'pronts-internacional') ? 'is-visible' : ''}">
+    <section class="section-panel pronts-board-panel ${(state.activeView === 'pronts-nacional' || state.activeView === 'pronts-internacional' || state.activeView === 'mensajes-personalizados') ? 'is-visible' : ''}">
       <div class="pronts-board">
         <div class="pronts-header">
           <div class="pronts-header-copy">
@@ -153,6 +148,24 @@ export const renderProntsView = (ctx: any) => {
         <div class="pronts-columns">
           ${getProntsColumnKeys().map((column) => renderColumnCard(column)).join('')}
         </div>
+
+        ${
+          isCustomMessagesView
+            ? `
+              <section class="pronts-editor-card custom-message-preview-card">
+                <div class="pronts-editor-head">
+                  <div>
+                    <p class="section-kicker">Vista previa de respuesta personalizada</p>
+                    <h3>Paquete en camino</h3>
+                    <small>Mensaje usado cuando el paquete registra tránsito hacia su destino.</small>
+                  </div>
+                  <span class="pronts-sandbox-pill">Paquete real seleccionado</span>
+                </div>
+                <textarea class="custom-message-preview-text custom-message-preview-editor" data-custom-transit-message rows="7">${escapeHtml(state.customTransitMessage || '')}</textarea>
+              </section>
+            `
+            : ''
+        }
 
         <div class="pronts-layout">
           <section class="pronts-editor-card">

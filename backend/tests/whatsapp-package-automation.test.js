@@ -2,9 +2,11 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   buildInternationalArrivalMessage,
+  buildPackageCancellationMessage,
   buildPackageReturnToOriginMessage,
   buildPackageEventSignature,
   getPackageAutomationNextDelayMs,
+  getNationalPackageEventStage,
   getWhatsAppTrackingRetrySchedule,
   getNewPackageWelcomePhoneCandidates,
   WHATSAPP_TRACKING_RETRY_INTERVAL_MS,
@@ -16,6 +18,8 @@ import {
   isInternationalArrivalEvent,
   isEligibleNewPackageWelcomeEntry,
   isPackageEventNotificationEligible,
+  isPackageEventForNotificationType,
+  isVentanillaPackageEvent,
   isPackageReturnToOriginEvent,
   isPackagePageOutsideRecentWindow,
   migrateWelcomeIntervalSetting,
@@ -35,6 +39,26 @@ test('programa reintentos de tracking cada 15 minutos y vence a las 24 horas', (
   assert.equal(WHATSAPP_TRACKING_RETRY_WINDOW_MS, 24 * 60 * 60 * 1000)
   assert.equal(schedule.nextAttemptAt.getTime(), createdAt + 15 * 60 * 1000)
   assert.equal(schedule.expiresAt.getTime(), createdAt + 24 * 60 * 60 * 1000)
+})
+
+test('clasifica devoluciones internacionales como importacion detenida', () => {
+  assert.equal(
+    getNationalPackageEventStage({
+      event: {
+        codigo_evento: 38,
+        evento_api: 'Devolver envio desde aduana (entrada)',
+      },
+    }),
+    'cancelled',
+  )
+  assert.equal(
+    resolveContactPackageStage({
+      statusText: 'Being returned',
+      latestEventStage: null,
+      transferStage: null,
+    }),
+    'cancelled',
+  )
 })
 
 test('identifica la recepción de entrada en oficina de cambio como llegada a Bolivia', () => {
@@ -65,6 +89,48 @@ test('no infiere llegada a Bolivia por un evento de salida o por tener una guía
   assert.equal(buildInternationalArrivalMessage({ packageCode: 'EY592031552US' }), '')
 })
 
+test('permite notificar la llegada de un paquete internacional aunque siga en recibido y sin estado aduanero', () => {
+  assert.equal(
+    isPackageEventNotificationEligible({
+      stage: 'received',
+      eventLabel: 'Recibir envío en oficina de cambio (entrada)',
+      isInternationalPackage: true,
+    }),
+    true,
+  )
+  assert.equal(
+    isPackageEventNotificationEligible({
+      stage: 'received',
+      eventLabel: 'Recibir envío en oficina de cambio (entrada)',
+      isInternationalPackage: false,
+    }),
+    false,
+  )
+})
+
+test('interpreta recepción del evento 297 posterior al tránsito como llegada a la siguiente oficina', () => {
+  assert.equal(
+    getNationalPackageEventStage({
+      event: { evento_id: 297, evento_api: 'Paquete recibido en oficina origen de transito.' },
+      hasPreviousTransit: false,
+    }),
+    'transit',
+  )
+  assert.equal(
+    getNationalPackageEventStage({
+      event: { evento_id: 'TRANSIT', codigo_evento: 297, evento_api: 'Paquete recibido en oficina origen de transito.' },
+      hasPreviousTransit: true,
+    }),
+    'regional',
+  )
+  assert.equal(
+    getNationalPackageEventStage({
+      event: { evento_id: 297, evento_api: 'Paquete recibido en oficina de destino.' },
+    }),
+    'regional',
+  )
+})
+
 test('en modo de prueba envía solo al número autorizado vinculado al paquete', () => {
   assert.deepEqual(
     selectPackageNotificationRecipients({
@@ -86,6 +152,31 @@ test('en modo de prueba no envía si ningún número autorizado está vinculado 
       associatedPhones: [],
     }),
     [],
+  )
+})
+
+test('en modo de prueba permite enviar aviso de llegada a números autorizados aunque el paquete no tenga teléfono', () => {
+  assert.deepEqual(
+    selectPackageNotificationRecipients({
+      testModeEnabled: true,
+      packageRecipients: [],
+      testRecipients: ['59164229403'],
+      associatedPhones: [],
+      allowUnassociatedTestRecipients: true,
+    }),
+    ['59164229403'],
+  )
+})
+
+test('con modo prueba apagado el aviso específico usa los destinatarios reales del paquete', () => {
+  assert.deepEqual(
+    selectPackageNotificationRecipients({
+      testModeEnabled: false,
+      packageRecipients: ['59177501487'],
+      testRecipients: ['59164229403'],
+      testRecipientsOnly: true,
+    }),
+    ['59177501487'],
   )
 })
 
@@ -150,6 +241,16 @@ test('mantiene la etapa mas avanzada entre el estado actual y los movimientos', 
   )
 })
 
+test('permite notificar cambios de tránsito, llegada a destino y cartero', () => {
+  for (const stage of ['transit', 'regional', 'courier']) {
+    assert.equal(
+      isPackageEventNotificationEligible({ stage }),
+      true,
+      `la etapa ${stage} debe poder notificar`,
+    )
+  }
+})
+
 test('permite notificar ventanilla aunque el identificador del evento la clasifique como recibido', () => {
   assert.equal(
     isPackageEventNotificationEligible({
@@ -169,6 +270,55 @@ test('permite notificar ventanilla aunque el identificador del evento la clasifi
     isPackageEventNotificationEligible({
       stage: 'received',
       eventLabel: 'Paquete recibido en origen',
+    }),
+    false,
+  )
+})
+
+test('identifica ventanilla como un tipo de evento independiente', () => {
+  assert.equal(
+    isVentanillaPackageEvent({ eventLabel: 'Correspondencia pendiente de recojo en ventanilla' }),
+    true,
+  )
+  assert.equal(
+    isVentanillaPackageEvent({ eventLabel: 'Solicitud de recojo' }),
+    true,
+  )
+  assert.equal(
+    isVentanillaPackageEvent({ eventLabel: 'Paquete recibido en oficina de origen' }),
+    false,
+  )
+})
+
+test('separa las notificaciones de ventanilla de los cambios generales', () => {
+  const ventanillaEvent = { eventLabel: 'Correspondencia pendiente de recojo en ventanilla' }
+  const transitEvent = { eventLabel: 'Paquete en tránsito a destino' }
+
+  assert.equal(isPackageEventForNotificationType({ ...ventanillaEvent, eventType: 'ventanilla' }), true)
+  assert.equal(isPackageEventForNotificationType({ ...ventanillaEvent, eventType: 'general' }), false)
+  assert.equal(isPackageEventForNotificationType({ ...transitEvent, eventType: 'ventanilla' }), false)
+  assert.equal(isPackageEventForNotificationType({ ...transitEvent, eventType: 'general' }), true)
+})
+
+test('el tipo de notificación de llegada internacional solo acepta entradas confirmadas', () => {
+  assert.equal(
+    isPackageEventForNotificationType({
+      eventLabel: 'Recibir envío en oficina de cambio (entrada)',
+      eventType: 'international-arrival-test',
+    }),
+    true,
+  )
+  assert.equal(
+    isPackageEventForNotificationType({
+      eventLabel: 'Despacho desde oficina de cambio (salida)',
+      eventType: 'international-arrival-test',
+    }),
+    false,
+  )
+  assert.equal(
+    isPackageEventForNotificationType({
+      eventLabel: 'Paquete en tránsito',
+      eventType: 'international-arrival-test',
     }),
     false,
   )
@@ -199,8 +349,21 @@ test('reconoce eventos de devolución al origen sin confundir una devolución ge
       stage: 'cancelled',
       eventLabel: 'Paquete cancelado',
     }),
-    false,
+    true,
   )
+})
+
+test('el aviso de cancelación no afirma que el paquete fue devuelto', () => {
+  const message = buildPackageCancellationMessage({
+    contactName: 'Ana',
+    packageCode: 'EN000006443LPZ',
+    eventLocation: 'La Paz',
+  })
+
+  assert.match(message, /envío \*EN000006443LPZ\*/)
+  assert.match(message, /registra el envío como cancelado en \*La Paz\*/)
+  assert.match(message, /El motivo no aparece/)
+  assert.doesNotMatch(message, /devuelto|retornando/)
 })
 
 test('el aviso de retorno incluye las fechas únicas de los avisos de reparto', () => {

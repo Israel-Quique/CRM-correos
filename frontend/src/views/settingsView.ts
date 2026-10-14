@@ -5,6 +5,8 @@ export const renderSettingsView = (ctx: any) => {
   const config = state.automationConfig ?? {
     automaticWelcome: false,
     automaticStatusUpdates: false,
+    automaticInternationalArrivalTestNotifications: true,
+    automaticVentanillaNotifications: true,
     automaticReconciliation: true,
     aiAutoReply: true,
     welcomeResponseIntervalMs: 5 * 60 * 1000,
@@ -34,6 +36,7 @@ export const renderSettingsView = (ctx: any) => {
   const watcherSkippedReasons = [
     ...Object.entries(watcherStatus?.welcomeSkippedByReason ?? {}),
     ...Object.entries(watcherStatus?.eventSkippedByReason ?? {}),
+    ...Object.entries(watcherStatus?.ventanillaSkippedByReason ?? {}),
   ]
     .map(([reason, count]) => `${reason}: ${count}`)
     .join(', ')
@@ -58,6 +61,7 @@ export const renderSettingsView = (ctx: any) => {
   const reconciliationSkippedReasons = [
     ...Object.entries(reconciliationStatus?.welcomeSkippedByReason ?? {}),
     ...Object.entries(reconciliationStatus?.eventSkippedByReason ?? {}),
+    ...Object.entries(reconciliationStatus?.ventanillaSkippedByReason ?? {}),
   ]
     .map(([reason, count]) => `${reason}: ${count}`)
     .join(', ')
@@ -193,9 +197,21 @@ export const renderSettingsView = (ctx: any) => {
           ${renderAutomationCard({
             key: 'automaticStatusUpdates',
             label: 'Cambios de evento',
-            description: 'Ejecuta el escaneo completo para cambios como tránsito, destino, cartero o entregado.',
+            description: 'Notifica cambios generales como tránsito, destino, cartero o entregado. Ventanilla se configura aparte.',
             badge: '🔁',
             interval: renderIntervalControl('eventChangeResponseIntervalMs', 'Tiempo de revisión', 'Puede tardar más porque compara eventos.', eventInterval),
+          })}
+          ${renderAutomationCard({
+            key: 'automaticInternationalArrivalTestNotifications',
+            label: 'Llegadas internacionales al número de prueba',
+            description: 'Envía un aviso al número de prueba autorizado cuando Tracking confirme que un paquete internacional llegó a Bolivia.',
+            badge: '🌎',
+          })}
+          ${renderAutomationCard({
+            key: 'automaticVentanillaNotifications',
+            label: 'Avisos de ventanilla',
+            description: 'Notifica solo cuando el movimiento indica correspondencia pendiente de recojo/entrega en ventanilla. Es independiente de los cambios generales.',
+            badge: '📬',
           })}
           ${renderAutomationCard({
             key: 'automaticReconciliation',
@@ -217,7 +233,7 @@ export const renderSettingsView = (ctx: any) => {
             <small>${reconciliationCheckedAt ? `${escapeHtml(reconciliationCheckedAt)} · ` : ''}${escapeHtml(reconciliationSummary)}</small>
             ${
               reconciliationStatus && reconciliationStatus.status !== 'running'
-                ? `<small>Paquetes cargados: ${reconciliationStatus.totalPackages}; mensajes enviados: ${reconciliationStatus.sentTotal} (bienvenidas ${reconciliationStatus.welcomeSent}, eventos ${reconciliationStatus.eventSent}); omitidos: ${reconciliationStatus.welcomeSkipped + reconciliationStatus.eventSkipped}${reconciliationSkippedReasons ? ` · Motivos: ${escapeHtml(reconciliationSkippedReasons)}` : ''}${reconciliationStatus.welcomeReason || reconciliationStatus.eventReason ? ` · Estado: ${escapeHtml([reconciliationStatus.welcomeReason, reconciliationStatus.eventReason].filter(Boolean).join('; '))}` : ''}.</small>`
+                ? `<small>Paquetes cargados: ${reconciliationStatus.totalPackages}; mensajes enviados: ${reconciliationStatus.sentTotal} (bienvenidas ${reconciliationStatus.welcomeSent}, eventos ${reconciliationStatus.eventSent}, ventanilla ${reconciliationStatus.ventanillaSent}); omitidos: ${reconciliationStatus.welcomeSkipped + reconciliationStatus.eventSkipped + reconciliationStatus.ventanillaSkipped}${reconciliationSkippedReasons ? ` · Motivos: ${escapeHtml(reconciliationSkippedReasons)}` : ''}${reconciliationStatus.welcomeReason || reconciliationStatus.eventReason || reconciliationStatus.ventanillaReason ? ` · Estado: ${escapeHtml([reconciliationStatus.welcomeReason, reconciliationStatus.eventReason, reconciliationStatus.ventanillaReason].filter(Boolean).join('; '))}` : ''}.</small>`
                 : ''
             }
           </div>
@@ -229,7 +245,7 @@ export const renderSettingsView = (ctx: any) => {
             <small>${watcherCheckedAt ? ` ${escapeHtml(watcherCheckedAt)} · ` : ''}${escapeHtml(watcherSummary)}</small>
             ${
               watcherStatus
-                ? `<small>Paquetes revisados: ${watcherStatus.totalPackages}; bienvenidas: ${watcherStatus.welcomeSent} enviadas/${watcherStatus.welcomeSkipped} omitidas; eventos: ${watcherStatus.eventSent} enviados/${watcherStatus.eventSkipped} omitidos${watcherSkippedReasons ? ` · Motivos: ${escapeHtml(watcherSkippedReasons)}` : ''}${watcherStatus.eventReason ? ` · Estado: ${escapeHtml(watcherStatus.eventReason)}` : ''}.</small>`
+                ? `<small>Paquetes revisados: ${watcherStatus.totalPackages}; bienvenidas: ${watcherStatus.welcomeSent} enviadas/${watcherStatus.welcomeSkipped} omitidas; eventos: ${watcherStatus.eventSent} enviados/${watcherStatus.eventSkipped} omitidos; ventanilla: ${watcherStatus.ventanillaSent} enviados/${watcherStatus.ventanillaSkipped} omitidos${watcherSkippedReasons ? ` · Motivos: ${escapeHtml(watcherSkippedReasons)}` : ''}${watcherStatus.eventReason || watcherStatus.ventanillaReason ? ` · Estado: ${escapeHtml([watcherStatus.eventReason, watcherStatus.ventanillaReason].filter(Boolean).join('; '))}` : ''}.</small>`
                 : ''
             }
           </div>

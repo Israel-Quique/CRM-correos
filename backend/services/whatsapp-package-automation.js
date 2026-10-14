@@ -3,8 +3,12 @@ export const selectPackageNotificationRecipients = ({
   packageRecipients = [],
   testRecipients = [],
   associatedPhones = [],
+  allowUnassociatedTestRecipients = false,
+  testRecipientsOnly = false,
 }) => {
+  if (testModeEnabled && testRecipientsOnly) return [...new Set(testRecipients)]
   if (!testModeEnabled) return packageRecipients
+  if (allowUnassociatedTestRecipients) return [...new Set(testRecipients)]
 
   const associatedNumbers = new Set([...packageRecipients, ...associatedPhones])
   return [...new Set(testRecipients.filter((phone) => associatedNumbers.has(phone)))]
@@ -68,6 +72,112 @@ export const isPackageReturnToOriginEvent = ({ eventLabel = '', eventSignature =
   return indicatesReturn && indicatesOrigin
 }
 
+export const getNationalPackageEventStage = ({ event, hasPreviousTransit = false }) => {
+  if (!event) return null
+
+  const eventText = normalizePackageStatusText(
+    [
+      event?.nombre,
+      event?.evento_api,
+      event?.evento_original,
+      event?.movimiento_bolivia,
+      event?.detalle,
+    ]
+      .filter(Boolean)
+      .join(' '),
+  )
+
+  if (isPackageReturnToOriginEvent({ eventLabel: eventText })) return 'cancelled'
+
+  const eventIdValue = [
+    event?.evento_id,
+    event?.codigo_evento,
+    event?.event_id,
+    event?.event_code,
+    event?.event_type_cd,
+  ].find((value) => value != null && String(value).trim() && Number.isFinite(Number(value)))
+  const eventId = Number(eventIdValue)
+  if (eventId === 297 && hasPreviousTransit) return 'regional'
+  if (
+    eventId === 297 &&
+    [
+      'oficina de destino',
+      'oficina destino',
+      'sucursal de destino',
+      'recibido en destino',
+      'recibido destino',
+      'llegada a destino',
+    ].some((indicator) => eventText.includes(indicator))
+  ) {
+    return 'regional'
+  }
+  if (eventId === 297 && eventText.includes('origen de transito')) return 'transit'
+  if ([318, 295, 2239, 2240, 2241, 297, 2242].includes(eventId)) return 'received'
+  if ([168, 240, 296].includes(eventId)) return 'transit'
+  if ([310, 312, 183, 4410, 2103, 4405, 4404, 3345, 4400].includes(eventId)) return 'regional'
+  if ([4409, 315].includes(eventId)) return 'courier'
+  if (eventId === 316) return 'delivered'
+  if (eventId === 38 && (eventText.includes('devol') || eventText.includes('return'))) return 'cancelled'
+  if (eventId === 4402) return 'cancelled'
+
+  if (eventText.includes('cartero') || eventText.includes('reparto')) return 'courier'
+  if (
+    eventText.includes('listo para entregar') ||
+    eventText.includes('oficina de entrega') ||
+    eventText.includes('ventanilla') ||
+    eventText.includes('pendiente de recojo') ||
+    eventText.includes('pendiente de entrega') ||
+    eventText.includes('solicitud de recojo') ||
+    eventText.includes('listo para recoger')
+  ) {
+    return 'regional'
+  }
+  if (eventText.includes('cancel') || eventText.includes('anul') || eventText.includes('rechaz')) return 'cancelled'
+  if (eventText.includes('devuelt') || eventText.includes('devolv') || eventText.includes('return')) return 'cancelled'
+  if (eventText.includes('entreg')) return 'delivered'
+  if (
+    eventText.includes('recibido en oficina') ||
+    eventText.includes('recibida en oficina') ||
+    eventText.includes('oficina destino') ||
+    eventText.includes('sucursal de destino') ||
+    eventText.includes('recibido destino') ||
+    eventText.includes('recibido regional')
+  ) {
+    return 'regional'
+  }
+  if (eventText.includes('saca interna') || eventText.includes('salida') || eventText.includes('transito')) return 'transit'
+  if (eventText.includes('recibido') || eventText.includes('origen')) return 'received'
+
+  return null
+}
+
+export const isVentanillaPackageEvent = ({ eventLabel = '', eventSignature = '' }) => {
+  const eventText = normalizePackageStatusText(`${eventLabel} ${eventSignature}`)
+  return [
+    'ventanilla',
+    'pendiente de recojo',
+    'pendiente de entrega',
+    'solicitud de recojo',
+    'listo para recoger',
+    'listo para entregar',
+    'listo para entrega',
+    'oficina de entrega',
+  ].some((indicator) => eventText.includes(indicator))
+}
+
+export const isPackageEventForNotificationType = ({
+  eventLabel = '',
+  eventSignature = '',
+  eventType = 'general',
+}) => {
+  const isVentanillaEvent = isVentanillaPackageEvent({ eventLabel, eventSignature })
+  if (eventType === 'international-arrival-test') {
+    return !isVentanillaEvent && isInternationalArrivalEvent(`${eventLabel} ${eventSignature}`)
+  }
+
+  return eventType === 'ventanilla' ? isVentanillaEvent : !isVentanillaEvent
+}
+
 export const buildPackageReturnToOriginMessage = ({
   contactName = '',
   packageCode = '',
@@ -89,6 +199,22 @@ export const buildPackageReturnToOriginMessage = ({
   ].join('\n')
 }
 
+export const buildPackageCancellationMessage = ({
+  contactName = '',
+  packageCode = '',
+  eventLocation = '',
+}) => {
+  const name = String(contactName ?? '').trim() || 'Hola'
+  const code = String(packageCode ?? '').trim() || 'tu paquete'
+  const location = String(eventLocation ?? '').trim()
+  return [
+    `Hola, ${name}. Tenemos una actualización de tu envío *${code}*.`,
+    '',
+    `El sistema registra el envío como cancelado${location ? ` en *${location}*` : ''}.`,
+    'El motivo no aparece en este movimiento. Escríbenos para que podamos orientarte.',
+  ].join('\n')
+}
+
 export const buildPackageEventSignature = ({ eventId, eventCode, label, location, date }) =>
   [eventId, eventCode, label, location, date]
     .map((value) => String(value ?? '').trim().toUpperCase())
@@ -97,7 +223,17 @@ export const buildPackageEventSignature = ({ eventId, eventCode, label, location
 
 const getPackageStatusStage = (statusText) => {
   const status = normalizePackageStatusText(statusText)
-  if (status.includes('cancel') || status.includes('anul') || status.includes('rechaz')) return 'cancelled'
+  if (
+    status.includes('cancel') ||
+    status.includes('anul') ||
+    status.includes('rechaz') ||
+    status.includes('devuelt') ||
+    status.includes('devolv') ||
+    status.includes('retorn') ||
+    status.includes('return')
+  ) {
+    return 'cancelled'
+  }
   if (status.includes('entregad') || status.includes('deliver') || status.includes('cerrad')) return 'delivered'
   if (status.includes('cartero') || status.includes('reparto') || status.includes('distribucion')) return 'courier'
   if (
@@ -155,21 +291,17 @@ export const resolveContactPackageStage = ({ statusText, latestEventStage, trans
   return movementStage ?? statusStage
 }
 
-export const isPackageEventNotificationEligible = ({ stage, eventLabel = '', eventSignature = '' }) => {
+export const isPackageEventNotificationEligible = ({
+  stage,
+  eventLabel = '',
+  eventSignature = '',
+  isInternationalPackage = false,
+}) => {
   if (isPackageReturnToOriginEvent({ eventLabel, eventSignature })) return true
-  if (['transit', 'regional', 'courier', 'delivered'].includes(stage)) return true
+  if (isInternationalPackage && isInternationalArrivalEvent(`${eventLabel} ${eventSignature}`)) return true
+  if (['transit', 'regional', 'courier', 'delivered', 'cancelled'].includes(stage)) return true
 
-  const eventText = normalizePackageStatusText(`${eventLabel} ${eventSignature}`)
-  return [
-    'ventanilla',
-    'pendiente de recojo',
-    'pendiente de entrega',
-    'solicitud de recojo',
-    'listo para recoger',
-    'listo para entregar',
-    'listo para entrega',
-    'oficina de entrega',
-  ].some((indicator) => eventText.includes(indicator))
+  return isVentanillaPackageEvent({ eventLabel, eventSignature })
 }
 
 export const WHATSAPP_TRACKING_RETRY_INTERVAL_MS = 15 * 60 * 1000

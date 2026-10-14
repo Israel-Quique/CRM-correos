@@ -1,5 +1,7 @@
 // @ts-nocheck
 
+import { getDeclaredDestinationEntries, getSafeDeclaredDepartment } from '../utils/declaredDestination'
+
 export const renderPackageCodeLookupModal = (ctx: any) => {
   const { state, escapeHtml } = ctx
 
@@ -10,6 +12,16 @@ export const renderPackageCodeLookupModal = (ctx: any) => {
   const lookupResult = state.packageCodeLookupResult as Record<string, any> | null
   const extractedCode = String(lookupResult?.extractedCode ?? '').trim()
   const normalizedCode = String(lookupResult?.normalizedCode ?? '').trim()
+  const cdsRecord = lookupResult?.cds?.record
+  const cdsDeclaration = cdsRecord?.declaracion_cds
+  const declarations = (cdsDeclaration?.objetos ?? []).flatMap((object: any) => object.declaraciones ?? [])
+  const declaredDestination = getDeclaredDestinationEntries(cdsRecord?.destinos_declarados, declarations)
+    .find((destination) =>
+      getSafeDeclaredDepartment(destination.departamento) ||
+      destination.ciudad ||
+      destination.codigo_postal ||
+      destination.pais_codigo,
+    )
 
   return `
     <div class="modal-backdrop" id="package-code-lookup-modal-backdrop">
@@ -62,6 +74,27 @@ export const renderPackageCodeLookupModal = (ctx: any) => {
                 <span class="${lookupResult.found ? 'package-code-found' : 'package-code-missing'}">
                   ${lookupResult.found ? 'Se encontró el código y la tabla fue filtrada.' : 'No se encontró el código en las APIs.'}
                 </span>
+                ${
+                  cdsDeclaration
+                    ? `<span>Declaración CDS: <strong>${escapeHtml(cdsDeclaration.estado || 'Sin estado')}</strong>${
+                        declaredDestination
+                        ? ` · Destino declarado: <strong>${escapeHtml([
+                            getSafeDeclaredDepartment(declaredDestination.departamento)
+                              ? `Departamento: ${getSafeDeclaredDepartment(declaredDestination.departamento)}`
+                              : '',
+                            declaredDestination.ciudad ? `Ciudad: ${declaredDestination.ciudad}` : '',
+                            declaredDestination.codigo_postal ? `CP: ${declaredDestination.codigo_postal}` : '',
+                            declaredDestination.pais_codigo ? `País: ${declaredDestination.pais_codigo}` : '',
+                          ].filter(Boolean).join(' · '))}</strong>`
+                          : ''
+                      }</span>`
+                    : ''
+                }
+                ${
+                  lookupResult.cds?.warning
+                    ? `<span class="notice-banner">${escapeHtml(lookupResult.cds.warning)}</span>`
+                    : ''
+                }
               </div>
             `
             : '<div class="empty-inline">Escribe un código para buscarlo y cargar el resultado en la tabla.</div>'

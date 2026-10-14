@@ -3,6 +3,8 @@
 export { renderContactsView } from './contactsView'
 export { renderChatView } from './chatView'
 export { renderGroupsView } from './groupsView'
+export { renderCustomMessagesView } from './customMessagesView'
+export { renderPersonalizedMessagesView } from './personalizedMessagesView'
 export { renderUsersView } from './usersView'
 export { renderEmsView } from './emsView'
 export { renderInternationalPackagesView } from './internationalPackagesView'
