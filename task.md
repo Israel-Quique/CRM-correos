@@ -1096,6 +1096,51 @@ Replicar fielmente el diseño de login proporcionado en la imagen de referencia:
 - Panel derecho con fondo claro, matasellos postales de agua y tarjeta flotante con botón dorado `Ingresar al Workspace CRM ➔`.
 ---
 
+## 14. Tarea 2026-10-11: Rediseño Visual de Sidebar y Header (Conversa OS - Estilo Postal / Golden Bolivia)
+
+### Objetivo
+Adaptar el diseño del sidebar y la barra superior según la imagen de referencia:
+1. **Sidebar temático en amarillo/mostaza postal (`#D6A429`)**:
+   - Encabezado de marca con insignia `[CRM]` en azul marino y texto `CRM Comercial` / `Conversa OS`.
+   - Botones de grupo de menú (`.menu-group-trigger`) con diseño de tarjeta redondeada:
+     - Título en negrita (`Nacional`, `Internacionales`, `Clientes`, `Usuarios`, `Sistema`) con texto oscuro (`#0C1E38`).
+     - Subtítulo con cantidad de módulos (`3 modulos`, `4 modulos`, etc.).
+     - Iconos temáticos a la izquierda y chevron indicador a la derecha.
+     - Estado activo con sombreado ámbar suave (`rgba(0,0,0,0.12)`).
+     - Subitems del menú (`.menu-item`) con tipografía oscura legible y resaltado activo.
+   - Marcas de agua postales (matasellos / Puerta del Sol) en la parte inferior del sidebar.
+2. **Topbar y Badges con Estilo Filatélico / Sello Postal**:
+   - Barra superior con fondo claro suave (`#F4F7FB` o blanco) y borde inferior sutil.
+   - Píldora central: `CRM comercial, marketing y automatizacion`.
+   - Badges de `Prueba` y `Agente IA` con borde estilo sello postal perforado/discontinuo (`dashed border`).
+   - Chip de `0 leads calientes` en dorado mostaza con texto oscuro.
+   - Avatar de usuario con fondo circular dorado suave.
+3. **Panel de Carga / Workspace**:
+   - Contenedor de `Cargando datos desde PostgreSQL...` con marco de sello postal discontinuo.
+
+### Archivos a modificar
+- `frontend/src/layout/sidebar.ts`: Ajuste del markup del sidebar, branding y marcas de agua.
+- `frontend/src/layout/authenticatedApp.ts`: Ajuste de clases y estructura de badges estilo sello postal.
+- `frontend/src/style.css`: Estilos visuales del sidebar mostaza, navegación, topbar filatélico y banner de carga.
+- `task.md`: Registro de avances y verificación.
+
+### Plan de implementación
+1. [x] Actualizar `frontend/src/layout/sidebar.ts` con el branding `CRM Comercial / Conversa OS`, chevrons de grupo y marcas de agua postales (Puerta del Sol / Tiwanaku y matasellos).
+2. [x] Ajustar estructura en `frontend/src/layout/authenticatedApp.ts` y topbar para sincronizar con la estética de sello postal.
+3. [x] Actualizar `frontend/src/style.css`:
+   - Sidebar en mostaza postal (`#D6A429`) con tipografía azul marino oscuro (`#0C1E38`).
+   - Insignia de marca `[CRM]` en azul marino `#0C1E38` con texto blanco.
+   - Triggers de menú `.menu-group-trigger` redondeados con hover suave y estado activo `.is-active` con sombreado oscuro translúcido.
+   - Submenús `.menu-item` en `#0C1E38` con estado `.is-current`.
+   - Marca de agua SVG `.sidebar-postal-watermark` en la parte inferior del sidebar.
+   - Topbar en blanco limpio `#FFFFFF` con borde inferior `#E2E8F0`.
+   - Badges de `Prueba` y `Agente IA` con diseño filatélico de borde perforado/discontinuo (`1.5px dashed #CBD5E1`), fondo suave y estados activo/inactivo.
+   - Chip de `leads calientes` en píldora dorada `#E5A823` con texto oscuro `#0C1E38`.
+   - Avatar de usuario con fondo circular dorado suave `#FDE68A`.
+   - Tarjeta de carga `.empty-state.loading-state` con borde de sello postal discontinuo (`2px dashed #CBD5E1`).
+4. [x] Verificar compilación: `npm --prefix frontend run build` completado exitosamente sin errores en 1.58s.
+---
+
 ## 12. Tarea 2026-09-28: Revision de Internacionales y API SITRA
 
 ### Solicitud
@@ -2268,3 +2313,545 @@ Al finalizar, recargar `http://localhost:5173/internacionales-pipeline` y pulsar
 - `node --test backend/tests/whatsapp-package-automation.test.js`: validar el evento de entrada, la persistencia de la confirmacion cuando el ultimo movimiento dice transito y el rechazo de eventos de salida.
 - `node --check backend/index.js` y `backend/services/whatsapp-package-automation.js`.
 - `git diff --check` para los archivos modificados.
+
+## Diagnostico 2026-10-09: paquete EN000007153LPZ sin bienvenida ni eventos
+
+### Hallazgos
+- No hay una fila local para `EN000007153LPZ` en el catalogo `international_tracking_packages`, ni coincidencia en contactos del CRM.
+- La base local no registra eventos `whatsapp_new_package_welcome_sent/skipped/failed`, `package_event_observed` ni `whatsapp_package_event_update_sent/skipped` para esa guia. Tampoco hay mensaje saliente registrado que contenga el codigo.
+- Las conciliaciones recientes del watcher fallan repetidamente con HTTP 403 en la pagina 1 de Tracking. Se reprodujo el fallo con la misma forma de consulta usada por la sincronizacion (`include_declaration=1`, pagina 1, 200 registros). Por ello, la carga completa no sincroniza paquetes ni llega a las fases de bienvenida y conciliacion de eventos.
+- La busqueda puntual de la guia en Tracking respondio HTTP 200 pero no devolvio coincidencia exacta. Paquetes-Contactos respondio HTTP 429 durante la busqueda puntual; la API separada de eventos respondio HTTP 401.
+
+### Conclusion y siguiente paso
+- El CRM no detecto ni registro esta guia, asi que no pudo generar la bienvenida automatica ni notificar sus movimientos. La evidencia apunta a restricciones de acceso/rate limit en las fuentes externas, no a un fallo del envio de WhatsApp para esta guia.
+- Para volver a probar, SITRA debe autorizar la consulta paginada con declaraciones, Paquetes-Contactos debe permitir la consulta sin 429 y la API de eventos requiere autorizacion valida. Despues, ejecutar una sincronizacion/conciliacion y verificar que la guia aparezca en el catalogo y en los logs de notificacion.
+- No se consultaron ni documentaron valores de credenciales; no se modifico la logica ni se envio ningun mensaje.
+
+## Diagnostico 2026-10-09: HTTP 403 en Tracking durante el watcher
+
+### Pruebas reproducidas
+- Se reviso la presencia de las variables configuradas sin leer ni imprimir sus valores. Tracking usa `TRACKING_SQLSERVER_TOKEN`; no hay un `TRACKING_API_TOKEN` alternativo configurado. Paquetes-Contactos tiene su variable de token especifica.
+- Con la misma credencial efectiva de Tracking y la consulta de pagina 1/100 registros, sin `include_declaration`, SITRA respondio HTTP 200 y devolvio 100 registros.
+- Repitiendo la consulta con `include_declaration=1`, SITRA respondio HTTP 403, tanto con 100 como con 200 registros por pagina.
+- La respuesta HTTP 200 no incluye la propiedad `declaracion_cds`; el backend activa `include_declaration=1` mediante `withTrackingDeclarations()` antes de sincronizar catalogos. Esto explica por que la API funciona para lecturas basicas pero falla en el watcher y en conciliaciones que piden declaraciones.
+- Paquetes-Contactos respondio HTTP 200 para la consulta reciente paginada durante esta prueba. En el primer ciclo reportado habia fallado la conexion; el ciclo siguiente obtuvo cuatro paquetes, consistente con una interrupcion temporal recuperada.
+
+### Interpretacion del log
+- `duplicate-recipient` para `SL00000108LP` y `SL00000107LP` significa que ya existe una bienvenida enviada a esos destinatarios; el control de deduplicacion evita reenviarla. No es un error de la API ni de WhatsApp.
+- La conciliacion completa queda bloqueada por el HTTP 403 de Tracking al solicitar declaraciones. Las consultas basicas siguen autorizadas.
+- La API separada de eventos habia respondido HTTP 401 en la prueba anterior; es un problema de autorizacion independiente del 403 de Tracking.
+
+### Conclusion
+- No hay evidencia de que el token general de Tracking este vencido: el mismo token devuelve HTTP 200 en la consulta basica. El bloqueo reproducible es especifico de `include_declaration=1`; SITRA debe confirmar si ese parametro requiere otro permiso/credencial o si ya no se admite.
+- No se cambio la logica ni se quitaron declaraciones de las consultas, porque ese campo puede ser necesario para conservar el catalogo completo. Tampoco se cambiaron credenciales.
+
+### Aclaracion posterior: API Dev de paquetes nacionales
+- El diagnostico HTTP 403 anterior corresponde a SITRA/Tracking y no debe confundirse con la API Dev de paquetes nacionales (`/api/paquetes-contactos`).
+- Se verifico el endpoint Dev efectivo sin mostrar la credencial: la consulta paginada de paquetes recientes respondio HTTP 200 y entrego 100 registros. En el log compartido, la primera consulta tuvo un fallo de conexion transitorio y el ciclo siguiente ya leyo 4 paquetes de esa fuente.
+- Se reprodujo la solicitud paginada del backend a la API Dev separada de eventos (`/api/paquetes-eventos`): respondio HTTP 401 con el mensaje `Token de acceso invalido, vencido o dado de baja.`. El servidor no distingue si el token es incorrecto, vencio o fue revocado.
+- El backend usa la variable dedicada `PAQUETES_EVENTOS_API_TOKEN` para esa ruta. Se confirmo localmente que esta configurada y que su valor no coincide con los tokens configurados para Paquetes-Contactos ni Tracking; los valores no se mostraron.
+- Los dos `duplicate-recipient` del log significan que ya habia bienvenidas enviadas a esos destinatarios. No explican el fallo de eventos ni indican un rechazo del API Dev de paquetes.
+- No se cambio codigo ni credenciales. Para corregirlo, solicitar al administrador Dev un token vigente/autorizado para `/api/paquetes-eventos`, configurarlo localmente en `PAQUETES_EVENTOS_API_TOKEN` y repetir la prueba. La API `/api/paquetes-contactos` ya respondio HTTP 200 en esta comprobacion.
+
+### Reprueba posterior al cambio de token (2026-10-09)
+- Se repitio la consulta paginada a `/api/paquetes-eventos` usando el valor efectivo cargado desde el `.env` raiz del CRM y el esquema Bearer del backend. La API continuo respondiendo HTTP 401 con `Token de acceso invalido, vencido o dado de baja.`.
+- `backend/index.js` carga el `.env` ubicado en la raiz del CRM (`path.join(__dirname, '..', '.env')`); no existe `backend/.env`. El `.env` raiz figura con ultima modificacion 2026-10-07 17:55, anterior al reporte de que se actualizo el token el 2026-10-09.
+- Esto indica que el token nuevo no esta reflejado en el `.env` raiz que lee el backend, o que el valor actualmente guardado alli sigue sin estar autorizado. No se leyo ni se mostro el secreto. Si se actualizo desde otra pantalla/archivo, esa ruta no es la fuente de esta variable; editar el `.env` raiz y reiniciar el backend antes de volver a probar.
+
+### Configuracion y verificacion del nuevo token (2026-10-09)
+- Se actualizaron `PAQUETES_EVENTOS_API_URL` a `https://dev.correos.gob.bo:18100/api/paquetes-eventos` y `PAQUETES_EVENTOS_API_TOKEN` en el `.env` raiz, que esta ignorado por Git.
+- La consulta paginada a la API Dev respondio HTTP 200 y devolvio 200 eventos (`data`, `paginacion`, `tipos_incluidos`, `nota`).
+- No se guardo el token en este documento ni en el codigo. Reiniciar el backend para que la ejecucion normal del watcher continue con la nueva configuracion.
+
+### Diagnostico: API de eventos correcta, avisos automaticos deshabilitados (2026-10-09)
+- La API configurada responde HTTP 200. En una consulta de diagnostico, la primera pagina incluyo eventos con campos de codigo y fecha que el backend reconoce; esto confirma conectividad y compatibilidad basica del formato, pero no garantiza que cada evento tenga un paquete/destinatario notificable.
+- El backend local tiene `WHATSAPP_STAGE_WATCHER_ENABLED=false` y `WHATSAPP_NEW_PACKAGE_WATCHER_ENABLED=false`. El segundo valor de entorno prevalece sobre `automaticStatusUpdates=true` guardado en la configuracion de automatizacion; con ambos flags apagados no se ejecuta el flujo del watcher que notifica cambios de estado.
+- La ultima revision rapida registrada consulto 6 paquetes de Paquetes-Contactos y 0 de Tracking, con 0 mensajes de evento enviados y 4 omitidos. No habia registros recientes de envio/fallo/omision individual de eventos, consistente con la automatizacion deshabilitada.
+- Conclusion: el bloqueo observado no es la URL ni la autenticacion de la API de eventos; son los flags de automatizacion del `.env`. No se habilitaron porque hacerlo puede enviar mensajes automaticamente a destinatarios reales; se requiere confirmacion antes de cambiar este comportamiento.
+- La consulta mostro solo cantidades, nombres de campos y estados; no se registraron credenciales, telefonos ni codigos de paquete.
+- Tras la confirmacion del usuario, se cambiaron ambos flags locales a `true`. Reiniciar el backend para que cargue la configuracion y active el watcher. No se envio un mensaje manual de prueba.
+
+### Seguimiento de eventos: EN000006443LPZ (2026-10-09)
+- Se reviso en modo de solo lectura. La guia tiene registro local de bienvenida, pero no tiene registros individuales de evento observado, aviso omitido ni aviso enviado. Esto indica que el CRM no llego a registrar un movimiento notificable para esta guia.
+- La ultima revision rapida, a las 18:03 UTC, registro 0 avisos de eventos y 4 paquetes omitidos. La automatizacion de eventos figura habilitada en la configuracion guardada.
+- Se compararon los tiempos locales: el proceso Node del backend inicio a las 17:33 UTC y el `.env` con los flags activados se modifico a las 17:51 UTC. Como `WHATSAPP_STAGE_WATCHER_ENABLED` se lee al arrancar y controla si se ejecuta la revision rapida de eventos, el proceso activo seguia usando la configuracion anterior. Esto explica que la revision de bienvenida omitiera el flujo de eventos aunque los flags del archivo ya estuvieran en `true`.
+- Una consulta exacta actual a la API de eventos para esta guia respondio HTTP 429 en todos los parametros de busqueda probados; por limite de solicitudes no se pudo confirmar el movimiento mas reciente directamente. La conectividad previa al catalogo general respondio HTTP 200, pero eso no sustituye la consulta de esta guia.
+- Siguiente paso: reiniciar el backend para que cargue los flags y dejar que el siguiente ciclo normal consulte y procese eventos. No se forzo una sincronizacion ni se envio un mensaje manual; al reiniciar, un evento elegible nuevo puede generar un WhatsApp a los destinatarios asociados.
+- La comprobacion no mostro ni guardo credenciales o telefonos.
+
+### Automatizacion independiente para eventos de ventanilla (2026-10-09)
+- Se confirmo que ya existian el texto del aviso de ventanilla y la elegibilidad por frases como `ventanilla`/`pendiente de recojo`, pero estaban dentro del mismo flujo de notificaciones generales y no tenian una automatizacion propia.
+- Se agrego `automaticVentanillaNotifications` como control separado en Configuraciones, activado por defecto. Su revision usa la frecuencia de eventos configurada, pero puede funcionar aunque `automaticStatusUpdates` este apagado.
+- Se separo la ruta de notificacion: Cambios de evento excluye los movimientos de ventanilla y Avisos de ventanilla solo procesa esos movimientos. Conserva la deduplicacion por guia, movimiento y destinatario para no duplicar mensajes.
+- Se incorporo el resultado de ventanilla a los registros del watcher/conciliacion y al estado visible en Configuraciones.
+- Para que entre en vigor, guardar la configuracion desde la interfaz (o reiniciar el backend si se modifica el archivo); no se envio ningun mensaje manual de prueba. Un aviso requiere que la API entregue el evento, que el contacto tenga destinatario valido y que Meta acepte el envio.
+- Validacion: `node --test backend/tests/whatsapp-package-automation.test.js` (29/29), `node --check backend/index.js`, `node --check backend/services/whatsapp-package-automation.js`, build del frontend (`tsc && vite build`), diagnosticos del editor sin errores y `git diff --check`; todos pasaron.
+
+### Revision de avisos de tránsito, destino, cartero y cancelación (2026-10-09)
+- Se verifico que los movimientos `transit`, `regional` (llegada a destino) y `courier` ya estaban clasificados, elegibles para notificacion general y tenian textos especificos.
+- Se encontro que `cancelled` tambien se clasificaba, pero `isPackageEventNotificationEligible` lo rechazaba, por lo que el aviso nunca alcanzaba el envio. Ahora la etapa cancelada es elegible para el canal general; retorno a origen conserva su mensaje especializado y precedencia.
+- Se separo el texto de cancelacion del de devolucion: informa que el sistema registra el envio como cancelado, incluye ubicacion si existe y no afirma un motivo ni que el paquete haya sido devuelto.
+- Ventanilla sigue usando su control independiente; los avisos de tránsito, destino, cartero y cancelación permanecen bajo `automaticStatusUpdates`.
+- Se añadieron pruebas para elegibilidad de tránsito/destino/cartero y cancelación, y para evitar confundir cancelación con devolución.
+- Validacion: `node --test backend/tests/whatsapp-package-automation.test.js` (31/31), `node --check backend/index.js`, `node --check backend/services/whatsapp-package-automation.js`, diagnosticos del editor y `git diff --check`; todos pasaron.
+
+### Seguimiento de llegada a destino: EN000006444LPZ
+- La API Dev muestra como destino TARIJA; los eventos disponibles culminan en `Paquete recibido en oficina origen de transito`. Esto acredita que el paquete sigue en una oficina de tránsito de origen, no que ya llegó a Tarija.
+- En los registros locales, el evento 240 `Saca interna creada (salida)` sí generó un WhatsApp. El evento 297 de recepción en oficina de origen se omitió como `ineligible-stage`: el clasificador lo trataba como `received`, aunque el ID también se usa para recepciones en oficinas de destino.
+- Se ajustó la clasificación del evento 297 para interpretar una recepción posterior a un despacho de tránsito como llegada a la siguiente oficina, incluso si la API repite la etiqueta `origen de tránsito`. Una primera recepción antes de cualquier despacho sigue como recepción/tránsito, y la llegada explícita a oficina de destino continúa siendo regional.
+- Así no se anuncia prematuramente que llegó a Tarija y el movimiento de tránsito puede notificarse por el canal general. Para que se procese con la lógica nueva, reiniciar el backend y esperar el siguiente ciclo; el envío depende de que el evento siga disponible, haya destinatario asociado y Meta acepte el mensaje.
+- Se añadieron pruebas para origen, destino explícito y el evento 297 genérico tras tránsito previo.
+
+### Ajuste contextual de llegada para EN000006445LPZ (2026-10-09)
+- A solicitud del usuario, se ajustó la interpretación del evento 297: cuando existe un movimiento anterior de tránsito/despacho, su siguiente recepción se considera llegada a la siguiente oficina (etapa regional), aunque la API reutilice el texto `Paquete recibido en oficina origen de transito.`.
+- La firma de deduplicación ahora distingue la etapa. Así, el aviso de tránsito previamente enviado para la misma firma no bloquea el nuevo aviso regional; una vez enviado el aviso regional, los ciclos siguientes sí lo reconocen como duplicado.
+- Se amplió la detección del identificador para preferir campos numéricos si el primer campo viene con una etiqueta de etapa como `TRANSIT`.
+- Se añadieron pruebas para el identificador `TRANSIT` junto con `codigo_evento: 297`, y para separar una recepción inicial de una recepción posterior al tránsito.
+- Validación: `node --test backend/tests/whatsapp-package-automation.test.js` (32/32), `node --check backend/index.js`, `node --check backend/services/whatsapp-package-automation.js`, `git diff --check`; todos pasaron. Reiniciar el backend para activar el cambio y que el siguiente ciclo procese la llegada.
+
+### Seguimiento de llegada y WhatsApp: EN000006445LPZ (2026-10-09)
+- La API Dev respondió HTTP 200 y muestra destino SUCRE con cuatro movimientos: recepción del cliente, recepción en oficina origen de tránsito, salida de saca interna y otra recepción en oficina origen de tránsito. El último movimiento disponible figura en LA PAZ; no hay evento que confirme recepción en Sucre.
+- El CRM registró el evento más reciente como `transit` y la etiqueta `Paquete recibido en oficina origen de transito.`. Su aviso de cambio de estado fue aceptado y quedó registrado como enviado; el callback de Meta para ese mismo mensaje avanzó a `delivered` y `read` pocos segundos después. Por tanto, no aparece un fallo de entrega en WhatsApp para ese aviso.
+- La guía también tiene un registro separado de bienvenida enviado en el mismo ciclo. El aviso de llegada a Sucre no se generó porque todavía no existe un movimiento de llegada a oficina/sucursal de destino en la respuesta actual de la API; destino SUCRE por sí solo no prueba que el paquete haya llegado.
+- Investigación de solo lectura; no se modificó lógica ni se forzó envío. Si el paquete ya llegó físicamente, revisar que SIOP registre/sincronice el evento de recepción en la oficina de destino y esperar la siguiente consulta del watcher.
+- Se consultaron solo el estado del envío y ubicaciones/eventos; no se guardaron ni documentaron teléfonos, tokens ni credenciales.
+
+### Diagnostico: aviso de EN000006445LPZ no llego al destinatario esperado (2026-10-09)
+- Se confirmo que el CRM registro el mensaje de tránsito para el evento mas reciente, y Meta reporto el mensaje como `sent`, `delivered` y `read`. Ese estado corresponde al destinatario usado por el CRM, no demuestra que lo recibiera el titular del paquete.
+- La configuracion guardada de WhatsApp tiene el modo de prueba activado y el destinatario del aviso coincide con un numero de prueba configurado. Ademas, ese destinatario no coincide con el WhatsApp actualmente registrado en el contacto del paquete. Esto explica por que el titular no recibio el aviso aunque Meta muestre el mensaje como leido.
+- La bienvenida y el aviso de evento se enviaron al mismo destinatario de prueba. No se expusieron ni guardaron numeros, tokens ni otros valores de configuracion.
+- No se cambio la configuracion ni se forzo un reenvio para evitar activar notificaciones a destinatarios reales sin autorizacion. Para que los avisos lleguen al destinatario del paquete, desactivar Modo de prueba en la configuracion de WhatsApp y verificar que el contacto tenga su numero correcto; el siguiente ciclo puede reevaluar el evento vigente para el destinatario normal.
+
+### Revalidacion del mensaje de comprobacion de EN000006445LPZ (2026-10-09)
+- Se inspecciono el cuerpo exacto de la bienvenida registrado: incluye la guia `EN000006445LPZ` y el destino SUCRE. Meta reporto ese mensaje como `sent`, `delivered` y `read`; el CRM no muestra fallo de envio para la bienvenida.
+- El saludo usa un nombre distinto al nombre actual del contacto CRM, lo que apunta a que el dato de nombre recibido para el destinatario no es confiable; no se reemplazo por otro nombre ni se modificaron los datos del contacto.
+- Correccion del diagnostico anterior: la comparacion previa miro un solo perfil WhatsApp. Al comprobar todos los perfiles vinculados, el destinatario del mensaje coincide con uno de ellos y tambien esta configurado como numero de prueba; por tanto, no se puede afirmar que el aviso se envio a un telefono ajeno al contacto. El modo de prueba sigue activado.
+- La comprobacion de solo lectura confirma que el codigo de paquete si esta en el mensaje guardado. Si el cliente indica que no lo ve, revisar el chat del WhatsApp asociado al perfil que recibio el mensaje y corregir el nombre en el origen de datos si corresponde. No se reenvio para evitar duplicar el aviso.
+
+### Revision de aviso de llegada a destino para EN000006445LPZ (2026-10-09)
+- Los registros del CRM solo contienen eventos hasta las 15:07:31 (hora local): el movimiento mas reciente es `Paquete recibido en oficina origen de transito`, ubicacion LA PAZ. No hay un evento de llegada/recepcion en SUCRE que pueda activar el mensaje de llegada a destino.
+- El movimiento de las 15:07:31 se proceso como `transit`; su WhatsApp fue enviado y Meta confirmo `sent`, `delivered` y `read`. Las omisiones posteriores corresponden al canal independiente de ventanilla y a deduplicacion; no representan una omision de llegada a destino.
+- Una consulta actual a la API Dev respondio HTTP 429 (limite de solicitudes), por lo que no se pudo comprobar si SIOP agrego un movimiento posterior. La ultima informacion verificable sigue siendo la recepcion en oficina de origen de transito, no la llegada a Sucre.
+- Conclusion: no se envio el aviso de llegada porque no existe un evento de destino registrado en los datos disponibles. Cuando la API vuelva a permitir consultas, verificar la nueva secuencia; si el paquete ya esta fisicamente en Sucre, confirmar que SIOP registre la recepcion en la sucursal destino. No se forzo envio ni se mostro informacion personal.
+
+### Revision de declaraciones en paquetes internacionales (2026-10-09)
+- El backend y la pantalla de Tracking solicitan `include_declaration=1` al endpoint `/api/tracking/paquetes`; el modelo del frontend contempla `declaracion_cds` con estados `declarada`, `objeto_sin_declaracion`, `sin_objeto_cds` y `consulta_incompleta`.
+- La consulta actual de la API de Tracking respondio HTTP 403, asi que no fue posible confirmar directamente si hoy el upstream devuelve declaraciones ni validar datos de un paquete concreto.
+- El catalogo local contiene 174713 registros y ninguno incluye actualmente la propiedad `declaracion_cds`. Por tanto, la base local no permite saber si esos paquetes tienen declaracion.
+- La interfaz solo declara el tipo de `declaracion_cds`; no se encontro una vista que presente sus valores. La capacidad esta prevista en las consultas/tipos, pero hoy no hay evidencia de disponibilidad de datos y la API rechaza la consulta con la configuracion efectiva.
+- Revision de solo lectura; no se mostro ni documento ningun token, contenido de declaracion o dato personal.
+
+### Vista de declaraciones por paquete internacional (2026-10-09)
+- Se agrego una columna `Declaración` a la lista internacional con resumen por paquete: declarada (cantidad), objeto sin declaración, sin objeto CDS, consulta incompleta o no consultada.
+- El boton `Información` ahora incluye el estado CDS, objetos asociados, declaraciones por objeto, numero/estado/etapa, resumen, campos, articulos y documentos, escapando el contenido antes de renderizarlo.
+- La vista diferencia dato ausente (API no incluyo `declaracion_cds`) de un resultado de consulta sin objetos CDS, evitando mostrar ausencia como una confirmacion de que no existe declaracion.
+- La API habia respondido HTTP 403 en la revision previa, asi que la UI podra mostrar datos reales cuando Tracking vuelva a responder con el campo solicitado mediante `include_declaration=1`; mientras falte, mostrara `No consultada`.
+- Validacion: `npm --prefix frontend run build`, diagnosticos del editor y `git diff --check`; todos pasaron.
+
+### Aclaracion: destinos por paquete internacional (2026-10-09)
+- El usuario aclaro que por “declaraciones” se refiere a los lugares/departamentos de destino de los paquetes, no a formularios aduaneros. No se modifico la vista aduanera anterior en esta revision.
+- Se resumieron los 100 registros mas recientemente importados del catalogo local: 32 muestran el pais Bolivia, 1 China, 1 Espana y 66 tienen `destino.nombre` y `destino.codigo` vacios. La ultima importacion local registrada fue 2026-10-09 14:27:18.
+- En esa muestra, el objeto `destino` solo contiene `codigo` y `nombre`; no hay campo de departamento/declaracion local que permita desglosar destinos dentro de Bolivia.
+- La consulta previa a la API de Tracking respondio HTTP 403; por ello esta muestra es del catalogo local y no confirma una lectura en vivo actual. No se leyeron ni mostraron codigos de paquete o datos de personas.
+
+## Tarea 2026-10-11: consolidacion de declaracion CDS y correcciones del pipeline internacional
+
+### Estado actualizado
+- Se consolidaron los cambios recientes en la lectura y visualizacion del tracking internacional para mantener la memoria del proyecto alineada con la ultima revision tecnica.
+- El foco principal fue la sincronizacion del catalogo de tracking con el campo `declaracion_cds`, la navegacion de paginas y la apertura del detalle de paquetes desde el pipeline internacional.
+- Se mantuvieron los valores secretos en `.env` fuera de este documento y solo se documentaron nombres de variables y criterios de seguridad.
+
+### Cambios aplicados
+- `README.md`: se agrego una nota explicita sobre el uso de `include_declaration=1` en `/api/tracking/paquetes`, la necesidad de permiso `sqlserver.read` + `cds.read`, y la restriccion de tratar datos de declaracion como si fueran siempre disponibles.
+- `backend/index.js`: se reforzo la carga del catalogo de tracking para conservar `declaracion_cds` cuando la API la devuelve, usando la estrategia de fallback solo cuando la respuesta no la incluye o la fuente esta bloqueada por permisos.
+- `frontend/src/main.ts`: se corrige la evaluacion de `trackingApiHasMore` para usar el total real cuando la API lo expone, y se agrega soporte para abrir el modal de detalle desde las columnas paginadas del pipeline internacional, no solo desde el catalogo general.
+- `frontend/src/modals/trackingInfoModal.ts`: se protege la renderizacion de `declaracion_cds` para que no falle cuando faltan objetos, listas o campos parciales.
+- `frontend/src/views/internationalPipelineView.ts`: se mantiene el orden del pipeline y el conteo total por columnas, con comportamientos estables aun cuando el catalogo llega parcial o desordenado.
+- `frontend/src/style.css`: se ajustan estilos de las columnas y controles del pipeline para reflejar el estado de carga y orden, sin introducir cambios de layout ajenos.
+
+### Verificacion
+- `npm --prefix frontend run build`: exitoso.
+- `node --check backend/index.js`: exitoso.
+- `git diff --check`: exitoso para los archivos involucrados.
+
+### Conclusiones
+- La integracion del pipeline internacional queda consistente con el manejo de datos de declaracion CDS y los fallbacks del catalogo local.
+- El flujo sigue siendo seguro desde la perspectiva de almacenamiento de secretos: no se registraron tokens ni valores sensibles en `task.md` ni en el codigo.
+- La siguiente comprobacion util es volver a consultar la API de Tracking con `include_declaration=1` cuando la autorizacion de SITRA este reinstalada; mientras tanto, la UI muestra el estado `No consultada` o usa el catalogo local sin convertir ausencia de datos en evidencia de inexistencia.
+
+## Diagnostico 2026-10-11: error al iniciar sesion en entorno local
+
+### Hallazgo
+- El frontend local esta escuchando en el puerto `5173`, pero el backend no tenia un proceso escuchando en `3001`.
+- `GET http://localhost:5173/api/health` devuelve HTTP 502 desde el proxy de Vite, por lo que la interfaz no puede completar el inicio de sesion mientras el backend este detenido.
+- No se intento iniciar el backend durante el diagnostico: al arrancar tambien activa los watchers de automatizacion de WhatsApp y podria procesar notificaciones pendientes.
+
+### Cambio aplicado
+- `frontend/src/main.ts`: el envio del formulario detecta HTTP 502/503/504 y fallos de red, y muestra el comando para iniciar el backend (`npm --prefix backend run dev`), en vez de dejar un mensaje tecnico o generico.
+
+### Verificacion y siguiente paso
+- Verificado: frontend escuchando en `5173`, backend no escuchando en `3001`, proxy de Vite devuelve HTTP 502 para `/api/health`.
+- Iniciar el backend en una terminal desde la carpeta del proyecto y volver a probar el login. Si el backend inicia pero el login sigue fallando, revisar el mensaje de error del endpoint sin compartir contrasenas ni secretos.
+
+## Correccion 2026-10-11: memoria del watcher y logs de eventos duplicados
+
+### Diagnostico
+- `Evento ya enviado` es el resultado esperado de la deduplicacion y significa que el mismo evento/destinatario no se reenvia.
+- El mensaje `Nuevo evento detectado ... preparando mensaje` se escribia antes de consultar la deduplicacion, por lo que parecia que se iba a enviar aunque despues se omitiera.
+- La sincronizacion pesada descargaba catálogos completos de eventos, Tracking y Paquetes-Contactos simultaneamente, reteniendo todas las filas crudas durante el armado y la actualizacion del pipeline. Tracking puede solicitar hasta 5000 paginas; este patron elevaba el pico de memoria del proceso Node.
+- Los errores `No se pudo conectar ... pagina 1` son fallos de conectividad con las APIs externas, independientes del control de duplicados. Se agrego reintento breve para fallos de red transitorios; si persisten, requieren revisar disponibilidad/red del servicio externo.
+
+### Cambios aplicados
+- `backend/index.js`: la sincronizacion completa ahora procesa paginas de Tracking y Paquetes-Contactos conforme llegan, registra las entradas normalizadas y no acumula los catálogos crudos completos en arrays o caché.
+- `backend/index.js`: el catalogo completo de eventos tambien se procesa por paginas, conservando en memoria solo el evento mas reciente por guia.
+- `backend/index.js`: las fuentes completas se consultan secuencialmente en vez de descargar los tres catálogos en paralelo.
+- `backend/index.js`: `fetchAllPaginatedItems` admite procesamiento por pagina sin retener resultados y reintenta hasta dos veces errores de red con espera incremental.
+- `backend/index.js`: el log `Nuevo evento detectado ... preparando mensaje` ahora se emite solo despues de confirmar que el destinatario no tiene ya ese evento; los duplicados solo muestran el mensaje de omision.
+
+### Verificacion y operacion
+- `node --check backend/index.js` y `node --check backend/services/whatsapp-package-automation.js`: exitosos.
+- `node --test backend/tests/whatsapp-package-automation.test.js backend/tests/ems-calculator.test.js`: 59 pruebas aprobadas.
+- `git diff --check -- backend/index.js task.md`: exitoso.
+- Reiniciar el backend para activar los cambios. Si continua el fallo de conexion a Tracking o Paquetes-Contactos, investigar la disponibilidad de esos servicios; los reintentos no sustituyen el acceso al API.
+
+## Correccion 2026-10-11: proxy de Vite al cargar el dashboard
+
+### Diagnostico
+- El proxy ya tenia un limite de 15 minutos y el cliente espera hasta 60 segundos; no era un timeout corto configurado en Vite.
+- `GET /api/dashboard` tardaba entre 30 y 33 segundos en los registros compartidos. Su consulta buscaba mensajes con un `OR` y normalizaba el telefono de cada fila dentro de dos consultas laterales por contacto, evitando busquedas eficientes por indice y pudiendo saturar la conexion proxy/backend.
+- En la comprobacion posterior, backend directo y Vite a `GET /api/health` respondieron HTTP 200; la API estaba disponible, aunque esto no descarta fallos intermitentes al ejecutar el dashboard.
+
+### Cambios aplicados
+- `backend/index.js`: la consulta del dashboard ahora busca el ultimo mensaje y el ultimo mensaje entrante por separado, con consultas ordenadas y limitadas; combina las coincidencias por `contact_id` y por telefono normalizado sin el `OR` que provocaba recorridos costosos.
+- `backend/db/init.sql`: agrega indices para los mensajes mas recientes por contacto y por telefono normalizado, incluyendo indices parciales para mensajes entrantes.
+- Se conserva el formato de respuesta del dashboard; el frontend y el timeout del proxy no se modificaron.
+
+### Verificacion y operacion
+- Verificado: `node --check backend/index.js`, `node --test backend/tests/whatsapp-package-automation.test.js backend/tests/ems-calculator.test.js` (59/59) y `npm --prefix frontend run build`.
+- `git diff --check -- backend/index.js backend/db/init.sql task.md` sin errores. El build conserva la advertencia existente sobre el tamaño del bundle principal.
+- Reiniciar el backend para que aplique los nuevos indices al inicializar PostgreSQL; no reiniciar automaticamente porque el arranque activa los watchers de WhatsApp.
+- Despues del reinicio, comprobar que `GET /api/dashboard` termina sin el error de proxy y que su duracion disminuye frente a los ~30 segundos registrados.
+
+## Correccion 2026-10-11: prioridad del servicio actual en cotizaciones WhatsApp
+
+### Revision de la conversacion
+- Las cotizaciones de las 4:44 p. m. (Delivery Express, 3 kg, modalidad indicada) y 4:45 p. m. (EMS Nacional) identifican correctamente el servicio.
+- La respuesta de las 4:53 p. m. es incorrecta: el mensaje actual pide Delivery Express y no debe responder con EMS heredado.
+- A las 4:57 p. m., 6 kg supera el maximo de Delivery Express; no se debe cotizar EMS automaticamente sin confirmar el cambio. La nueva ruta a Cochabamba tampoco debe reemplazarse por Santa Cruz.
+- La solicitud rural de Achacachi debe respetar la regla existente: Delivery Express no aplica a comunidades/provincias y se orienta a EMS, sin heredar la ruta/peso anterior.
+- En la pregunta de 500 g y dimensiones, la politica de Delivery Express debe responderse aunque falte modalidad o ruta; no corresponde reutilizar una tarifa EMS anterior.
+- Las respuestas a las entradas `#FREE-2026`, JSON de override y auditoria son correctas y se conserva la proteccion. En la cotizacion multiple, el item 1 queda pendiente por modalidad, los otros dos se cotizan y el total parcial excluye correctamente el pendiente.
+
+### Cambios aplicados
+- `backend/services/whatsapp-tariff-routing.js`: agrega un selector testeable que da prioridad al servicio explicito del mensaje actual antes de categorias EMS pendientes, peso heredado o servicio anterior.
+- `backend/index.js`: utiliza esa prioridad; un pedido explicito de Delivery Express por encima de 5 kg ya no se convierte silenciosamente en una cotizacion EMS.
+- `backend/services/whatsapp-tariff-routing.js`: extrae la deteccion de preguntas sobre dimensiones para validarla directamente en pruebas; su politica ya se ejecutaba antes de solicitar los campos de ruta/modalidad.
+- `backend/tests/whatsapp-tariff-routing.test.js`: cubre cambios EMS/Delivery Express dentro de la conversacion y preguntas de dimensiones sin modalidad.
+
+### Verificacion y operacion
+- Verificado: `node --check backend/index.js`, `node --check backend/services/whatsapp-tariff-routing.js`, 38 pruebas EMS/routing/intencion aprobadas y `npm --prefix frontend run build`.
+- `git diff --check` sin errores. El build del frontend conserva la advertencia existente sobre el tamaño del bundle.
+- El backend local observado inicio a las 17:26:24, despues de las respuestas de 16:53–17:08. Al guardar `backend/index.js`, el watcher de desarrollo reinicio automaticamente el backend a las 17:36:15; `GET /api/health` devolvio estado `ok`. Ese reinicio vuelve a activar los watchers de WhatsApp; no se inicio un segundo proceso.
+
+## Diagnostico 2026-10-12: destino declarado en CDS / departamento por paquete
+
+### Hallazgo
+- En SITRA el campo correcto para el departamento declarado del paquete es `declaracion_cds.objetos[].declaraciones[].destino_declarado.departamento`, y para la ciudad es `destino_declarado.ciudad`.
+- El valor del departamento no viene de `declaracion_cds` en general; viene del bloque `destino_declarado` generado por el parser CDS usando los campos `RSta` (departamento) y `RCty` (ciudad).
+- El proyecto CRM estaba leyendo la declaración de forma parcial y no mostraba ese destino en el modal de detalle del paquete, aunque la API de SITRA ya lo trae cuando la consulta incluye `include_declaration=1` y el token tiene permiso `cds.read`.
+
+### Cambios aplicados
+- `frontend/src/main.ts`: se extiende el tipo `TrackingApiPackage` para incluir `destino_declarado`, `destinos_declarados` y los campos `departamento`, `ciudad` y `pais_codigo`.
+- `frontend/src/modals/trackingInfoModal.ts`: se agrega la renderizacion del `Destino declarado` en cada declaración y un resumen agregado de `destinos_declarados` para que el departamento aparezca en la UI del paquete.
+- Se documenta la regla de negocio: la declaración CDS no sustituye el destino del paquete, sino que aporta el destino declarado en aduanas para ese objeto.
+
+### Verificacion y operacion
+- `npm --prefix frontend run build`: exitoso.
+- Se valida la lógica existente en SITRA y el proyecto CRM: el dato correcto esta en `destino_declarado` y no en un campo genérico de `departamento` del paquete. La ausencia del valor en la UI no significa que la API no la esté enviando; suele indicar que la consulta no incluye CDS o que el token no tiene `cds.read`.
+- Para volver a probar en producción, confirmar `include_declaration=1` y que el token autorizado tenga `cds.read` en SITRA; si falta ese permiso, la API responde sin ese dato o con el estado `consulta_incompleta`.
+
+## Diagnostico 2026-10-12: API actual rechaza la consulta con declaraciones CDS
+
+### Prueba de solo lectura
+- Se consulto la URL de Tracking configurada en el CRM, sin mostrar ni guardar URL ni credenciales.
+- Con `include_declaration=0`, pagina 1 y 25 registros: HTTP 200, 25 paquetes.
+- Con `include_declaration=1`, mismos parametros: HTTP 403; la respuesta fue clasificada como error de permiso. No se recibieron paquetes ni declaraciones en esta consulta.
+- Por tanto, actualmente no se puede confirmar ningun departamento de destino declarado desde la API. La causa comprobada es que el endpoint rechaza la solicitud ampliada; no es un problema de renderizado de los departamentos recibidos.
+
+### Flujo CRM y cambio
+- `backend/index.js` solicita `include_declaration=1`; ante HTTP 403 responde con catalogo local de respaldo, que puede no contener `declaracion_cds`. La interfaz muestra el aviso de respaldo cuando la API externa falla.
+- `frontend/src/modals/trackingInfoModal.ts` presenta el departamento cuando viene en `destinos_declarados[]` o `declaracion_cds.objetos[].declaraciones[].destino_declarado`.
+- `frontend/src/main.ts`: se corrigio el tipo `TrackingApiPackage`; `destinos_declarados` pertenece al nivel del paquete, de acuerdo con la respuesta de SITRA, no dentro de `declaracion_cds`.
+
+### Siguiente paso y validacion
+- SITRA debe autorizar al token utilizado por el CRM con `cds.read` y confirmar que la lectura CDS este habilitada. No se modificaron permisos ni credenciales.
+- Repetir las dos consultas despues del cambio: ambas deben responder HTTP 200 y la consulta ampliada debe incluir `declaracion_cds`; solo entonces se podra validar cuantos departamentos llegan.
+- Verificacion de esta revision: consulta segura con conteos agregados; no se imprimieron tokens, codigos de paquete ni datos personales.
+
+## Diagnostico 2026-10-12: expediente CDS si tiene destino, el token API del CRM no puede leerlo
+
+### Evidencia del expediente y del codigo SITRA
+- La captura compartida de `/conjunto` muestra la declaracion aduanera del paquete consultado y el destino declarado en Tarija. El flujo web usa `PostalWorkspace::search()` y `CdsRepository::search()`.
+- La API consumida por el CRM es otra ruta: `GET /api/tracking/paquetes`. En `SqlServerPackageListController`, el destino declarado se forma desde los campos CDS `RCty` (ciudad) y `RSta` (departamento) y se expone en `declaracion_cds.objetos[].declaraciones[].destino_declarado` y `destinos_declarados[]`.
+- Esa ruta requiere un token Sanctum ligado a un administrador, con `sqlserver.read`; para incluir declaraciones requiere ademas `cds.read`. La cuenta y contraseña de acceso web no sustituyen ese token de integración.
+
+### Prueba actual, busqueda exacta sin exponer datos
+- Consulta a la API configurada en CRM con el codigo compartido, pagina 1 y `include_declaration=0`: HTTP 200; la busqueda encontró 2 filas y, de forma esperada, no incluyo `declaracion_cds`.
+- Misma consulta con `include_declaration=1`: HTTP 403 y mensaje clasificado como falta del permiso CDS; no devolvio paquetes ni departamentos.
+- Esto confirma que el problema actual no es el mapeo de `RSta` ni que el expediente web carezca de declaracion: el token/API no esta autorizado para leer CDS. El frontend no puede mostrar departamentos que el endpoint rechazó.
+
+### Verificacion de SITRA y accion operativa
+- `php artisan test --filter=declaration --stop-on-failure` desde SITRA: 8 pruebas aprobadas (96 assertions), incluyendo el contrato de `departamento` y `ciudad` en la respuesta API.
+- SITRA documenta emitir un token de integracion para un administrador con `--ability=sqlserver.read,cds.read`; actualizar en el entorno del CRM el token de tracking y reiniciar el backend. Verificar que la solicitud exacta con `include_declaration=1` responda HTTP 200 y devuelva destino declarado antes de retirar el token anterior.
+- No se modifico el permiso del servidor, no se emitio token y no se utilizo la contraseña de acceso web compartida en el mensaje. Por seguridad, cambiar esa contraseña mediante el canal de administracion porque fue incluida en la conversacion.
+
+## Diagnostico 2026-10-12: boton de actualizacion en /internacionales
+
+### Revision del flujo y del entorno local
+- `frontend/src/views/internationalPackagesView.ts` conecta el boton `Actualizar paquetes` con `refreshTrackingApiPackages()`.
+- Esa funcion vuelve a pedir la pagina actual (por defecto la primera) mediante `GET /api/tracking/paquetes?...&include_declaration=1`; no ejecuta la sincronizacion completa `POST /api/internacionales/sync?force=1`.
+- Si SITRA responde error, `backend/index.js` devuelve la pagina guardada localmente con `warning` y `upstreamStatus`, en vez de datos recientes del proveedor. En ese caso el boton no incorpora el resultado al catalogo: la funcion termina al detectar el aviso de respaldo.
+- La vista muestra el aviso generico de respaldo local, por lo que puede parecer que la lista se recargo aunque las filas provengan de la ultima sincronizacion exitosa.
+- Comprobacion local: `/internacionales` sirve la app web, `GET /api/health` responde 200 y `/api/ai/health` requiere autenticacion (401). El navegador sin sesion activa redirige al login; no se uso ninguna credencial para entrar.
+- La consulta externa mas reciente de esta revision sigue siendo HTTP 403 para `include_declaration=1`; la consulta sin declaraciones responde HTTP 200. Por ello el refresh del CRM continua sin poder obtener una pagina completa con declaraciones mientras no se corrija el permiso del token.
+
+### Conclusion y siguiente paso
+- Hay dos aspectos distintos: el boton vuelve a consultar la pagina actual, pero no sincroniza todo el catalogo; y la API rechaza el acceso CDS, por lo que tampoco puede refrescarse correctamente ni siquiera esa pagina con departamentos.
+- Para que lleguen los departamentos, SITRA debe habilitar `cds.read` en el token de integracion utilizado por CRM. Luego verificar HTTP 200 con `include_declaration=1`.
+- Si se necesita que el boton sincronice todo el catalogo, debe ajustarse el flujo frontend/backend para invocar la sincronizacion completa y luego volver a cargar las filas. No se cambio ese comportamiento en esta revision para no prometer datos recientes mientras la API aun responde 403.
+
+## Diagnostico 2026-10-12: paquete declarado aparece como "No consultada" en Internacionales
+
+### Prueba exacta
+- Se consulto el paquete indicado por el usuario contra la API SITRA con `q` exacto y paginacion de 25.
+- Sin `include_declaration=1`, SITRA respondio HTTP 200 y encontro 1 registro; como esperado, `meta.declaracion_cds_incluida=false` y no habia campo CDS.
+- Con `include_declaration=1`, la API respondio HTTP 403 clasificado como permiso de CDS y no devolvio filas.
+- El resultado explica la etiqueta de CRM: `renderTrackingDeclarationSummary()` muestra "No consultada" cuando `declaracion_cds` esta ausente. Si SITRA devuelve la propiedad con estado `declarada`, el mismo renderizador muestra "Declarada".
+- El usuario compartio una captura del expediente web `/conjunto` con declaracion y destino declarado en Tarija. Ese flujo web usa autenticacion de sesion y consulta CDS directamente; no demuestra que el token tecnico que consume CRM tenga `cds.read`.
+
+### Conclusiones y accion
+- No es correcto inferir `declarada` desde el expediente web, ni etiquetar como declarado un paquete si la API del CRM no pudo consultar CDS. Se conserva "No consultada" para distinguir falta de acceso de una respuesta CDS positiva/negativa.
+- El mapeo de SITRA debe enviar `declaracion_cds.estado` por paquete; el codigo y las pruebas existentes verifican ese contrato. El bloqueo observado ocurre antes de recibir ese payload, en la autorizacion del token.
+- El administrador de SITRA debe autorizar o emitir para la integracion un token con `sqlserver.read` y `cds.read`. Repetir la consulta exacta; se espera HTTP 200, `meta.declaracion_cds_incluida=true` y `data[].declaracion_cds.estado=declarada` para que CRM la muestre como tal.
+- No se modifico codigo ni permisos durante esta comprobacion; no se registraron datos del paquete ni secretos en logs.
+
+## Integracion separada de declaraciones CDS por paquete
+
+### Cambios implementados
+- SITRA expone `POST /api/tracking/cds/declaraciones`, separado del servicio de Tracking. El endpoint requiere usuario administrador y `cds.read`, acepta hasta 100 codigos y devuelve la declaracion, sus objetos/documentos y el destino declarado mapeado desde `RSta` (departamento) y `RCty` (ciudad). No requiere `sqlserver.read`.
+- El endpoint de SITRA se cubre con `tests/Feature/CdsDeclarationApiTest.php` y esta documentado en `docs/IPS_OPERACIONES.md`.
+- CRM configura el servicio y su credencial CDS de forma independiente con `CDS_API_URL` y `CDS_API_TOKEN`; no reutiliza ni registra los valores de credenciales.
+- `backend/index.js` pide los paquetes a Tracking sin solicitarle CDS y enriquece la pagina vigente, la consulta exacta y el catalogo completo con la API CDS. La consulta agrupa hasta 100 codigos por solicitud y aplica una pausa para respetar el limite de la API CDS.
+- Si CDS no esta configurado o responde con error, los datos de Tracking se conservan y se adjunta una advertencia; el CRM no afirma que el paquete esta declarado sin una respuesta CDS.
+- El buscador puede abrir un registro encontrado solo en CDS, incluso si Tracking no tiene coincidencia. El resultado muestra el estado CDS y el destino declarado; el modal de detalle recibe el registro de la busqueda.
+- README y `.env.example` describen la configuracion sin incluir secretos.
+
+### Requisitos para recibir declaraciones reales
+- Desplegar primero SITRA con la ruta nueva.
+- Configurar `CDS_API_URL` y un `CDS_API_TOKEN` de integracion autorizado con `cds.read` en el entorno CRM. El token de Tracking puede seguir siendo distinto.
+- Consultar un codigo conocido y confirmar que la respuesta CRM incluye `declaracion_cds.estado` y `destinos_declarados[].departamento`. `destino_declarado` representa el departamento de la declaracion CDS, no garantiza el destino operativo actual de Tracking/IPS.
+- La implementacion local por si sola no habilita el permiso ni cambia el despliegue; sin token CDS autorizado, la respuesta debe mostrar una advertencia.
+
+### Validacion ejecutada y pendiente
+- SITRA: `php artisan test --filter=CdsDeclarationApiTest` paso, 3 pruebas y 14 aserciones; `php artisan route:list --path=tracking/cds/declaraciones` registra la ruta nueva.
+- CRM: `npm run build` paso (incluye `tsc` y Vite); `node --check backend/index.js` paso; las pruebas dirigidas de backend pasaron (36 pruebas).
+- `git diff --check` paso en los archivos de esta integracion. Se excluyeron archivos con cambios previos ajenos a esta tarea.
+- Sigue pendiente probar un codigo real despues del despliegue de SITRA y de configurar la credencial con `cds.read`; no registrar el token ni datos personales del paquete.
+
+### Verificacion del endpoint desplegado y diagnostico CRM - 2026-10-12
+- La peticion sin credenciales a `POST http://172.65.10.55:8103/api/tracking/cds/declaraciones`, con `Accept: application/json`, respondio HTTP 401 JSON. Esto confirma que el servidor alcanza una ruta protegida; no confirma autorizacion, conexion CDS ni contenido para un paquete.
+- En la configuracion local revisada no existen valores para `CDS_API_URL` ni `CDS_API_TOKEN` en `.env`, ni archivo `backend/.env`. No se leyeron ni mostraron secretos. El codigo usa `CDS_API_TOKEN` como credencial obligatoria para consultar CDS y, si falta, devuelve advertencia y estado `consulta_incompleta`.
+- Se corrigio `.env.example` para usar la base SITRA `http://172.65.10.55:8103` en vez del host de desarrollo. El valor efectivo del CRM puede omitir `CDS_API_URL` (su default es la base de Tracking) o configurarlo explicitamente.
+- Para mostrar declaraciones, crear en SITRA un token de integracion de administrador con permiso `cds.read`, configurarlo como `CDS_API_TOKEN` en el entorno del backend CRM y reiniciar el backend. Despues probar un codigo con declaracion conocida y verificar el estado/destino; esta revision no probo una consulta CDS autenticada ni confirma que el CRM desplegado tenga la configuracion.
+
+### Configuracion local y prueba con token proporcionado - 2026-10-12
+- Se configuraron localmente `CDS_API_URL` con la base SITRA `http://172.65.10.55:8103` y `CDS_API_TOKEN` en el `.env` ignorado por Git. El valor del token no se copia a este documento ni al codigo.
+- Se envio una consulta autenticada de prueba para `LP666718164MY`; SITRA respondio HTTP 403. Por lo tanto, el CRM ya tiene la credencial local configurada, pero SITRA no autoriza esta consulta y todavia no se confirma que el departamento se este devolviendo. Revisar que el token corresponda a un usuario administrador con la habilidad `cds.read` y que el despliegue activo de SITRA incluya esa regla.
+- El token fue compartido en la conversacion; por seguridad, revocarlo y emitir uno nuevo antes de usarlo en produccion. Actualizar `CDS_API_TOKEN` local con el token nuevo y reiniciar el backend para que cargue la configuracion.
+
+### Seccion de entorno para declaraciones CDS
+- Se agruparon `CDS_API_URL` y `CDS_API_TOKEN` bajo una seccion explicita para declaraciones aduaneras CDS de paquetes internacionales, tanto en el `.env` local ignorado por Git como en `.env.example`.
+- `CDS_API_URL` es la base SITRA (`http://172.65.10.55:8103`); el backend usa la ruta `/api/tracking/cds/declaraciones`. `CDS_API_TOKEN` debe ser un token autorizado con `cds.read`.
+- El token real permanece solo en `.env` local; `.env.example` conserva un marcador y no versiona credenciales.
+
+### Verificacion funcional de Tracking/CDS - 2026-10-12
+- La consulta exacta a Tracking en SITRA devolvio HTTP 200 y coincidencia para `EY467201535US` y `LP666718164MY`.
+- La consulta autenticada CDS al host correcto `http://172.65.10.55:8103` devolvio HTTP 200 y estado `declarada` para ambos codigos. Para `LP666718164MY`, SITRA devolvio departamento `Cercado` y ciudad `Tarija`. Para `EY467201535US`, devolvio ciudad `LA PAZ BOLIVIA` pero `RSta` vacio, por lo que faltaba departamento.
+- El `.env` local tenia como URL CDS una ruta completa. El backend construye la ruta absoluta `/api/tracking/cds/declaraciones`, por lo que resuelve correctamente al endpoint host; la prueba directa confirma HTTP 200.
+- Se corrigio SITRA para inferir un departamento solo si el pais es BO y el campo de ciudad coincide exactamente con el nombre de un departamento boliviano, con sufijo opcional “Bolivia” o “BO”. No se altera un `RSta` ya informado ni se infiere en otros paises/ciudades.
+- Pruebas SITRA: `php artisan test --filter=CdsDeclarationApiTest` paso con 8 pruebas y 38 aserciones. La compilacion frontend y 36 pruebas dirigidas del backend CRM tambien pasaron. `GET /api/health` respondio HTTP 200 en el backend local; el servidor Vite de desarrollo no estaba escuchando en el puerto 5173 durante esta comprobacion, asi que no se verifico la pantalla en navegador.
+- Hay que desplegar la correccion SITRA para que el departamento inferido de La Paz aparezca en la API real; al momento de la prueba, la respuesta desplegada aun devolvia el departamento vacio para `EY467201535US`.
+
+### Respuesta de declaraciones CDS por mensajes WhatsApp
+- Se integró la consulta CDS a `fetchMatchingPackageContext()` para mensajes con código de guía, consultando CDS aparte de Tracking y sin barrer declaraciones por número telefónico.
+- El contexto del bot separa explícitamente el departamento/ciudad declarado en CDS del destino y la ubicación operativos de Tracking. Cuando el cliente pregunta por declaración o departamento, responde usando los campos recibidos; si CDS falla o falta el departamento, lo comunica sin inferir datos.
+- La búsqueda CDS por código también funciona cuando el código no tuvo coincidencia en Tracking, pero no altera el estado operativo ni afirma movimientos que Tracking no confirmó.
+- Se añadieron pruebas unitarias de clasificación de consulta y respuestas para departamento disponible, departamento ausente y consulta CDS incompleta en `backend/tests/whatsapp-intent.test.js`.
+- Validacion de esta integracion al bot: `node --check backend/index.js`, `node --check backend/services/whatsapp-intent.js` y las suites dirigidas `whatsapp-intent`, `whatsapp-package-automation` y `whatsapp-tariff-routing` pasaron; SITRA CDS paso 8 pruebas/38 aserciones.
+- Para probar mensajes reales hay que desplegar/reiniciar CRM con estos cambios y SITRA con la inferencia de La Paz. El entorno consultado ya autorizo CDS para los dos codigos; rotar el token compartido en la conversacion antes de dejarlo en produccion.
+
+### Prueba de lote de 100 paquetes internacionales en SITRA - 2026-10-12
+- Se leyo Tracking con `TRACKING_SQLSERVER_TOKEN`, recorriendo sus paginas hasta reunir 100 codigos postales internacionales unicos; no se imprimieron ni almacenaron los codigos en la documentacion.
+- La consulta unica `POST /api/tracking/cds/declaraciones` se envio al host configurado `172.65.10.55:8103` con el token local y respondio HTTP 200. SITRA devolvio 100 resultados: 11 `declarada`, 89 `sin_objeto_cds`, 0 `objeto_sin_declaracion`, 0 `consulta_incompleta`; `meta.cds_truncado=false`.
+- Departamentos presentes entre las declaraciones devueltas: BOLIVIA, Cochabamba, La Paz y SANTA CRUZ.
+- Una consulta adicional inmediata para verificar el departamento del caso conocido de La Paz respondio HTTP 429 (limite de solicitudes); no se reintento. La prueba del lote confirma que el endpoint responde en el servidor y entrega resultados, pero no verifica el departamento de ese codigo especifico ni la interfaz web.
+
+### Mostrar destino declarado CDS en tabla Internacionales
+- `frontend/src/main.ts`: la celda muestra información estructurada del destino declarado CDS; no se debe usar solo el departamento porque algunos registros tienen ciudad/país en otros campos.
+- Si Tracking no informa destino, la tabla muestra `Bolivia` solo para guias internacionales con un evento entrante (`entrada`, `inbound` o `importacion`). No se inventa departamento/localidad y no se cambia el destino operativo de la API.
+- Solo se modifico la presentacion del CRM; no se modifico la API CDS ni SITRA.
+
+### Muestreo de paquetes sin declaracion y sin destino - 2026-10-12
+- Se consultaron las primeras paginas de Tracking hasta reunir 100 codigos internacionales unicos; Tracking respondio HTTP 200. Se enviaron esos mismos 100 codigos en una consulta CDS; CDS respondio HTTP 200 y devolvio 100 resultados sin truncamiento.
+- En la muestra, 84 codigos no estaban declarados en CDS, 67 no tenian destino operativo informado por Tracking y 58 cumplian ambas condiciones. Ejemplos de la interseccion: `EC261702498BE`, `LX097177961NL`, `LX098223177NL`, `LX096688840NL` y `LX096606315NL`; CDS los clasifico como `sin_objeto_cds` y Tracking no informo destino.
+- Este es un muestreo de 100 paquetes, no un conteo del catalogo completo. `sin_objeto_cds` significa que CDS no encontro un objeto asociado para ese codigo en esta consulta; no se uso un destino declarado inexistente ni se infirio ubicacion.
+
+### Evitar mostrar teléfonos como departamento declarado - 2026-10-13
+- La columna `Destino declarado CDS` y los resúmenes CDS descartan valores telefónicos en el campo de departamento, por ejemplo `Tel 591...`.
+- Se aplicó el mismo filtro en los modales de consulta/detalle y en el resumen CDS enviado al contexto del bot. Los datos recibidos de CDS no se modifican.
+
+### Corregir destino CDS incompleto para LP666543485MY - 2026-10-13
+- La declaración CDS mostrada para `LP666543485MY` tiene información de destinatario/dirección en los campos de origen, pero `destinos_declarados`/`destino_declarado` no estaba exponiendo esos valores a la tabla; por eso se veía `—`.
+- La tabla y los modales ahora usan como respaldo `RCty`, `RZip` y `RCtr` de los campos originales de la declaración cuando no hay destino normalizado. `RSta` solo se muestra si no parece un teléfono. No se infiere una ciudad a partir de la dirección libre ni se cambia el destino operativo de Tracking.
+- El contexto CDS enviado al bot aplica el mismo respaldo para no responder que el destino no está informado cuando hay ciudad, código postal o país en la declaración original.
+
+### Notificar llegada internacional al número de prueba - 2026-10-13
+- En modo de prueba, un evento confirmado de entrada en oficina de cambio para un paquete de Tracking Internacional se notifica a los números de prueba autorizados aunque el paquete no tenga teléfono asociado.
+- La llegada es notificable aun si Tracking conserva la etapa `received` y no depende de que Aduana haya registrado o completado la declaración. Se mantiene la deduplicación por paquete/evento/destinatario.
+- Para ejecutarlo desde el watcher deben estar activos Modo de prueba WhatsApp y Cambios de evento; el aviso sigue limitado a los números configurados para pruebas.
+
+### Ajuste de modo prueba para notificaciones internacionales - 2026-10-13
+- Se corrigió la detección de paquetes que llegan a Bolivia: el watcher ya no depende solo del último evento, también revisa el historial del paquete para encontrar `Recibir envío en oficina de cambio (entrada)`.
+- Al mezclar datos de Tracking con Paquetes-Contactos se conserva la señal de llegada internacional, para que no se pierda cuando una fuente reemplaza a la otra.
+- En modo de prueba WhatsApp activo, las notificaciones del watcher se envían a los números de prueba autorizados para probar llegadas internacionales, cambios de estado y ventanilla sin contactar a destinatarios reales.
+- Con modo de prueba WhatsApp desactivado, las mismas notificaciones dejan de usar números de prueba y se envían a los teléfonos reales registrados en el paquete/contacto.
+- Se aumentó el límite predeterminado de códigos recientes revisados para eventos de llegada de 25 a 200, configurable con `PACKAGE_RECENT_EVENT_CODE_LIMIT`.
+- Se agregó trazabilidad en logs: las omisiones de eventos guardan `notificationType`, y el resumen del watcher reporta `internationalArrivalSent`, `internationalArrivalSkipped` y sus motivos.
+- Archivos modificados: `backend/index.js`, `backend/services/whatsapp-package-automation.js`, `backend/tests/whatsapp-package-automation.test.js`.
+- Validación: `node --check backend/index.js` pasó; `node --test backend/tests/whatsapp-package-automation.test.js` pasó con 36/36 pruebas.
+- Requisito operativo: reiniciar el backend para que el watcher cargue esta regla; al arrancar puede procesar notificaciones pendientes, por lo que conviene confirmar que el modo prueba esté en el estado deseado antes del reinicio.
+### Respuesta WhatsApp para paquetes en aduana - 2026-10-13
+- Si el contexto real del paquete trae estado, ubicacion o ultimo evento relacionado con aduana, el bot responde de forma directa que el paquete se encuentra en aduana, en revision u observacion aduanera.
+- La respuesta usa el codigo de guia y el ultimo registro disponible, sin inventar fechas ni ubicaciones no confirmadas.
+- Tambien se agrego una regla al prompt de seguimiento para mantener el mismo criterio cuando el flujo use IA.
+- Archivos modificados: `backend/services/whatsapp-intent.js`, `backend/index.js`, `backend/tests/whatsapp-intent.test.js`.
+- Validacion: `node --test backend/tests/whatsapp-intent.test.js` paso con 12/12 pruebas; `node --test backend/tests/whatsapp-package-automation.test.js` paso con 36/36 pruebas; `node --check backend/index.js` paso.
+
+### Respuesta WhatsApp para distribucion nacional - 2026-10-13
+- Si el contexto real del paquete trae eventos de distribucion nacional del pipeline (`13`, `14`, `35`, `71` o `72`) o textos de ubicacion nacional, traslado o clasificacion, el bot responde que el paquete ya esta en Bolivia y se esta clasificando para su distribucion nacional.
+- La respuesta no muestra el numero ni nombre tecnico del evento; solo informa el estado operativo entendible para el cliente.
+- Se guarda `currentLatestEventSignature` en el contexto del paquete para que la respuesta pueda guiarse por la firma real del evento del pipeline.
+- El mismo texto se usa para consultas por WhatsApp y para notificaciones automaticas del watcher cuando el evento corresponde.
+- Archivos modificados: `backend/services/whatsapp-intent.js`, `backend/index.js`, `backend/tests/whatsapp-intent.test.js`.
+- Validacion: `node --test backend/tests/whatsapp-intent.test.js` paso con 14/14 pruebas; `node --test backend/tests/whatsapp-package-automation.test.js` paso con 36/36 pruebas; `node --check backend/index.js` y `node --check backend/services/whatsapp-intent.js` pasaron.
+
+### Correccion de filtros del pipeline internacional - 2026-10-13
+- Se revisaron conteos agregados locales de `international_tracking_packages` por `latest_event_code` y `stage_key`: los eventos IPS principales estaban guardados con la etapa esperada (`35 -> regional`, `31/34/38 -> transit`, `32/36/39/73 -> courier`, `37 -> delivered`).
+- La causa del fallo estaba en frontend: el modal `+ Estados` del tablero internacional usaba fuentes nacionales (`isNationalTrackingPackage`/`isNationalContactPackage`) y filtros de fecha/departamento del pipeline nacional.
+- Se corrigio `getApiPipelineStateOptions()` para que, cuando la vista activa sea `internacionales-tablero`, use paquetes internacionales, omita paquetes-contactos nacionales y aplique los filtros `internationalPipelineDateStart`, `internationalPipelineDateEnd` e `internationalPipelineDepartment`.
+- Tambien se ajusto el fallback textual de `getTrackingPipelineStage()`: textos de `ubicacion nacional`, `traslado` o `clasific` ahora caen en `regional`/Distribucion nacional en vez de `transit`/Aduana.
+- Archivo modificado: `frontend/src/main.ts`.
+- Validacion: `npm --prefix frontend run build` paso; `node --check backend/index.js` paso.
+
+### Modulo de mensajes personalizados - 2026-10-14
+- Se agrego `Mensajes personalizados` al grupo **Clientes** del sidebar, debajo de Agrupaciones.
+- La vista reutiliza el editor existente de prompts/configuracion para mostrar y editar mensajes personalizados sin duplicar la logica de guardado ni simulacion.
+- Se ajustaron titulo, descripcion y etiqueta de alcance para diferenciar el modulo general de las vistas Nacional e Internacional.
+- Archivos modificados: `frontend/src/main.ts`, `frontend/src/layout/workspace.ts`, `frontend/src/views/prontsView.ts`.
+- Validacion: `npm --prefix frontend run build`.
+
+### Correccion de visibilidad de mensajes personalizados - 2026-10-14
+- Se corrigio la condicion de visibilidad de `frontend/src/views/prontsView.ts`: el nuevo módulo ahora aparece correctamente cuando `activeView` es `mensajes-personalizados`.
+- Causa: la vista compartida solo marcaba como visible las rutas Nacional e Internacional.
+- Validacion: `npm --prefix frontend run build`.
+
+### Biblioteca visible de respuestas personalizadas - 2026-10-14
+- Se reemplazó el acceso al editor de prompts por una vista independiente que muestra los mensajes configurados para tarifas, Delivery Express y seguimiento.
+- La nueva biblioteca presenta cada caso, su descripción y el texto de respuesta con sus variables (`{packageCode}`, `{status}`, etc.).
+- Archivos modificados: `frontend/src/views/customMessagesView.ts`, `frontend/src/views/index.ts`, `frontend/src/layout/workspace.ts`, `frontend/src/style.css`.
+- Validación: `npm --prefix frontend run build`.
+
+### Vista operativa de mensajes por paquetes - 2026-10-14
+- Se ajustó `Mensajes personalizados` para utilizar nuevamente la vista operativa existente de prompts: estados de paquetes, mensajes configurables, variables de contexto y probador con paquetes reales.
+- El módulo ya no presenta un catálogo estático; usa los paquetes disponibles en los datos cargados del CRM mediante `getProntsColumnContacts`.
+- Se actualizó la descripción para indicar que los mensajes responden sobre paquetes existentes.
+
+### Vista previa de respuesta de paquete en tránsito - 2026-10-14
+- Se agregó en `Mensajes personalizados` la vista previa del mensaje de tránsito solicitado para `CP000118322BO`, con saludo, destino, última actualización y aviso de próximo movimiento.
+- La vista queda dentro del editor operativo junto a las columnas y el probador de paquetes.
+- Archivos modificados: `frontend/src/views/prontsView.ts`, `frontend/src/style.css`.
+
+### Edición del mensaje personalizado de tránsito - 2026-10-14
+- La vista previa del mensaje de `CP000118322BO` ahora es un campo editable; conserva los saltos de línea y permite modificar el texto directamente.
+- El contenido editado se mantiene durante la sesión del CRM para poder probarlo y ajustarlo antes de integrarlo al prompt definitivo.
+- Archivos modificados: `frontend/src/main.ts`, `frontend/src/views/prontsView.ts`, `frontend/src/style.css`.
+
+### Vista independiente de todos los mensajes personalizados - 2026-10-14
+- `Mensajes personalizados` ahora abre una vista nueva e independiente, sin columnas de prompts ni probador IA.
+- La vista reúne todos los mensajes personalizados por categoría (tarifas, Delivery Express y seguimiento) y presenta cada texto en un campo editable.
+- Archivos modificados: `frontend/src/layout/workspace.ts`, `frontend/src/views/customMessagesView.ts`, `frontend/src/style.css`.
+
+### Vista nueva desde cero para mensajes personalizados - 2026-10-14
+- Se creó `frontend/src/views/personalizedMessagesView.ts` como pantalla independiente desde cero.
+- La ruta ya no reutiliza el editor de prompts ni sus componentes; muestra una biblioteca propia de mensajes editables, categorizados y con botón de guardar.
+- Archivos modificados: `frontend/src/views/personalizedMessagesView.ts`, `frontend/src/views/index.ts`, `frontend/src/layout/workspace.ts`, `frontend/src/style.css`.
+
+### Corrección de enrutamiento de la vista nueva - 2026-10-14
+- Se corrigió el orden de las condiciones de `renderWorkspace`: `mensajes-personalizados` ya no cae primero en la vista de prompts.
+- Ahora la ruta muestra exclusivamente `personalizedMessagesView.ts`.
+
+### Plantillas editables con variables y guardado - 2026-10-14
+- Cada mensaje de `Mensajes personalizados` ahora es editable mediante un textarea independiente.
+- Se agregó una guía paso a paso visible con las variables permitidas: `{Nombre cliente}`, `{paquete}`, `{Destino del paquete}`, `{estado}` y `{ultimo movimiento}`.
+- El botón `Guardar cambios` persiste las plantillas en el navegador y muestra confirmación al usuario.
+- Archivos modificados: `frontend/src/views/personalizedMessagesView.ts`, `frontend/src/main.ts`, `frontend/src/style.css`.
+
+### Separación nacional/internacional y editor con vista previa - 2026-10-14
+- La nueva vista agrega botones superiores **Nacionales** e **Internacionales**.
+- Los mensajes se listan por categoría en el panel izquierdo; al seleccionar uno, se edita en el panel derecho.
+- La vista previa reemplaza `{Nombre cliente}`, `{paquete}` y `{Destino del paquete}` con datos del primer paquete disponible en la API cargada.
+- Cada mensaje tiene su propio botón `Guardar mensaje` y persiste la plantilla editada.
+
+### Panel de datos enviados por la API - 2026-10-14
+- Se agregó un tercer panel a la derecha del editor para mostrar los datos usados en la personalización: cliente, paquete, destino, estado, último movimiento y fuente API.
+- El panel cambia según la pestaña Nacional/Internacional y el paquete disponible cargado en `state.data`.
+
+### Búsqueda y ampliación de mensajes existentes - 2026-10-14
+- Se revisaron `backend/knowledge/agent-responses.json`, `backend/services/whatsapp-intent.js` y `backend/services/whatsapp-package-automation.js`.
+- Se incorporaron a la vista mensajes existentes para cartero, cancelación/retorno, llegada a Bolivia, aduana, paquete no encontrado y consulta de declaración aduanera.
+- Los mensajes conservan variables editables para conectarse con los datos del paquete.
+
+### Corrección de lectura de destinos desde la API - 2026-10-14
+- Se revisó cómo llegan los destinos en la API: pueden ser texto o un objeto con `nombre`/`direccion`.
+- La vista ahora lee ambos formatos, también considera destinatario y código `codigo_s10`, y muestra `Destino no informado` si la API no entrega destino.
+- Se eliminó el respaldo fijo `Germany` para evitar enviar o previsualizar destinos inventados.
+
+### Incorporación de bienvenida nacional y recojo en ventanilla - 2026-10-14
+- La búsqueda del flujo `buildNewPackageWelcomeMessage` confirmó que faltaba la plantilla de bienvenida para paquetes nuevos nacionales.
+- Se agregó `Bienvenida de paquete nuevo`, incluyendo cliente, código, origen, destino, aviso de salida a ruta y canal de consulta.
+- También se agregó el mensaje de paquete disponible para recojo en ventanilla con sucursal de destino.
+
+### Revisión de `chat.txt` y mensajes faltantes - 2026-10-14
+- Se revisó `C:\Users\israe\OneDrive\Desktop\Pasantia\Correos de Bolivia\chat.txt`, diferenciando mensajes emitidos por Correos de Bolivia de instrucciones/prompts escritos por el usuario.
+- Se identificaron y agregaron mensajes de saludo inicial, recorrido de paquete, llegada a Bolivia sin sucursal, despacho internacional desde Bolivia, aduana con último registro y entrega confirmada.
+- No se incorporaron instrucciones de jailbreak, solicitudes de descuentos no autorizados ni mensajes del usuario como plantillas operativas.
+
+### Switch de activación por mensaje - 2026-10-14
+- Se agregó un switch individual junto a cada mensaje nacional e internacional.
+- El switch permite activar/desactivar la plantilla y muestra visualmente los mensajes inactivos.
+- El estado se persiste en `localStorage` junto con las plantillas editadas.
+
+### Incorporación completa de plantillas faltantes - 2026-10-14
+- Se agregaron las plantillas faltantes identificadas en `chat.txt`: saludos, solicitud de peso y dimensiones, tarifas referenciales, tercera edad, cotizaciones múltiples, confirmación e inconsistencia de guías, atención telefónica, declaraciones aduaneras, errores de tracking, recorrido de paquetes y correspondencia pendiente de recojo.
+- Las plantillas están separadas en Nacionales e Internacionales y usan variables editables para los datos dinámicos.
+- Se excluyeron duplicados, pruebas de jailbreak, descuentos no autorizados y respuestas defectuosas como `[object Object]`.
+
+### Panel de mensajes desplazable - 2026-10-14
+- Cotizaciones redactadas por el agente: se eliminó la selección directa de `buildTariffReply(...)`; la IA ahora recibe el resultado estructurado del tarifario y redacta según los datos disponibles.
+- El tarifario sigue siendo la fuente única de precios y condiciones; la IA no puede inventar ni modificar valores.
+- Validación: `node --check backend/index.js`.
+- Recuperación conversacional de cotización y tracking: se ajustó `backend/index.js` para que el agente, ante una solicitud no resoluble, pida los datos faltantes para cotizar o ofrezca consultar una guía usando el estado real de la API.
+- Se agregó un fallback conversacional para evitar respuestas vacías o genéricas.
+- Validación: `node --check backend/index.js`.
+- El listado de mensajes nacionales e internacionales ahora tiene desplazamiento vertical independiente.
+- Se agregó una altura máxima, scrollbar visible y estilos compatibles con navegadores Chromium para recorrer todos los mensajes sin desplazar el editor derecho.

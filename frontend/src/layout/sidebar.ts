@@ -78,13 +78,12 @@ export const renderSidebar = (ctx: any) => {
           aria-label="${state.isSidebarCollapsed ? 'Desplegar sidebar' : 'Replegar sidebar'}"
           title="${state.isSidebarCollapsed ? 'Desplegar sidebar' : 'Replegar sidebar'}"
         >
-          ${getBrandIcon()}
           CRM
         </button>
         <div class="brand-copy">
-          <p>CRM Omnicanal</p>
+          <p>CRM Comercial</p>
           <strong>Conversa OS</strong>
-        </div>En
+        </div>
       </div>
     </div>
 
@@ -109,7 +108,7 @@ export const renderSidebar = (ctx: any) => {
                   <strong>${group.label}</strong>
                   <small>${group.items.length} modulos</small>
                 </span>
-                <span class="menu-group-arrow">${expanded ? '-' : '+'}</span>
+                <span class="menu-group-arrow">${expanded ? '▲' : '▼'}</span>
               </button>
 
               <div class="menu-items">
@@ -197,6 +196,23 @@ export const renderSidebar = (ctx: any) => {
         })
         .join('')}
     </nav>
+    
+    <div class="sidebar-postal-watermark" aria-hidden="true">
+      <svg viewBox="0 0 200 240" fill="none" stroke="currentColor">
+        <!-- Puerta del Sol / Silueta Tiwanaku -->
+        <path d="M20 230h160v-10h-25v-80h25v-10h-50v35h-35v-35H20v10h25v80H20v10z" stroke-width="1.2" opacity="0.4"/>
+        <rect x="70" y="165" width="60" height="65" stroke-width="1.2" opacity="0.4"/>
+        <!-- Sello Matasellos Circular -->
+        <circle cx="80" cy="90" r="45" stroke-dasharray="4 3" stroke-width="1.2"/>
+        <circle cx="80" cy="90" r="38" stroke-width="0.9"/>
+        <path d="M40 90h80M80 50v80" stroke-width="0.7"/>
+        <text x="80" y="85" text-anchor="middle" font-size="8" font-family="sans-serif" font-weight="700" fill="currentColor">12 DE</text>
+        <text x="80" y="98" text-anchor="middle" font-size="7" font-family="sans-serif" font-weight="700" fill="currentColor">BMITT</text>
+        <text x="80" y="115" text-anchor="middle" font-size="9" font-family="sans-serif" font-weight="800" fill="currentColor">BOLIVIA</text>
+        <!-- Ondas de Matasellos -->
+        <path d="M125 75c15-7 25 7 40 0M125 90c15-7 25 7 40 0M125 105c15-7 25 7 40 0" stroke-width="1.2"/>
+      </svg>
+    </div>
 
   </aside>
 `

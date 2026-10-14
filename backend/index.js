@@ -32,19 +32,33 @@ import {
   isEmsWeightReplyMissingUnit,
   shouldForceEmsForWeightLimit,
 } from './services/ems-calculator.js'
-import { isPackageTrackingRequest, selectLatestPackageEntry } from './services/whatsapp-intent.js'
+import {
+  isDeliveryExpressDimensionQuestion,
+  resolveTariffServiceKey,
+} from './services/whatsapp-tariff-routing.js'
+import {
+  buildCustomsTrackingReply,
+  buildNationalDistributionTrackingReply,
+  buildPackageDeclarationReply,
+  isPackageDeclarationQuestion,
+  isPackageTrackingRequest,
+  selectLatestPackageEntry,
+} from './services/whatsapp-intent.js'
 import {
   buildInternationalArrivalMessage,
+  buildPackageCancellationMessage,
   buildPackageEventSignature,
   buildPackageReturnToOriginMessage,
   getPackageAutomationNextDelayMs,
   getWhatsAppTrackingRetrySchedule,
   getNewPackageWelcomePhoneCandidates,
+  getNationalPackageEventStage,
   getTrackingPackageRecipientPhoneCandidates,
   hasInternationalArrivalEvent,
   isInternationalArrivalEvent,
   isEligibleNewPackageWelcomeEntry,
   isPackageEventNotificationEligible,
+  isPackageEventForNotificationType,
   isPackageReturnToOriginEvent,
   isPackagePageOutsideRecentWindow,
   migrateWelcomeIntervalSetting,
@@ -328,7 +342,7 @@ const whatsappDefaults = {
   senderNumber: process.env.WHATSAPP_META_SENDER_NUMBER?.trim() ?? '',
   testModeEnabled:
     process.env.WHATSAPP_TEST_MODE == null ? false : process.env.WHATSAPP_TEST_MODE === 'true',
-  testModeNumber: process.env.WHATSAPP_TEST_MODE_NUMBER?.trim() ?? '',
+  testModeNumber: process.env.WHATSAPP_TEST_MODE_NUMBER?.trim() ?? '+59164229403',
   webhookVerifyToken:
     process.env.WHATSAPP_META_WEBHOOK_VERIFY_TOKEN?.trim() ?? '',
 }
@@ -385,7 +399,117 @@ const getTrackingApiDefaults = () => ({
     '',
 })
 
+const getCdsApiDefaults = () => ({
+  baseUrl: process.env.CDS_API_URL?.trim() ?? getTrackingApiDefaults().baseUrl,
+  token: process.env.CDS_API_TOKEN?.trim() ?? '',
+})
+
+let cdsApiLastRequestAt = 0
+let cdsApiRequestQueue = Promise.resolve()
+
+const waitForCdsApiRateLimit = async () => {
+  const previousRequest = cdsApiRequestQueue
+  let unlockQueue = () => {}
+  cdsApiRequestQueue = new Promise((resolve) => {
+    unlockQueue = resolve
+  })
+  await previousRequest
+
+  try {
+    const waitMs = Math.max(0, 2200 - (Date.now() - cdsApiLastRequestAt))
+    if (waitMs > 0) await sleep(waitMs)
+    cdsApiLastRequestAt = Date.now()
+  } finally {
+    unlockQueue()
+  }
+}
+
 const cloneJson = (value) => JSON.parse(JSON.stringify(value))
+
+const markCdsDeclarationUnavailable = (item) => {
+  if (!Object.prototype.hasOwnProperty.call(item ?? {}, 'declaracion_cds')) {
+    item.declaracion_cds = {
+      estado: 'consulta_incompleta',
+      truncado: false,
+      objetos: [],
+      destinos_declarados: [],
+    }
+    item.destinos_declarados = []
+  }
+}
+
+const enrichTrackingPackagesWithCds = async (items = []) => {
+  if (!Array.isArray(items) || items.length === 0) return null
+
+  const codeEntries = items
+    .map((item) => ({
+      item,
+      code: normalizePackageCodeForLookup(getPackageCodeFromItem(item)),
+    }))
+    .filter((entry) => entry.code)
+  if (codeEntries.length === 0) return null
+
+  const cdsApiDefaults = getCdsApiDefaults()
+  if (!cdsApiDefaults.token) {
+    codeEntries.forEach(({ item }) => markCdsDeclarationUnavailable(item))
+    return 'No se pudo consultar CDS: falta configurar el token independiente CDS_API_TOKEN.'
+  }
+
+  const codes = [...new Set(codeEntries.map((entry) => entry.code))]
+  const cdsUrl = new URL('/api/tracking/cds/declaraciones', cdsApiDefaults.baseUrl)
+  const recordsByCode = new Map()
+  let warning = null
+
+  for (let offset = 0; offset < codes.length; offset += 100) {
+    const batch = codes.slice(offset, offset + 100)
+    try {
+      await waitForCdsApiRateLimit()
+      const response = await fetchJsonWithTimeout(cdsUrl, {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ' + cdsApiDefaults.token,
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ codes: batch }),
+      }, 30000)
+      const payload = await response.json().catch(() => null)
+      if (!response.ok) {
+        throw new Error(`La API CDS respondió HTTP ${response.status}.`)
+      }
+
+      const records = Array.isArray(payload?.data) ? payload.data : []
+      for (const record of records) {
+        const code = normalizePackageCodeForLookup(record?.codigo)
+        if (code) recordsByCode.set(code, record)
+      }
+      if (records.length !== batch.length) {
+        warning = 'La API CDS no devolvió el resultado de todos los paquetes consultados.'
+      }
+    } catch (error) {
+      warning = error instanceof Error ? error.message : 'No se pudo consultar la API CDS.'
+      batch.forEach((code) => {
+        const record = codeEntries.find((entry) => entry.code === code)
+        if (record) markCdsDeclarationUnavailable(record.item)
+      })
+    }
+  }
+
+  for (const { item, code } of codeEntries) {
+    const cdsRecord = recordsByCode.get(code)
+    if (cdsRecord?.declaracion_cds) {
+      item.declaracion_cds = cdsRecord.declaracion_cds
+      item.destinos_declarados = Array.isArray(cdsRecord.destinos_declarados)
+        ? cdsRecord.destinos_declarados
+        : cdsRecord.declaracion_cds.destinos_declarados ?? []
+    } else {
+      markCdsDeclarationUnavailable(item)
+      warning ??= 'La API CDS no devolvió declaración para uno o más paquetes.'
+    }
+  }
+
+  return warning
+}
 
 const getContactPackagesApiDefaults = () => ({
   endpoint:
@@ -612,7 +736,7 @@ const fetchExactTrackingPackageMatch = async ({ url, headers, code }) => {
   let successfulLookup = false
   let lastErrorStatus = null
   let successfulUrl = null
-  const lookupUrls = [url]
+  const lookupUrls = [new URL(url.toString())]
   const fallbackUrl = new URL('/api/tracking/paquetes', getTrackingApiDefaults().fallbackBaseUrl)
   if (!lookupUrls.some((candidate) => candidate.origin === fallbackUrl.origin && candidate.pathname === fallbackUrl.pathname)) {
     lookupUrls.push(fallbackUrl)
@@ -1017,6 +1141,9 @@ app.get('/api/tracking/paquetes', cors(), authMiddleware, async (request, respon
       }
     }
 
+    const includeDeclaration = searchParams.get('include_declaration') !== '0'
+    searchParams.delete('include_declaration')
+
     upstreamUrl.search = searchParams.toString()
 
     const upstreamResponse = await fetchJsonWithTimeout(upstreamUrl, {
@@ -1057,6 +1184,9 @@ app.get('/api/tracking/paquetes', cors(), authMiddleware, async (request, respon
     }
 
     const payloadItems = getPaginatedPayloadItems(payload)
+    const declarationWarning = includeDeclaration
+      ? await enrichTrackingPackagesWithCds(payloadItems)
+      : null
     const requestedPage = Math.max(1, Number.parseInt(String(request.query.page), 10) || 1)
     const requestedPerPage = Math.max(1, Number.parseInt(String(request.query.per_page), 10) || 100)
     const effectivePerPage = Math.max(
@@ -1066,6 +1196,12 @@ app.get('/api/tracking/paquetes', cors(), authMiddleware, async (request, respon
 
     response.status(upstreamResponse.status).json({
       ...payload,
+      ...(declarationWarning
+        ? {
+            warning: declarationWarning,
+            declarationWarning,
+          }
+        : {}),
       pagination: {
         ...(payload?.pagination && typeof payload.pagination === 'object' ? payload.pagination : {}),
         page: Number(payload?.meta?.page ?? requestedPage),
@@ -1181,6 +1317,19 @@ app.get('/api/internacionales/paquetes-contactos', cors(), authMiddleware, async
 })
 
 const normalizeReference = (value) => String(value ?? '').trim()
+const getSafeDeclaredDepartment = (value) => {
+  const department = normalizeReference(value)
+  if (!department) return ''
+
+  const containsPhoneLabel = /\b(?:tel(?:[ée]fono)?|cel(?:ular)?|m[oó]vil|whatsapp|phone)\b/i.test(department)
+  const digitCount = department.replace(/\D/g, '').length
+  return containsPhoneLabel || digitCount >= 7 ? '' : department
+}
+const getCdsDeclarationField = (fields, fieldName) => {
+  if (!fields || typeof fields !== 'object' || Array.isArray(fields)) return ''
+  const entry = Object.entries(fields).find(([key]) => key.trim().toLowerCase() === fieldName.toLowerCase())
+  return normalizeReference(entry?.[1])
+}
 const normalizePhoneNumber = (value) => normalizeReference(value).replace(/[^\d]/g, '')
 const fetchAllContactPackagesCatalog = async ({ forceRefresh = false } = {}) => {
   const cacheKey = 'all'
@@ -1535,7 +1684,7 @@ const fetchRecentPackageEventCodes = async () => {
   return result.rows
     .map((row) => normalizePackageCodeForLookup(row.package_code))
     .filter(Boolean)
-    .slice(0, Number.parseInt(process.env.PACKAGE_RECENT_EVENT_CODE_LIMIT || '25', 10) || 25)
+    .slice(0, Number.parseInt(process.env.PACKAGE_RECENT_EVENT_CODE_LIMIT || '200', 10) || 200)
 }
 
 const fetchRecentContactPackageEventsByCode = async () => {
@@ -1652,7 +1801,12 @@ const fetchRecentPackageEventsByCode = async () => {
   return { events, failures }
 }
 
-const fetchAllPackageEventsCatalog = async ({ forceRefresh = false } = {}) => {
+const fetchAllPackageEventsCatalog = async ({
+  forceRefresh = false,
+  cacheResult = true,
+  retainResults = true,
+  onPage = null,
+} = {}) => {
   reloadLocalEnv()
   if (!hasDedicatedPackageEventsApiConfig()) {
     return {
@@ -1666,13 +1820,13 @@ const fetchAllPackageEventsCatalog = async ({ forceRefresh = false } = {}) => {
 
   const cacheKey = 'all'
   const cachedEvents = getCachedValue(packageEventsCache, cacheKey)
-  if (!forceRefresh && cachedEvents) {
+  if (!forceRefresh && cacheResult && cachedEvents) {
     return cachedEvents
   }
 
   const inFlightCacheKey = `${cacheKey}-in-flight`
   const pendingEvents = getCachedValue(packageEventsCache, inFlightCacheKey)
-  if (!forceRefresh && pendingEvents) {
+  if (!forceRefresh && cacheResult && pendingEvents) {
     return pendingEvents
   }
 
@@ -1690,24 +1844,28 @@ const fetchAllPackageEventsCatalog = async ({ forceRefresh = false } = {}) => {
     perPage: 200,
     maxPages: 2000,
     timeoutMs,
+    onPage,
+    retainItems: retainResults,
   })
-    .then((data) =>
-      setCachedValue(
-        packageEventsCache,
-        cacheKey,
-        {
-          data,
-          total: data.length,
-          cachedAt: new Date().toISOString(),
-        },
-        CONTACT_PACKAGES_CATALOG_TTL_MS,
-      ),
-    )
+    .then((data) => {
+      const catalog = {
+        data,
+        total: data.length,
+        cachedAt: new Date().toISOString(),
+      }
+      return cacheResult
+        ? setCachedValue(packageEventsCache, cacheKey, catalog, CONTACT_PACKAGES_CATALOG_TTL_MS)
+        : catalog
+    })
     .finally(() => {
-      packageEventsCache.delete(inFlightCacheKey)
+      if (cacheResult) {
+        packageEventsCache.delete(inFlightCacheKey)
+      }
     })
 
-  setCachedValue(packageEventsCache, inFlightCacheKey, catalogPromise, CONTACT_PACKAGES_CATALOG_TTL_MS)
+  if (cacheResult) {
+    setCachedValue(packageEventsCache, inFlightCacheKey, catalogPromise, CONTACT_PACKAGES_CATALOG_TTL_MS)
+  }
   return catalogPromise
 }
 
@@ -2232,6 +2390,14 @@ const getStoredAutomationConfig = async () => {
       envValue: process.env.WHATSAPP_NEW_PACKAGE_WATCHER_ENABLED,
       defaultValue: true,
     }),
+    automaticVentanillaNotifications: resolveAutomationBooleanSetting({
+      storedValue: settings.automaticVentanillaNotifications,
+      defaultValue: true,
+    }),
+    automaticInternationalArrivalTestNotifications: resolveAutomationBooleanSetting({
+      storedValue: settings.automaticInternationalArrivalTestNotifications,
+      defaultValue: true,
+    }),
     automaticReconciliation: resolveAutomationBooleanSetting({
       storedValue: settings.automaticReconciliation,
       defaultValue: true,
@@ -2273,6 +2439,10 @@ const getAutomationWatcherStatus = async () => {
            details->>'eventSkipped' as event_skipped,
            details->'eventSkippedByReason' as event_skipped_by_reason,
            details->>'eventReason' as event_reason,
+           details->>'ventanillaSent' as ventanilla_sent,
+           details->>'ventanillaSkipped' as ventanilla_skipped,
+           details->'ventanillaSkippedByReason' as ventanilla_skipped_by_reason,
+           details->>'ventanillaReason' as ventanilla_reason,
            details->'packageCountsBySource' as package_counts_by_source,
            details->'packageSourceFailures' as package_source_failures,
            details->'welcomeSkippedByReason' as welcome_skipped_by_reason
@@ -2304,6 +2474,10 @@ const getAutomationWatcherStatus = async () => {
              details->>'eventSkipped' as event_skipped,
              details->'eventSkippedByReason' as event_skipped_by_reason,
              details->>'eventReason' as event_reason,
+             details->>'ventanillaSent' as ventanilla_sent,
+             details->>'ventanillaSkipped' as ventanilla_skipped,
+             details->'ventanillaSkippedByReason' as ventanilla_skipped_by_reason,
+             details->>'ventanillaReason' as ventanilla_reason,
              details->'sourceFailures' as source_failures,
              details->'notificationFailures' as notification_failures
       from system_logs
@@ -2353,6 +2527,10 @@ const getAutomationWatcherStatus = async () => {
           eventSkipped: Number(row.event_skipped) || 0,
           eventSkippedByReason: row.event_skipped_by_reason ?? {},
           eventReason: row.event_reason ?? null,
+          ventanillaSent: Number(row.ventanilla_sent) || 0,
+          ventanillaSkipped: Number(row.ventanilla_skipped) || 0,
+          ventanillaSkippedByReason: row.ventanilla_skipped_by_reason ?? {},
+          ventanillaReason: row.ventanilla_reason ?? null,
           packageCountsBySource: row.package_counts_by_source ?? {},
           packageSourceFailures: row.package_source_failures ?? [],
           welcomeSkippedByReason: row.welcome_skipped_by_reason ?? {},
@@ -2381,6 +2559,10 @@ const getAutomationWatcherStatus = async () => {
             eventSkipped: Number(latestReconciliation.event_skipped) || 0,
             eventSkippedByReason: latestReconciliation.event_skipped_by_reason ?? {},
             eventReason: latestReconciliation.event_reason ?? null,
+            ventanillaSent: Number(latestReconciliation.ventanilla_sent) || 0,
+            ventanillaSkipped: Number(latestReconciliation.ventanilla_skipped) || 0,
+            ventanillaSkippedByReason: latestReconciliation.ventanilla_skipped_by_reason ?? {},
+            ventanillaReason: latestReconciliation.ventanilla_reason ?? null,
             sourceFailures: latestReconciliation.source_failures ?? [],
             notificationFailures: latestReconciliation.notification_failures ?? [],
           }
@@ -2424,6 +2606,12 @@ app.put('/api/settings/automation', authMiddleware, async (request, response) =>
       ...(typeof body.automaticWelcome === 'boolean' ? { automaticWelcome: body.automaticWelcome } : {}),
       ...(typeof body.automaticStatusUpdates === 'boolean'
         ? { automaticStatusUpdates: body.automaticStatusUpdates }
+        : {}),
+      ...(typeof body.automaticVentanillaNotifications === 'boolean'
+        ? { automaticVentanillaNotifications: body.automaticVentanillaNotifications }
+        : {}),
+      ...(typeof body.automaticInternationalArrivalTestNotifications === 'boolean'
+        ? { automaticInternationalArrivalTestNotifications: body.automaticInternationalArrivalTestNotifications }
         : {}),
       ...(typeof body.automaticReconciliation === 'boolean'
         ? { automaticReconciliation: body.automaticReconciliation }
@@ -2846,10 +3034,23 @@ const getInternationalIpsStageFromEvent = (event) => {
   const eventId = Number(
     event?.evento_id ?? event?.codigo_evento ?? event?.event_code ?? event?.event_type_cd ?? event?.event_id,
   )
+  const eventText = normalizeReference(
+    [
+      event?.nombre,
+      event?.evento_api,
+      event?.evento_original,
+      event?.event_name,
+      event?.movimiento_bolivia,
+      event?.detalle,
+    ]
+      .filter(Boolean)
+      .join(' '),
+  ).toLowerCase()
   if (eventId === 37) return 'delivered'
   if (eventId === 76) return 'cancelled'
   if ([32, 36, 39, 73, 74, 75].includes(eventId)) return 'courier'
   if ([13, 14, 35, 71, 72].includes(eventId)) return 'regional'
+  if (eventId === 38 && (eventText.includes('devol') || eventText.includes('return'))) return 'cancelled'
   if ([31, 34, 38].includes(eventId)) return 'transit'
   if ([1, 2, 3, 8, 12, 30].includes(eventId)) return 'received'
 
@@ -2868,6 +3069,11 @@ const getRegisteredLatestPackageEvent = (events = []) => {
 const buildLatestPackageEventsByCode = (events = []) => {
   const latestEventsByCode = new Map()
 
+  addLatestPackageEventsToCodeMap(latestEventsByCode, events)
+  return latestEventsByCode
+}
+
+const addLatestPackageEventsToCodeMap = (latestEventsByCode, events = []) => {
   ;(Array.isArray(events) ? events : []).forEach((event) => {
     const eventCodes = getPackageEventCodeValuesForLookup(event)
     eventCodes.forEach((code) => {
@@ -2879,71 +3085,17 @@ const buildLatestPackageEventsByCode = (events = []) => {
       }
     })
   })
-
-  return latestEventsByCode
 }
 
-const getNationalPackageStageFromEvent = (event) => {
-  if (!event) return null
-
-  const eventText = normalizeReference(
-    [event?.nombre, event?.evento_api, event?.evento_original, event?.movimiento_bolivia, event?.detalle]
-      .filter(Boolean)
-      .join(' '),
-  ).toLowerCase()
-
-  if (isPackageReturnToOriginEvent({ eventLabel: eventText })) return 'cancelled'
-
-  const eventId = Number(event?.evento_id ?? event?.codigo_evento)
-  if ([318, 295, 2239, 2240, 2241, 297, 2242].includes(eventId)) return 'received'
-  if ([168, 240, 296].includes(eventId)) return 'transit'
-  if ([310, 312, 183, 4410, 2103, 4405, 4404, 3345, 4400].includes(eventId)) return 'regional'
-  if ([4409, 315].includes(eventId)) return 'courier'
-  if (eventId === 316) return 'delivered'
-  if (eventId === 4402) return 'cancelled'
-
-  if (eventText.includes('cartero') || eventText.includes('reparto')) return 'courier'
-  if (
-    eventText.includes('listo para entregar') ||
-    eventText.includes('oficina de entrega') ||
-    eventText.includes('ventanilla') ||
-    eventText.includes('pendiente de recojo') ||
-    eventText.includes('pendiente de entrega') ||
-    eventText.includes('solicitud de recojo') ||
-    eventText.includes('listo para recoger')
-  ) {
-    return 'regional'
-  }
-  if (eventText.includes('cancel') || eventText.includes('anul') || eventText.includes('rechaz')) return 'cancelled'
-  if (eventText.includes('devuelto')) return 'cancelled'
-  if (eventText.includes('entreg')) return 'delivered'
-  if (
-    eventText.includes('recibido en oficina') ||
-    eventText.includes('recibida en oficina') ||
-    eventText.includes('oficina destino') ||
-    eventText.includes('sucursal de destino') ||
-    eventText.includes('recibido destino') ||
-    eventText.includes('recibido regional')
-  ) {
-    return 'regional'
-  }
-  if (eventText.includes('saca interna') || eventText.includes('salida') || eventText.includes('transito')) return 'transit'
-  if (eventText.includes('recibido') || eventText.includes('origen')) return 'received'
-
-  return null
-}
+const getNationalPackageStageFromEvent = (event, hasPreviousTransit = false) =>
+  getNationalPackageEventStage({ event, hasPreviousTransit })
 
 const getPackageStageFromEvents = (item) => {
   const events = Array.isArray(item?.eventos) ? item.eventos.filter(Boolean) : []
   const latestEvent = getPackageLatestEvent(item)
-  const latestEventId = Number(latestEvent?.evento_id ?? latestEvent?.codigo_evento)
   const hasPreviousTransit = events.some((event) => getNationalPackageStageFromEvent(event) === 'transit')
 
-  if (latestEventId === 297 && hasPreviousTransit) {
-    return 'regional'
-  }
-
-  return getNationalPackageStageFromEvent(latestEvent)
+  return getNationalPackageStageFromEvent(latestEvent, hasPreviousTransit)
 }
 
 const hasContactPackageTransfer = (item) => {
@@ -2994,6 +3146,9 @@ const getMostAdvancedPackageStage = (...stages) =>
 
 const inferTrackingPackageStage = (item) => {
   const latestEvent = getTrackingLatestEvent(item)
+  const statusStage = normalizeEmsStatus(item?.estado_postal)
+  if (statusStage === 'cancelled') return statusStage
+
   const ipsStage = getInternationalIpsStageFromEvent(latestEvent)
   if (ipsStage) return ipsStage
 
@@ -3054,6 +3209,30 @@ const getPackageEventSignature = (event) => {
     ),
   })
 }
+
+const getInternationalArrivalEventFromEvents = (events = []) =>
+  (Array.isArray(events) ? events : [])
+    .filter((event) =>
+      isInternationalArrivalEvent(
+        [
+          getPackageEventLabel(event),
+          getPackageEventSignature(event),
+          event?.movimiento_bolivia,
+          event?.detalle,
+        ]
+          .filter(Boolean)
+          .join(' '),
+      ),
+    )
+    .sort((firstEvent, secondEvent) =>
+      getPackageEventTimestampValue(secondEvent) - getPackageEventTimestampValue(firstEvent),
+    )[0] ?? null
+
+const getInternationalArrivalEventFromItem = (item, registeredLatestEvent = null) =>
+  getInternationalArrivalEventFromEvents([
+    registeredLatestEvent,
+    ...(Array.isArray(item?.eventos) ? item.eventos : []),
+  ].filter(Boolean))
 
 const inferContactPackageStage = (item) => {
   const statusText = normalizeReference(item?.estado?.nombre)
@@ -3448,10 +3627,18 @@ const persistInternationalTrackingCatalog = async (items = []) => {
 const fetchAllTrackingPackagesCatalog = async ({ forceRefresh = false } = {}) => {
   const cacheKey = 'all'
   const cachedCatalog = getCachedValue(packagePipelineSyncCache, cacheKey)
-  if (!forceRefresh && cachedCatalog && Array.isArray(cachedCatalog.data) && cachedCatalog.data.length > 0) {
+  const cachedCatalogIncludesDeclarations =
+    Array.isArray(cachedCatalog?.data) &&
+    cachedCatalog.data.every((item) => Object.prototype.hasOwnProperty.call(item ?? {}, 'declaracion_cds'))
+  if (
+    !forceRefresh &&
+    cachedCatalogIncludesDeclarations &&
+    Array.isArray(cachedCatalog.data) &&
+    cachedCatalog.data.length > 0
+  ) {
     return cachedCatalog
   }
-  if (cachedCatalog && (!Array.isArray(cachedCatalog.data) || cachedCatalog.data.length === 0)) {
+  if (cachedCatalog && !cachedCatalogIncludesDeclarations) {
     packagePipelineSyncCache.delete(cacheKey)
   }
 
@@ -3465,6 +3652,7 @@ const fetchAllTrackingPackagesCatalog = async ({ forceRefresh = false } = {}) =>
 
   const trackingApiDefaults = getTrackingApiDefaults()
   const trackingUrl = new URL('/api/tracking/paquetes', trackingApiDefaults.baseUrl)
+  let declarationWarning = null
 
   const catalogPromise = fetchAllPaginatedItems({
     url: trackingUrl,
@@ -3479,7 +3667,10 @@ const fetchAllTrackingPackagesCatalog = async ({ forceRefresh = false } = {}) =>
     throwOnAnyPageError: true,
     minimumPageIntervalMs: 2500,
     maxRateLimitRetries: 6,
-    onPage: async (pageItems) => persistInternationalTrackingCatalog(pageItems),
+    onPage: async (pageItems) => {
+      declarationWarning ??= await enrichTrackingPackagesWithCds(pageItems)
+      await persistInternationalTrackingCatalog(pageItems)
+    },
   })
     .then(async (items) => {
       if (items.length === 0) {
@@ -3492,6 +3683,7 @@ const fetchAllTrackingPackagesCatalog = async ({ forceRefresh = false } = {}) =>
           data: items,
           total: items.length,
           cachedAt: new Date().toISOString(),
+          ...(declarationWarning ? { warning: declarationWarning } : {}),
         },
         CONTACT_PACKAGES_CATALOG_TTL_MS,
       )
@@ -3526,7 +3718,10 @@ const seedInternationalPipelineCatalog = async () => {
     maxPages: 5000,
     trustReportedTotal: false,
     throwOnFirstPageError: true,
-    onPage: async (pageItems) => persistInternationalTrackingCatalog(pageItems),
+    onPage: async (pageItems) => {
+      await enrichTrackingPackagesWithCds(pageItems)
+      await persistInternationalTrackingCatalog(pageItems)
+    },
   }).finally(() => {
     internationalPipelineSeedPromise = null
   })
@@ -3972,6 +4167,7 @@ const buildTrackingPackageSyncEntry = ({ item, latestEventsByCode = new Map() })
 
   const registeredLatestEvent = latestEventsByCode.get(normalizePackageCodeForLookup(code))
   const latestEvent = registeredLatestEvent ?? getTrackingLatestEvent(item)
+  const internationalArrivalEvent = getInternationalArrivalEventFromItem(item, registeredLatestEvent)
   const stage = inferTrackingPackageStage({
     ...item,
     eventos: registeredLatestEvent
@@ -4005,6 +4201,10 @@ const buildTrackingPackageSyncEntry = ({ item, latestEventsByCode = new Map() })
     latestEventLocation: getPackageEventLocation(latestEvent),
     latestEventDate: normalizeReference(latestEvent?.fecha),
     latestEventSignature: getPackageEventSignature(latestEvent),
+    internationalArrivalEventLabel: getPackageEventLabel(internationalArrivalEvent),
+    internationalArrivalEventLocation: getPackageEventLocation(internationalArrivalEvent),
+    internationalArrivalEventDate: normalizeReference(internationalArrivalEvent?.fecha),
+    internationalArrivalEventSignature: getPackageEventSignature(internationalArrivalEvent),
     sources: ['Tracking'],
     phoneCandidates: allPhoneCandidates,
     phoneNames: getPackageSyncPhoneNames(item, 'tracking'),
@@ -4027,6 +4227,63 @@ const syncPackagePipelineFromApis = async ({ reconciliation = false } = {}) => {
   let latestEventsByCode = new Map()
   const packageEventSourceFailures = []
   const testModePackagePhones = new Map()
+  let trackingItemsCount = 0
+  let contactPackageCatalogCount = 0
+  const packageEntriesByCode = new Map()
+  const registerEntry = (entry) => {
+    if (!entry?.code) return
+
+    const existing = packageEntriesByCode.get(entry.code)
+    if (!existing) {
+      packageEntriesByCode.set(entry.code, {
+        ...entry,
+        sources: new Set(entry.sources ?? []),
+        phoneCandidates: new Set(entry.phoneCandidates ?? []),
+        phoneNames: new Map(entry.phoneNames ?? []),
+      })
+      return
+    }
+
+    existing.sources = new Set([...(existing.sources ?? []), ...(entry.sources ?? [])])
+    existing.phoneCandidates = new Set([...(existing.phoneCandidates ?? []), ...(entry.phoneCandidates ?? [])])
+    existing.phoneNames = new Map([...(existing.phoneNames ?? []), ...(entry.phoneNames ?? [])])
+    if (!normalizeReference(existing.internationalArrivalEventSignature) &&
+      normalizeReference(entry.internationalArrivalEventSignature)) {
+      existing.internationalArrivalEventLabel = entry.internationalArrivalEventLabel
+      existing.internationalArrivalEventLocation = entry.internationalArrivalEventLocation
+      existing.internationalArrivalEventDate = entry.internationalArrivalEventDate
+      existing.internationalArrivalEventSignature = entry.internationalArrivalEventSignature
+    }
+
+    const entryEventTimestamp = Number(entry.latestEventTimestamp) || 0
+    const existingEventTimestamp = Number(existing.latestEventTimestamp) || 0
+    const hasComparableEventTimestamps = entryEventTimestamp > 0 || existingEventTimestamp > 0
+    const shouldReplace = hasComparableEventTimestamps
+      ? entryEventTimestamp > existingEventTimestamp ||
+        (entryEventTimestamp === existingEventTimestamp &&
+          getPackageSyncEntrySpecificity(entry) > getPackageSyncEntrySpecificity(existing))
+      : entry.updatedAt > existing.updatedAt ||
+        (entry.updatedAt === existing.updatedAt &&
+          getPackageSyncEntrySpecificity(entry) > getPackageSyncEntrySpecificity(existing))
+
+    if (shouldReplace) {
+      packageEntriesByCode.set(entry.code, {
+        ...existing,
+        ...entry,
+        internationalArrivalEventLabel:
+          entry.internationalArrivalEventLabel ?? existing.internationalArrivalEventLabel,
+        internationalArrivalEventLocation:
+          entry.internationalArrivalEventLocation ?? existing.internationalArrivalEventLocation,
+        internationalArrivalEventDate:
+          entry.internationalArrivalEventDate ?? existing.internationalArrivalEventDate,
+        internationalArrivalEventSignature:
+          entry.internationalArrivalEventSignature ?? existing.internationalArrivalEventSignature,
+        sources: existing.sources,
+        phoneCandidates: existing.phoneCandidates,
+        phoneNames: existing.phoneNames,
+      })
+    }
+  }
 
   if (testModeEnabled) {
     const trackingApiDefaults = getTrackingApiDefaults()
@@ -4160,71 +4417,78 @@ const syncPackagePipelineFromApis = async ({ reconciliation = false } = {}) => {
       )
     }
   } else {
-    ;[trackingItems, contactPackageCatalog, latestEventsByCode] = await Promise.all([
-      fetchAllTrackingPackagesCatalog({ forceRefresh: true }).then((payload) => payload.data ?? []),
-      fetchAllContactPackagesCatalog({ forceRefresh: true }).then((payload) => payload.data ?? []),
-      fetchAllPackageEventsCatalog({ forceRefresh: true })
-        .then((payload) => {
-          if (payload.skipped) packageEventSourceFailures.push('eventos-api-no-configurada')
-          return buildLatestPackageEventsByCode(payload.data ?? [])
-        })
-        .catch(() => {
-          packageEventSourceFailures.push('eventos-api-no-disponible')
-          return new Map()
-        }),
-    ])
+    const events = await fetchAllPackageEventsCatalog({
+      forceRefresh: true,
+      cacheResult: false,
+      retainResults: false,
+      onPage: (pageItems) => addLatestPackageEventsToCodeMap(latestEventsByCode, pageItems),
+    }).catch(() => {
+      packageEventSourceFailures.push('eventos-api-no-disponible')
+      return null
+    })
+    if (events?.skipped) packageEventSourceFailures.push('eventos-api-no-configurada')
+
+    const trackingApiDefaults = getTrackingApiDefaults()
+    const trackingUrl = new URL('/api/tracking/paquetes', trackingApiDefaults.baseUrl)
+    const trackingHeaders = {
+      Authorization: `Bearer ${trackingApiDefaults.token}`,
+      Accept: 'application/json',
+    }
+    await fetchAllPaginatedItems({
+      url: trackingUrl,
+      headers: trackingHeaders,
+      perPage: 200,
+      maxPages: 5000,
+      trustReportedTotal: false,
+      throwOnFirstPageError: true,
+      throwOnAnyPageError: true,
+      minimumPageIntervalMs: 2500,
+      maxRateLimitRetries: 6,
+      retainItems: false,
+      onPage: async (pageItems) => {
+        trackingItemsCount += pageItems.length
+        await persistInternationalTrackingCatalog(pageItems)
+        for (const item of pageItems) {
+          registerEntry(buildTrackingPackageSyncEntry({ item, latestEventsByCode }))
+        }
+      },
+    })
+
+    const contactPackagesApiDefaults = getContactPackagesApiDefaults()
+    const contactPackagesUrl = new URL(contactPackagesApiDefaults.endpoint)
+    const contactPackagesTimeoutMs = Number.parseInt(
+      process.env.CONTACT_PACKAGES_CATALOG_TIMEOUT_MS || '30000',
+      10,
+    )
+    await fetchAllPaginatedItems({
+      url: contactPackagesUrl,
+      headers: {
+        Authorization: `Bearer ${contactPackagesApiDefaults.token}`,
+        Accept: 'application/json',
+      },
+      perPage: 200,
+      maxPages: 2000,
+      timeoutMs: contactPackagesTimeoutMs,
+      retainItems: false,
+      onPage: (pageItems) => {
+        contactPackageCatalogCount += pageItems.length
+        for (const item of pageItems) {
+          registerEntry(buildContactPackageSyncEntry({ item, latestEventsByCode }))
+        }
+      },
+    })
   }
 
-  const packageEntriesByCode = new Map()
-  const registerEntry = (entry) => {
-    if (!entry?.code) return
-
-    const existing = packageEntriesByCode.get(entry.code)
-    if (!existing) {
-      packageEntriesByCode.set(entry.code, {
-        ...entry,
-        sources: new Set(entry.sources ?? []),
-        phoneCandidates: new Set(entry.phoneCandidates ?? []),
-        phoneNames: new Map(entry.phoneNames ?? []),
-      })
-      return
-    }
-
-    existing.sources = new Set([...(existing.sources ?? []), ...(entry.sources ?? [])])
-    existing.phoneCandidates = new Set([...(existing.phoneCandidates ?? []), ...(entry.phoneCandidates ?? [])])
-    existing.phoneNames = new Map([...(existing.phoneNames ?? []), ...(entry.phoneNames ?? [])])
-
-    const entryEventTimestamp = Number(entry.latestEventTimestamp) || 0
-    const existingEventTimestamp = Number(existing.latestEventTimestamp) || 0
-    const hasComparableEventTimestamps = entryEventTimestamp > 0 || existingEventTimestamp > 0
-    const shouldReplace = hasComparableEventTimestamps
-      ? entryEventTimestamp > existingEventTimestamp ||
-        (entryEventTimestamp === existingEventTimestamp &&
-          getPackageSyncEntrySpecificity(entry) > getPackageSyncEntrySpecificity(existing))
-      : entry.updatedAt > existing.updatedAt ||
-        (entry.updatedAt === existing.updatedAt &&
-          getPackageSyncEntrySpecificity(entry) > getPackageSyncEntrySpecificity(existing))
-
-    if (shouldReplace) {
-      packageEntriesByCode.set(entry.code, {
-        ...existing,
-        ...entry,
-        sources: existing.sources,
-        phoneCandidates: existing.phoneCandidates,
-        phoneNames: existing.phoneNames,
-      })
-    }
+  if (testModeEnabled) {
+    trackingItemsCount = trackingItems.length
+    contactPackageCatalogCount = contactPackageCatalog.length
+    trackingItems.forEach((item) => {
+      registerEntry(buildTrackingPackageSyncEntry({ item, latestEventsByCode }))
+    })
+    contactPackageCatalog.forEach((item) => {
+      registerEntry(buildContactPackageSyncEntry({ item, latestEventsByCode }))
+    })
   }
-
-  trackingItems.forEach((item) => {
-    const entry = buildTrackingPackageSyncEntry({ item, latestEventsByCode })
-    if (entry) registerEntry(entry)
-  })
-
-  contactPackageCatalog.forEach((item) => {
-    const entry = buildContactPackageSyncEntry({ item, latestEventsByCode })
-    if (entry) registerEntry(entry)
-  })
 
   if (testModeEnabled) {
     for (const [code, entry] of packageEntriesByCode) {
@@ -4296,7 +4560,6 @@ const syncPackagePipelineFromApis = async ({ reconciliation = false } = {}) => {
     }
   }
 
-  const packageEntries = [...packageEntriesByCode.values()]
   const client = await pool.connect()
   const syncedAt = new Date().toISOString()
   let createdCount = 0
@@ -4306,7 +4569,7 @@ const syncPackagePipelineFromApis = async ({ reconciliation = false } = {}) => {
   try {
     await client.query('begin')
 
-    for (const entry of packageEntries) {
+    for (const entry of packageEntriesByCode.values()) {
       const nextResult = await upsertPackageContact(client, entry)
       if (nextResult?.action === 'created') {
         createdCount += 1
@@ -4314,7 +4577,9 @@ const syncPackagePipelineFromApis = async ({ reconciliation = false } = {}) => {
         updatedCount += 1
       }
       if (nextResult?.id) {
-        syncedEntries.push({ ...entry, contactId: nextResult.id, action: nextResult.action })
+        entry.contactId = nextResult.id
+        entry.action = nextResult.action
+        syncedEntries.push(entry)
       }
     }
 
@@ -4330,10 +4595,10 @@ const syncPackagePipelineFromApis = async ({ reconciliation = false } = {}) => {
     event: 'package_pipeline_sync_completed',
     statusCode: 200,
     details: {
-      total: packageEntries.length,
+      total: packageEntriesByCode.size,
       packageCountsBySource: {
-        tracking: trackingItems.length,
-        contact: contactPackageCatalog.length,
+        tracking: trackingItemsCount,
+        contact: contactPackageCatalogCount,
       },
       packageEventSourceFailures,
       createdCount,
@@ -4375,7 +4640,10 @@ const syncPackagePipelineFromApis = async ({ reconciliation = false } = {}) => {
     })
   }
 
-  const eventNotificationResult = await notifyPackageEventChanges(syncedEntries, { requireWelcome: false }).catch(async (error) => {
+  const eventNotificationResult = await notifyPackageEventChanges(syncedEntries, {
+    requireWelcome: false,
+    eventType: 'general',
+  }).catch(async (error) => {
     await writeSystemLog({
       level: 'error',
       event: 'package_event_change_notification_failed',
@@ -4391,78 +4659,150 @@ const syncPackagePipelineFromApis = async ({ reconciliation = false } = {}) => {
     }
   })
 
+  const internationalArrivalNotificationResult = await notifyPackageEventChanges(syncedEntries, {
+    requireWelcome: false,
+    eventType: 'international-arrival-test',
+  }).catch(async (error) => {
+    await writeSystemLog({
+      level: 'error',
+      event: 'whatsapp_international_arrival_test_notification_failed',
+      statusCode: 500,
+      details: {
+        error: error instanceof Error ? error.message : 'Error desconocido.',
+      },
+    }).catch(() => {})
+    return {
+      sent: 0,
+      skipped: syncedEntries.length,
+      error: error instanceof Error ? error.message : 'Error desconocido.',
+    }
+  })
+
+  const ventanillaNotificationResult = await notifyPackageEventChanges(syncedEntries, {
+    requireWelcome: false,
+    eventType: 'ventanilla',
+  }).catch(async (error) => {
+    await writeSystemLog({
+      level: 'error',
+      event: 'package_ventanilla_notification_failed',
+      statusCode: 500,
+      details: {
+        error: error instanceof Error ? error.message : 'Error desconocido.',
+      },
+    }).catch(() => {})
+    return {
+      sent: 0,
+      skipped: syncedEntries.length,
+      error: error instanceof Error ? error.message : 'Error desconocido.',
+    }
+  })
+
   console.log(
     `Notificaciones de eventos: ${eventNotificationResult.sent} enviado(s), ${eventNotificationResult.skipped} omitido(s).`,
+  )
+  console.log(
+    `Avisos de llegada internacional al numero de prueba: ${internationalArrivalNotificationResult.sent} enviado(s), ${internationalArrivalNotificationResult.skipped} omitido(s).`,
+  )
+  console.log(
+    `Notificaciones de ventanilla: ${ventanillaNotificationResult.sent} enviado(s), ${ventanillaNotificationResult.skipped} omitido(s).`,
   )
 
   return {
     syncedAt,
     createdCount,
     updatedCount,
-    total: packageEntries.length,
+    total: packageEntriesByCode.size,
     packageCountsBySource: {
-      tracking: trackingItems.length,
-      contact: contactPackageCatalog.length,
+      tracking: trackingItemsCount,
+      contact: contactPackageCatalogCount,
     },
     packageSourceFailures: packageEventSourceFailures,
     newPackageWelcome: newPackageWelcomeResult,
     eventNotifications: eventNotificationResult,
+    internationalArrivalNotifications: internationalArrivalNotificationResult,
+    ventanillaNotifications: ventanillaNotificationResult,
   }
 }
 
-const syncRecentPackageAutomations = async ({ sendWelcome = true, sendEvents = true } = {}) => {
+const syncRecentPackageAutomations = async ({
+  sendWelcome = true,
+  sendEvents = true,
+  sendVentanillaEvents = true,
+} = {}) => {
   await ensureDatabaseReady()
 
   const automationConfig = await getStoredAutomationConfig()
   const shouldSendWelcome = sendWelcome && automationConfig.automaticWelcome
   const shouldSendEvents = sendEvents && automationConfig.automaticStatusUpdates
+  const shouldSendInternationalArrivalNotifications =
+    sendEvents && automationConfig.automaticInternationalArrivalTestNotifications
+  const shouldSendVentanillaEvents =
+    sendVentanillaEvents && automationConfig.automaticVentanillaNotifications
 
-  if (!shouldSendWelcome && !shouldSendEvents) {
+  if (
+    !shouldSendWelcome &&
+    !shouldSendEvents &&
+    !shouldSendInternationalArrivalNotifications &&
+    !shouldSendVentanillaEvents
+  ) {
     return {
       syncedAt: new Date().toISOString(),
       total: 0,
       createdCount: 0,
       newPackageWelcome: { sent: 0, skipped: 0, reason: 'new-package-welcome-disabled' },
       eventNotifications: { sent: 0, skipped: 0, reason: 'automatic-status-updates-disabled' },
+      internationalArrivalNotifications: {
+        sent: 0,
+        skipped: 0,
+        reason: 'international-arrival-test-notifications-disabled',
+      },
+      ventanillaNotifications: { sent: 0, skipped: 0, reason: 'automatic-ventanilla-notifications-disabled' },
     }
   }
 
   let recentContactItems = []
   let recentTrackingItems = []
   const packageSourceFailures = []
-  if (shouldSendWelcome) {
-    const [contactResult, trackingResult] = await Promise.allSettled([
-      fetchRecentContactPackagesCatalog(),
+  if (shouldSendWelcome || shouldSendInternationalArrivalNotifications) {
+    const contactResult = shouldSendWelcome
+      ? fetchRecentContactPackagesCatalog()
+      : Promise.resolve([])
+    const [contactLookup, trackingLookup] = await Promise.allSettled([
+      contactResult,
       fetchRecentTrackingPackagesCatalog(),
     ])
-    if (contactResult.status === 'fulfilled') {
-      recentContactItems = contactResult.value
+    if (contactLookup.status === 'fulfilled') {
+      recentContactItems = contactLookup.value
     } else {
       packageSourceFailures.push('paquetes-contactos')
       console.warn(
-        `Watcher WhatsApp: no se pudo consultar Paquetes-Contactos para bienvenidas: ${contactResult.reason instanceof Error ? contactResult.reason.message : 'Error desconocido.'}`,
+        `Watcher WhatsApp: no se pudo consultar Paquetes-Contactos: ${contactLookup.reason instanceof Error ? contactLookup.reason.message : 'Error desconocido.'}`,
       )
     }
-    if (trackingResult.status === 'fulfilled') {
-      recentTrackingItems = trackingResult.value
+    if (trackingLookup.status === 'fulfilled') {
+      recentTrackingItems = trackingLookup.value
     } else {
       packageSourceFailures.push('tracking')
       console.warn(
-        `Watcher WhatsApp: no se pudo consultar Tracking para bienvenidas: ${trackingResult.reason instanceof Error ? trackingResult.reason.message : 'Error desconocido.'}`,
+        `Watcher WhatsApp: no se pudo consultar Tracking: ${trackingLookup.reason instanceof Error ? trackingLookup.reason.message : 'Error desconocido.'}`,
       )
     }
-    if (contactResult.status === 'rejected' && trackingResult.status === 'rejected') {
-      throw new Error('No se pudieron consultar las fuentes de paquetes recientes para bienvenidas.')
+    if (contactLookup.status === 'rejected' && trackingLookup.status === 'rejected') {
+      throw new Error('No se pudieron consultar las fuentes de paquetes recientes.')
     }
   }
   const packageCountsBySource = {
     contact: recentContactItems.length,
     tracking: recentTrackingItems.length,
   }
-  const recentEvents = shouldSendEvents ? await fetchRecentPackageEventsCatalog() : []
+  const recentEvents =
+    shouldSendEvents || shouldSendInternationalArrivalNotifications || shouldSendVentanillaEvents
+    ? await fetchRecentPackageEventsCatalog()
+    : []
   const latestEventsByCode = buildLatestPackageEventsByCode(recentEvents)
 
   let eventPackageItems = []
+  let arrivalTrackingItems = []
   if (latestEventsByCode.size > 0) {
     const contactPackagesApiDefaults = getContactPackagesApiDefaults()
     const contactUrl = new URL(contactPackagesApiDefaults.endpoint)
@@ -4484,6 +4824,36 @@ const syncRecentPackageAutomations = async ({ sendWelcome = true, sendEvents = t
       ),
     )
     eventPackageItems = eventPackageResults.flatMap((result) => result.items ?? [])
+
+    if (shouldSendInternationalArrivalNotifications) {
+      const arrivalCodes = [...latestEventsByCode.entries()]
+        .filter(([, event]) =>
+          isInternationalArrivalEvent(
+            `${getPackageEventLabel(event)} ${getPackageEventSignature(event)}`,
+          ),
+        )
+        .map(([code]) => code)
+        .slice(0, Number.parseInt(process.env.PACKAGE_RECENT_EVENT_CODE_LIMIT || '200', 10) || 200)
+      const trackingApiDefaults = getTrackingApiDefaults()
+      const trackingUrl = new URL('/api/tracking/paquetes', trackingApiDefaults.baseUrl)
+      const trackingHeaders = {
+        Authorization: `Bearer ${trackingApiDefaults.token}`,
+        Accept: 'application/json',
+      }
+      const arrivalTrackingResults = await Promise.all(
+        arrivalCodes.map((code) =>
+          fetchExactPackageCodeMatches({
+            url: trackingUrl,
+            headers: trackingHeaders,
+            queryParam: 'q',
+            code,
+            perPage: 20,
+            timeoutMs: 8000,
+          }),
+        ),
+      )
+      arrivalTrackingItems = arrivalTrackingResults.flatMap((result) => result.items ?? [])
+    }
   }
 
   const recentEntriesByCode = new Map()
@@ -4494,13 +4864,24 @@ const syncRecentPackageAutomations = async ({ sendWelcome = true, sendEvents = t
     if (!lookupCode) continue
     recentEntriesByCode.set(lookupCode, entry)
   }
-  for (const item of recentTrackingItems) {
+  for (const item of [...recentTrackingItems, ...arrivalTrackingItems]) {
     const entry = buildTrackingPackageSyncEntry({ item, latestEventsByCode })
     if (!entry?.code) continue
     const lookupCode = normalizePackageCodeForLookup(entry.code)
     if (!lookupCode) continue
     const existingEntry = recentEntriesByCode.get(lookupCode)
     if (existingEntry) {
+      existingEntry.sources = [...new Set([
+        ...(existingEntry.sources ?? []),
+        ...(entry.sources ?? []),
+      ])]
+        if (!normalizeReference(existingEntry.internationalArrivalEventSignature) &&
+          normalizeReference(entry.internationalArrivalEventSignature)) {
+          existingEntry.internationalArrivalEventLabel = entry.internationalArrivalEventLabel
+          existingEntry.internationalArrivalEventLocation = entry.internationalArrivalEventLocation
+          existingEntry.internationalArrivalEventDate = entry.internationalArrivalEventDate
+          existingEntry.internationalArrivalEventSignature = entry.internationalArrivalEventSignature
+        }
       if (existingEntry.source === 'contact' && !existingEntry.primaryPhone) {
         existingEntry.primaryPhone = entry.welcomePhoneCandidates[0] || ''
         existingEntry.phoneNames = new Map([
@@ -4523,6 +4904,8 @@ const syncRecentPackageAutomations = async ({ sendWelcome = true, sendEvents = t
       packageSourceFailures,
       newPackageWelcome: { sent: 0, skipped: 0 },
       eventNotifications: { sent: 0, skipped: 0 },
+      internationalArrivalNotifications: { sent: 0, skipped: 0 },
+      ventanillaNotifications: { sent: 0, skipped: 0 },
     }
   }
 
@@ -4555,8 +4938,21 @@ const syncRecentPackageAutomations = async ({ sendWelcome = true, sendEvents = t
     ? await notifyNewPackageContacts(syncedEntries)
     : { sent: 0, skipped: syncedEntries.length, reason: 'new-package-welcome-not-due' }
   const eventNotifications = shouldSendEvents
-    ? await notifyPackageEventChanges(syncedEntries, { requireWelcome: false })
+    ? await notifyPackageEventChanges(syncedEntries, { requireWelcome: false, eventType: 'general' })
     : { sent: 0, skipped: syncedEntries.length, reason: 'automatic-status-updates-disabled' }
+  const internationalArrivalNotifications = shouldSendInternationalArrivalNotifications
+    ? await notifyPackageEventChanges(syncedEntries, {
+        requireWelcome: false,
+        eventType: 'international-arrival-test',
+      })
+    : {
+        sent: 0,
+        skipped: syncedEntries.length,
+        reason: 'international-arrival-test-notifications-disabled',
+      }
+  const ventanillaNotifications = shouldSendVentanillaEvents
+    ? await notifyPackageEventChanges(syncedEntries, { requireWelcome: false, eventType: 'ventanilla' })
+    : { sent: 0, skipped: syncedEntries.length, reason: 'automatic-ventanilla-notifications-disabled' }
 
   return {
     syncedAt: new Date().toISOString(),
@@ -4566,6 +4962,8 @@ const syncRecentPackageAutomations = async ({ sendWelcome = true, sendEvents = t
     packageSourceFailures,
     newPackageWelcome,
     eventNotifications,
+    internationalArrivalNotifications,
+    ventanillaNotifications,
   }
 }
 
@@ -4612,11 +5010,44 @@ const cleanPackagePlaceLabel = (value, fallback = '') => {
   return cleaned || fallback
 }
 
+const isInternationalDestinationLabel = (value) => {
+  const destination = normalizeReference(value)
+  if (!destination || destination.toLowerCase() === 'destino') return false
+  if (getBoliviaBranchLocation(destination)) return false
+  return !normalizeSearchText(destination).includes('bolivia')
+}
+
+const isBoliviaInternationalDispatchLocation = (value) => {
+  const location = normalizeSearchText(value)
+  return Boolean(location) &&
+    (
+      location.includes('bolpbb') ||
+      location.includes('la paz ems') ||
+      location.includes('bolivia') ||
+      location.includes('la paz')
+    )
+}
+
+const buildInternationalTransitMessage = ({ packageCode, destination, eventLocation }) => [
+  `Tenemos una actualizacion de tu paquete *${packageCode}*.`,
+  '',
+  `Tu paquete estuvo en *La Paz, Bolivia* y ya partio hacia *${destination}*.`,
+  eventLocation && !isBoliviaInternationalDispatchLocation(eventLocation)
+    ? `Ultimo registro operativo: ${eventLocation}.`
+    : 'Continua en transito internacional; te notificaremos cuando registre un nuevo movimiento.',
+].join('\n')
+
 const buildPackageEventChangeMessage = ({ contact, entry }) => {
   const contactName = normalizeReference(entry?.recipientName) || normalizeReference(contact?.name) || 'Hola'
   const packageCode = normalizeReference(entry?.code) || 'tu guia'
   const destination = cleanPackagePlaceLabel(entry?.destinationLabel, 'destino')
   const eventLabel = normalizeReference(entry?.latestEventLabel) || 'Nuevo movimiento registrado'
+  const arrivalMessage = buildInternationalArrivalMessage({
+    packageCode,
+    eventLabel: `${eventLabel} ${normalizeReference(entry?.latestEventSignature)}`,
+  })
+  if (arrivalMessage) return arrivalMessage
+
   const eventLocation = cleanPackagePlaceLabel(entry?.latestEventLocation)
   const eventDate = normalizeReference(entry?.latestEventDate)
   const destinationBranchText = formatBranchText(getBoliviaBranchLocation(destination))
@@ -4639,6 +5070,16 @@ const buildPackageEventChangeMessage = ({ contact, entry }) => {
     })
   }
 
+  const nationalDistributionMessage = buildNationalDistributionTrackingReply({
+    packageCode,
+    latestEventLabel: eventLabel,
+    latestEventSignature: entry?.latestEventSignature,
+    statusLabel: entry?.statusLabel || entry?.stage,
+  })
+  if (nationalDistributionMessage) {
+    return nationalDistributionMessage
+  }
+
   if (['received', 'transit', 'regional', 'courier', 'delivered', 'cancelled'].includes(entry?.stage)) {
     const origin = cleanPackagePlaceLabel(entry?.originLabel, 'origen')
     const baseTitle = `Â¡Hola, ${contactName}! ðŸ‘‹ Tenemos una actualizaciÃ³n de tu paquete *${packageCode}*.`
@@ -4653,6 +5094,11 @@ const buildPackageEventChangeMessage = ({ contact, entry }) => {
     }
 
     if (entry.stage === 'transit') {
+      if (isInternationalDestinationLabel(destination) &&
+        isBoliviaInternationalDispatchLocation(eventLocation)) {
+        return buildInternationalTransitMessage({ packageCode, destination, eventLocation })
+      }
+
       return [
         baseTitle,
         '',
@@ -4691,12 +5137,11 @@ const buildPackageEventChangeMessage = ({ contact, entry }) => {
       ].join('\n')
     }
 
-    return [
-      baseTitle,
-      '',
-      `âŒ Figura cancelado o devuelto${eventLocation ? ` en *${eventLocation}*` : ''}.`,
-      'ðŸ’¡ Si necesitas revisar el motivo, escribe *RECLAMO*.',
-    ].join('\n')
+    return buildPackageCancellationMessage({
+      contactName,
+      packageCode,
+      eventLocation,
+    })
   }
 
   if (entry?.stage === 'regional') {
@@ -4720,6 +5165,11 @@ const buildPackageEventChangeMessage = ({ contact, entry }) => {
 
   if (entry?.stage === 'transit') {
     const isInternalDispatch = normalizeSearchText(eventLabel).includes('saca interna')
+
+    if (isInternationalDestinationLabel(destination) &&
+      isBoliviaInternationalDispatchLocation(eventLocation)) {
+      return buildInternationalTransitMessage({ packageCode, destination, eventLocation })
+    }
 
     if (isInternalDispatch) {
       return [
@@ -4880,7 +5330,13 @@ const getNormalizedWhatsAppRecipients = (phones = []) =>
     .filter(isValidWhatsAppRecipientNumber)
     .filter((phone, index, normalizedPhones) => normalizedPhones.indexOf(phone) === index)
 
-const getPackageNotificationRecipients = ({ config, entry, phones = [] }) => {
+const getPackageNotificationRecipients = ({
+  config,
+  entry,
+  phones = [],
+  allowUnassociatedTestRecipients = false,
+  testRecipientsOnly = false,
+}) => {
   const testModeEnabled = normalizeBoolean(config?.testModeEnabled, whatsappDefaults.testModeEnabled)
   const packageRecipients = getNormalizedWhatsAppRecipients(phones)
   const testRecipients = getNormalizedWhatsAppRecipients(getConfiguredWhatsAppTestNumbers(config))
@@ -4895,6 +5351,8 @@ const getPackageNotificationRecipients = ({ config, entry, phones = [] }) => {
     packageRecipients,
     testRecipients,
     associatedPhones,
+    allowUnassociatedTestRecipients,
+    testRecipientsOnly: testModeEnabled && testRecipientsOnly,
   })
 }
 
@@ -4937,13 +5395,30 @@ const sendAndLogPackageWhatsAppMessage = async ({ config, contactId, recipient, 
   return providerMessageId
 }
 
-const notifyPackageEventChanges = async (entries = [], { requireWelcome = true } = {}) => {
+const notifyPackageEventChanges = async (
+  entries = [],
+  { requireWelcome = true, eventType = 'general' } = {},
+) => {
   const automationConfig = await getStoredAutomationConfig()
-  if (!WHATSAPP_STAGE_WATCHER_ENABLED && !automationConfig.automaticStatusUpdates) {
+  const notificationsEnabled =
+    eventType === 'ventanilla'
+      ? automationConfig.automaticVentanillaNotifications
+      : eventType === 'international-arrival-test'
+        ? automationConfig.automaticInternationalArrivalTestNotifications
+      : automationConfig.automaticStatusUpdates
+  if (!notificationsEnabled) {
     console.log(
-      `Actualizaciones de estado desactivadas; se leyeron ${entries.length} paquetes sin enviar mensajes.`,
+      `Notificaciones de ${eventType} desactivadas; se leyeron ${entries.length} paquetes sin enviar mensajes.`,
     )
-    return { sent: 0, skipped: entries.length, reason: 'automatic-status-updates-disabled' }
+    return {
+      sent: 0,
+      skipped: entries.length,
+      reason: eventType === 'ventanilla'
+        ? 'automatic-ventanilla-notifications-disabled'
+        : eventType === 'international-arrival-test'
+          ? 'international-arrival-test-notifications-disabled'
+        : 'automatic-status-updates-disabled',
+    }
   }
   const config = await getStoredWhatsAppConfig()
   const configError = validateWhatsAppConfig(config)
@@ -4965,6 +5440,7 @@ const notifyPackageEventChanges = async (entries = [], { requireWelcome = true }
       details: {
         packageCode: normalizePackageCodeForLookup(entry?.code),
         contactId: entry?.contactId ?? null,
+        notificationType: eventType,
         packageStage: entry?.stage ?? null,
         eventSignature: normalizeReference(entry?.latestEventSignature),
         reason,
@@ -4975,15 +5451,47 @@ const notifyPackageEventChanges = async (entries = [], { requireWelcome = true }
 
   for (const entry of entries) {
     const packageCode = normalizePackageCodeForLookup(entry?.code)
-    const eventSignature = normalizeReference(entry?.latestEventSignature)
+    const useInternationalArrivalEvent =
+      eventType === 'international-arrival-test' &&
+      normalizeReference(entry?.internationalArrivalEventSignature)
+    const notificationEventLabel = useInternationalArrivalEvent
+      ? entry.internationalArrivalEventLabel
+      : entry?.latestEventLabel
+    const notificationEventSignature = useInternationalArrivalEvent
+      ? entry.internationalArrivalEventSignature
+      : entry?.latestEventSignature
+    const eventSignature = normalizeReference(notificationEventSignature)
+    const hasTrackingSource = entry?.sources instanceof Set
+      ? entry.sources.has('Tracking')
+      : Array.isArray(entry?.sources) && entry.sources.includes('Tracking')
+    const isInternationalPackage = entry?.source === 'tracking' || hasTrackingSource
+
     if (!isPackageEventNotificationEligible({
       stage: entry?.stage,
-      eventLabel: entry?.latestEventLabel,
+      eventLabel: notificationEventLabel,
       eventSignature,
+      isInternationalPackage,
     })) {
       await recordSkipped(entry, 'ineligible-stage')
       continue
     }
+
+    const isCorrectNotificationType = isPackageEventForNotificationType({
+      eventLabel: notificationEventLabel,
+      eventSignature,
+      eventType,
+    })
+    if (!isCorrectNotificationType) {
+      await recordSkipped(
+        entry,
+        eventType === 'ventanilla' ? 'not-ventanilla-event' : 'handled-by-ventanilla-notification',
+      )
+      continue
+    }
+
+    const isInternationalArrival =
+      isInternationalPackage &&
+      isInternationalArrivalEvent(`${notificationEventLabel ?? ''} ${eventSignature}`)
 
     if (requireWelcome) {
       const welcomeResult = await pool.query(
@@ -5010,6 +5518,9 @@ const notifyPackageEventChanges = async (entries = [], { requireWelcome = true }
     const targetPhones = getPackageNotificationRecipients({
       config,
       entry,
+      allowUnassociatedTestRecipients:
+        eventType === 'international-arrival-test' && isInternationalArrival,
+      testRecipientsOnly: eventType === 'international-arrival-test',
       phones: (entry?.source === 'contact'
       ? (isDeliveredUpdate
           ? getEntryPhoneCandidates(entry)
@@ -5035,10 +5546,6 @@ const notifyPackageEventChanges = async (entries = [], { requireWelcome = true }
       continue
     }
 
-    console.log(
-      `[${packageCode}] Nuevo evento detectado: ${entry.latestEventLabel || 'sin descripciÃ³n'}; preparando mensaje para ${targetPhones.join(', ')}.`,
-    )
-
     const lastObservedResult = await pool.query(
       `
         select event, details
@@ -5055,11 +5562,16 @@ const notifyPackageEventChanges = async (entries = [], { requireWelcome = true }
     const baseDetails = {
       contactId: entry.contactId,
       packageCode,
+      notificationType: eventType,
       eventSignature,
       packageStage: entry.stage,
-      eventLabel: entry.latestEventLabel,
-      eventLocation: entry.latestEventLocation,
-      eventDate: entry.latestEventDate,
+      eventLabel: notificationEventLabel,
+      eventLocation: useInternationalArrivalEvent
+        ? entry.internationalArrivalEventLocation
+        : entry.latestEventLocation,
+      eventDate: useInternationalArrivalEvent
+        ? entry.internationalArrivalEventDate
+        : entry.latestEventDate,
     }
 
     if (!lastSignature) {
@@ -5080,7 +5592,10 @@ const notifyPackageEventChanges = async (entries = [], { requireWelcome = true }
           where event = 'whatsapp_package_event_update_sent'
             and details->>'packageCode' = $1
             and (
-              details->>'eventSignature' = $2
+              (
+                details->>'eventSignature' = $2
+                and details->>'packageStage' = $4
+              )
               or ($4 = 'delivered' and details->>'packageStage' = 'delivered')
             )
             and regexp_replace(coalesce(details->>'recipient', ''), '[^0-9]', '', 'g') = $3
@@ -5098,6 +5613,10 @@ const notifyPackageEventChanges = async (entries = [], { requireWelcome = true }
         })
         continue
       }
+
+      console.log(
+        `[${packageCode}] Nuevo evento detectado: ${entry.latestEventLabel || 'sin descripciÃ³n'}; preparando mensaje para ${targetPhone}.`,
+      )
 
       let deliveryNoticeDates = []
       if (isPackageReturnToOriginEvent({ eventLabel: entry.latestEventLabel, eventSignature })) {
@@ -5125,6 +5644,14 @@ const notifyPackageEventChanges = async (entries = [], { requireWelcome = true }
         contact,
         entry: {
           ...entry,
+          ...(useInternationalArrivalEvent
+            ? {
+                latestEventLabel: entry.internationalArrivalEventLabel,
+                latestEventLocation: entry.internationalArrivalEventLocation,
+                latestEventDate: entry.internationalArrivalEventDate,
+                latestEventSignature: entry.internationalArrivalEventSignature,
+              }
+            : {}),
           deliveryNoticeDates,
           recipientName:
             phoneNames.get(targetPhone) ||
@@ -5424,11 +5951,14 @@ const fetchAllPaginatedItems = async ({
   throwOnAnyPageError = false,
   minimumPageIntervalMs = 0,
   maxRateLimitRetries = 3,
+  maxNetworkRetries = 2,
   onPage = null,
+  retainItems = true,
 }) => {
   const allItems = []
   const pageSignatures = new Set()
   let lastRequestAt = 0
+  let totalItemsFetched = 0
 
   for (let page = 1; page <= maxPages; page += 1) {
     const paginatedUrl = new URL(url.toString())
@@ -5440,8 +5970,16 @@ const fetchAllPaginatedItems = async ({
 
     let response = null
     for (let attempt = 1; attempt <= maxRateLimitRetries + 1; attempt += 1) {
-      lastRequestAt = Date.now()
-      response = await fetchJsonWithTimeout(paginatedUrl, { headers }, timeoutMs).catch(() => null)
+      for (let networkAttempt = 1; networkAttempt <= maxNetworkRetries + 1; networkAttempt += 1) {
+        lastRequestAt = Date.now()
+        try {
+          response = await fetchJsonWithTimeout(paginatedUrl, { headers }, timeoutMs)
+        } catch {
+          if (networkAttempt > maxNetworkRetries) break
+          await sleep(Math.min(1000 * (2 ** (networkAttempt - 1)), 8000))
+        }
+        if (response) break
+      }
       if (response?.status !== 429) break
 
       if (attempt <= maxRateLimitRetries) {
@@ -5493,7 +6031,10 @@ const fetchAllPaginatedItems = async ({
     }
     pageSignatures.add(pageSignature)
 
-    allItems.push(...pageItems)
+    if (retainItems) {
+      allItems.push(...pageItems)
+    }
+    totalItemsFetched += pageItems.length
 
     if (typeof onPage === 'function') {
       await onPage(pageItems, page, payload)
@@ -5504,7 +6045,7 @@ const fetchAllPaginatedItems = async ({
     }
 
     const totalItems = getPaginatedPayloadTotal(payload)
-    if (trustReportedTotal && Number.isFinite(totalItems) && allItems.length >= totalItems) {
+    if (trustReportedTotal && Number.isFinite(totalItems) && totalItemsFetched >= totalItems) {
       break
     }
     const effectivePerPage = Number(
@@ -5520,7 +6061,7 @@ const fetchAllPaginatedItems = async ({
     }
   }
 
-  if (allItems.length > 0 && allItems.length >= maxPages * perPage && throwOnAnyPageError) {
+  if (totalItemsFetched > 0 && totalItemsFetched >= maxPages * perPage && throwOnAnyPageError) {
     throw new Error(`La API externa superó el límite de ${maxPages} páginas; el catálogo no está completo.`)
   }
 
@@ -6044,6 +6585,74 @@ const fetchMatchingPackageContext = async (reference, packageCode = '') => {
           )),
   )
 
+  const cdsLookupItem = normalizedPackageCode
+    ? matchingTrackingItems[0] ?? {
+        codigo_s10: normalizedPackageCode,
+        codigo: normalizedPackageCode,
+      }
+    : null
+  const cdsDeclarationWarning = cdsLookupItem
+    ? await enrichTrackingPackagesWithCds([cdsLookupItem])
+    : null
+  const cdsDeclaration = cdsLookupItem?.declaracion_cds ?? null
+  const declaredDestinations = Array.isArray(cdsLookupItem?.destinos_declarados)
+    ? cdsLookupItem.destinos_declarados
+    : []
+  const declarationDestinations = (cdsDeclaration?.objetos ?? []).flatMap((object) =>
+    (object?.declaraciones ?? []).map((declaration) => ({
+      departamento:
+        getSafeDeclaredDepartment(declaration?.destino_declarado?.departamento) ||
+        getSafeDeclaredDepartment(getCdsDeclarationField(declaration?.campos, 'RSta')),
+      ciudad:
+        normalizeReference(declaration?.destino_declarado?.ciudad) ||
+        getCdsDeclarationField(declaration?.campos, 'RCty'),
+      codigo_postal:
+        normalizeReference(declaration?.destino_declarado?.codigo_postal) ||
+        getCdsDeclarationField(declaration?.campos, 'RZip'),
+      pais_codigo:
+        normalizeReference(declaration?.destino_declarado?.pais_codigo) ||
+        getCdsDeclarationField(declaration?.campos, 'RCtr'),
+    })),
+  )
+  const declaredRecipients = (cdsDeclaration?.objetos ?? []).flatMap((object) =>
+    (object?.declaraciones ?? [])
+      .map((declaration) => declaration?.destinatario_declarado)
+      .filter((recipient) => normalizeReference(recipient?.nombre)),
+  )
+  const declaredRecipient = declaredRecipients[0] ?? null
+  const allDeclaredDestinations = [...declaredDestinations, ...declarationDestinations]
+  const hasDeclaredDestinationInfo = allDeclaredDestinations.some((destination) =>
+    getSafeDeclaredDepartment(destination?.departamento) ||
+    normalizeReference(destination?.ciudad) ||
+    normalizeReference(destination?.codigo_postal) ||
+    normalizeReference(destination?.pais_codigo),
+  )
+  const cdsDeclarationSummary = cdsDeclaration
+    ? [
+        `Estado de declaración CDS: ${normalizeReference(cdsDeclaration.estado) || 'Sin estado'}`,
+        ...allDeclaredDestinations.map((destination) => {
+          const department = getSafeDeclaredDepartment(destination?.departamento)
+          const city = normalizeReference(destination?.ciudad)
+          const postalCode = normalizeReference(destination?.codigo_postal)
+          const country = normalizeReference(destination?.pais_codigo)
+          return [
+            department ? `departamento declarado ${department}` : '',
+            city ? `ciudad declarada ${city}` : '',
+            postalCode ? `codigo postal declarado ${postalCode}` : '',
+            country ? `pais declarado ${country}` : '',
+          ]
+            .filter(Boolean)
+            .join(' | ')
+        }).filter(Boolean),
+        ...(!hasDeclaredDestinationInfo ? ['destino declarado no informado'] : []),
+        'El destino declarado en CDS no confirma la ubicación operativa actual del paquete.',
+      ]
+        .filter(Boolean)
+        .join('\n')
+    : cdsDeclarationWarning
+      ? 'La consulta de declaración CDS está incompleta; no se pudo confirmar el departamento declarado.'
+      : ''
+
   const trackingPackageEntries = matchingTrackingItems.map((item) => {
     const latestEvent = getTrackingLatestEvent(item)
     const statusText =
@@ -6195,6 +6804,10 @@ const fetchMatchingPackageContext = async (reference, packageCode = '') => {
     summarySections.push(`Paquetes-Contactos API:\n- ${contactSummaries.join('\n- ')}`)
   }
 
+  if (cdsDeclarationSummary) {
+    summarySections.push(`Declaración aduanera CDS:\n${cdsDeclarationSummary}`)
+  }
+
   const testModeNumber = normalizeBoliviaTestNumber(whatsappDefaults.testModeNumber)
   const isTestModeNumber =
     targetCandidates.has(testModeNumber) || targetCandidates.has(testModeNumber?.replace(/^591/, '') || '')
@@ -6227,6 +6840,7 @@ const fetchMatchingPackageContext = async (reference, packageCode = '') => {
     currentLatestEventLabel: mostAdvancedEntry?.latestEventLabel ?? latestPackageEntry?.latestEventLabel ?? '',
     currentLatestEventLocation: mostAdvancedEntry?.latestEventLocation ?? latestPackageEntry?.latestEventLocation ?? '',
     currentLatestEventAt: mostAdvancedEntry?.latestEventAt ?? latestPackageEntry?.latestEventAt ?? '',
+    currentLatestEventSignature: mostAdvancedEntry?.latestEventSignature ?? latestPackageEntry?.latestEventSignature ?? '',
     currentOriginLabel: mostSpecificEntry?.originLabel ?? mostAdvancedEntry?.originLabel ?? latestPackageEntry?.originLabel ?? '',
     currentOriginDepartment:
       mostSpecificEntry?.originDepartment ?? mostAdvancedEntry?.originDepartment ?? latestPackageEntry?.originDepartment ?? '',
@@ -6236,6 +6850,16 @@ const fetchMatchingPackageContext = async (reference, packageCode = '') => {
       mostSpecificEntry?.destinationDepartment ?? mostAdvancedEntry?.destinationDepartment ?? latestPackageEntry?.destinationDepartment ?? '',
     currentDestinationAddress:
       mostSpecificEntry?.destinationAddress ?? mostAdvancedEntry?.destinationAddress ?? latestPackageEntry?.destinationAddress ?? '',
+    currentRecipientName:
+      normalizeReference(declaredRecipient?.nombre) ||
+      mostSpecificEntry?.recipientName ||
+      mostAdvancedEntry?.recipientName ||
+      latestPackageEntry?.recipientName ||
+      '',
+    cdsDeclaration,
+    declaredRecipient,
+    declaredDestinations,
+    cdsDeclarationWarning,
     packageCodes: [...new Set(packageEntries.map((entry) => entry.code).filter(Boolean))],
     summaryText: summarySections.join('\n\n'),
     agentFactsText,
@@ -6396,13 +7020,30 @@ app.get('/api/package-code-lookup', cors(), authMiddleware, async (request, resp
             }),
           ])
 
+    const cdsRecord = tracking.record ?? {
+      mailitm_pid: normalizedCode,
+      codigo_s10: normalizedCode,
+      codigo: normalizedCode,
+    }
+    const declarationWarning = await enrichTrackingPackagesWithCds([cdsRecord])
+    const cdsFound = ['declarada', 'objeto_sin_declaracion'].includes(cdsRecord.declaracion_cds?.estado)
+    if (tracking.record && declarationWarning) {
+      tracking.declarationWarning = declarationWarning
+    }
+
     response.json({
       query: rawQuery,
       extractedCode,
       normalizedCode,
-      found: tracking.found || contact.found,
+      found: tracking.found || contact.found || cdsFound,
       tracking,
       contact,
+      cds: {
+        source: 'cds',
+        found: cdsFound,
+        record: cdsRecord,
+        warning: declarationWarning,
+      },
     })
   } catch (error) {
     response.status(502).json({
@@ -6866,8 +7507,10 @@ const normalizeEmsStatus = (value) => {
     normalized.includes('cancel') ||
     normalized.includes('anul') ||
     normalized.includes('rechaz') ||
-    normalized.includes('devuelto') ||
-    normalized.includes('retornado')
+    normalized.includes('devuelt') ||
+    normalized.includes('devolv') ||
+    normalized.includes('retorn') ||
+    normalized.includes('return')
   ) {
     return 'cancelled'
   }
@@ -7262,7 +7905,7 @@ const formatPackageAgencyContext = (packageContext = null) => {
 
 const buildFallbackAgentReplyLegacy = ({ contact, messageBody, currentStatus, packageContext = null }) => {
   const normalizedMessage = normalizeReference(messageBody).toLowerCase()
-  const contactName = normalizeReference(contact?.name) || 'Hola'
+  const contactName = normalizeReference(packageContext?.currentRecipientName) || normalizeReference(contact?.name) || 'Hola'
   const packageCode = normalizeReference(packageContext?.currentPackageCode)
   const originDepartment = normalizeReference(packageContext?.currentOriginDepartment)
   const originLabel = normalizeReference(packageContext?.currentOriginLabel)
@@ -7295,6 +7938,7 @@ const isDeliveryQuestion =
   }
 
   if (packageContext?.matched && packageContext.stage === 'delivered') {
+    return `Hola, ${contactName}! Revisé la guía ${packageCode || 'indicada'} y figura como entregada. Si necesitas más detalle sobre la entrega, puedo ayudarte a revisarlo.`
     return `RevisÃ© la guÃ­a ${packageCode || 'indicada'} y figura como entregada${destinationLocationText ? ` en ${destinationLocationText}` : ''}. Si necesitas mÃ¡s detalle sobre la entrega, puedo ayudarte a revisarlo.`
   }
 
@@ -7362,7 +8006,11 @@ const isDeliveryQuestion =
 }
 const buildFriendlyFallbackAgentReply = ({ contact, messageBody, currentStatus, packageContext = null }) => {
   const normalizedMessage = normalizeReference(messageBody).toLowerCase()
-  const contactName = normalizeReference(contact?.name) || 'Hola'
+  const contactName = normalizeReference(packageContext?.currentRecipientName) || normalizeReference(contact?.name) || 'Hola'
+  if (packageContext?.matched && packageContext.stage === 'delivered') {
+    const packageCode = normalizeReference(packageContext?.currentPackageCode) || 'indicada'
+    return `Hola, ${contactName}! Revisé la guía ${packageCode} y figura como entregada. Si necesitas más detalle sobre la entrega, puedo ayudarte a revisarlo.`
+  }
   const packageCode = normalizeReference(packageContext?.currentPackageCode)
   const originDepartment = normalizeReference(packageContext?.currentOriginDepartment)
   const originLabel = normalizeReference(packageContext?.currentOriginLabel)
@@ -7421,6 +8069,26 @@ const buildFriendlyFallbackAgentReply = ({ contact, messageBody, currentStatus, 
           hasInternationalArrivalEvent(packageContext.packageEvents),
       })
     : ''
+  const customsTrackingReply = packageContext?.matched
+    ? buildCustomsTrackingReply({
+        packageCode,
+        latestEventLabel:
+          normalizeReference(packageContext.currentLatestEventLabel) ||
+          (latestPackageEvent ? getPackageEventTitle(latestPackageEvent) : ''),
+        latestEventLocation: packageContext.currentLatestEventLocation,
+        statusLabel: packageContext.currentStatusLabel,
+      })
+    : ''
+  const nationalDistributionTrackingReply = packageContext?.matched
+    ? buildNationalDistributionTrackingReply({
+        packageCode,
+        latestEventLabel:
+          normalizeReference(packageContext.currentLatestEventLabel) ||
+          (latestPackageEvent ? getPackageEventTitle(latestPackageEvent) : ''),
+        latestEventSignature: packageContext.currentLatestEventSignature,
+        statusLabel: packageContext.currentStatusLabel,
+      })
+    : ''
 
   if (packageContext?.matched && packageContext.stage === 'delivered') {
     return `RevisÃ© la guÃ­a ${packageCode || 'indicada'} ðŸ“¦ y figura como entregada âœ…${destinationLocationText ? ` en ${destinationLocationText} ðŸ“` : ''}. Si necesitas mÃ¡s detalle sobre la entrega, puedo ayudarte a revisarlo ðŸ˜Š.`
@@ -7432,6 +8100,14 @@ const buildFriendlyFallbackAgentReply = ({ contact, messageBody, currentStatus, 
 
   if (packageContext?.matched && packageContext.stage === 'courier') {
     return `RevisÃ© la guÃ­a ${packageCode || 'indicada'} ðŸ“¦ y figura asignada a cartero ðŸ›µ${destinationLocationText ? ` en ${destinationLocationText} ðŸ“` : ''}. EstÃ¡ en proceso de reparto ðŸšš; no aparece como entregada todavÃ­a â³.`
+  }
+
+  if (customsTrackingReply) {
+    return customsTrackingReply
+  }
+
+  if (nationalDistributionTrackingReply) {
+    return nationalDistributionTrackingReply
   }
 
   if (internationalArrivalMessage) {
@@ -8123,6 +8799,14 @@ const supportContactNumber = process.env.BOT_SUPPORT_CONTACT_NUMBER?.trim() || '
 const PROMPT_INJECTION_SAFE_REPLY =
   `No puedo ayudarte con eso. Solo puedo ayudarte con consultas relacionadas con Correos de Bolivia, seguimiento de paquetes y atencion al cliente. Para mas informacion, comunicate al ${supportContactNumber}.`
 
+const buildConversationRecoveryReply = ({ category = 'GENERAL', packageCode = '' } = {}) => {
+  if (category === 'TARIFAS') {
+    return 'Puedo ayudarte a cotizar el envio. Indícame origen, destino, peso y servicio; si quieres consultar un paquete, envíame también su número de guía.'
+  }
+  if (packageCode) return `Puedo revisar el estado de la guía ${packageCode} o ayudarte a cotizar un nuevo envío. ¿Qué necesitas consultar?`
+  return 'Puedo ayudarte a cotizar un envío o consultar el estado de un paquete. Indícame los datos que necesitas revisar.'
+}
+
 const isPromptInjectionAttempt = (messageBody) => {
   const normalized = normalizeIntentText(messageBody)
 
@@ -8497,11 +9181,6 @@ const isDeliveryExpressProvinceDestination = (messageBody) => {
     const normalizedKeyword = normalizeTariffLookupText(keyword)
     return normalizedKeyword && new RegExp(`\\b${normalizedKeyword}\\b`).test(normalized)
   })
-}
-
-const isDeliveryExpressDimensionQuestion = (messageBody) => {
-  const normalized = normalizeTariffLookupText(messageBody)
-  return /\b(mide|medida|medidas|alto|altura|ancho|largo|dimension|dimensiones|metro|metros|cm|centimetro|centimetros)\b/.test(normalized)
 }
 
 const hasUnsupportedDeliveryExpressMode = (messageBody) => {
@@ -8971,14 +9650,20 @@ const getTariffQuote = async ({ messageBody, recentConversation = '', skipMultip
   const currentModeNeedsRoute = Boolean(currentDeliveryMode) && !requestedDeliveryTime && currentRoutePlaceCount < 2 && !recentCustomerRouteText
   const isNewTariffQuestionWithoutService =
     isTariffInquiryMessage(messageBody) && !currentServiceKey && !currentDeliveryMode
-  const serviceKey =
-    (isFreshInternationalShipmentRequest ? 'ems' : '') ||
-    (recentEmsFollowUpCategory && !isFreshShipmentRequestWithoutService ? 'ems' : '') ||
-    (shouldRouteOversizedPackageToEms ? 'ems' : '') ||
-    currentServiceKey ||
-    (currentDeliveryMode ? 'delivery_express' : '') ||
-    (!isFreshShipmentRequestWithoutService && !shouldAskServiceForCurrentRoute && !isNewPackageQuestion && isRouteChangeQuestion && recentCustomerServiceKey ? recentCustomerServiceKey : '') ||
-    (shouldAskServiceForCurrentRoute || isNewPackageQuestion || isNewTariffQuestionWithoutService ? '' : recentCustomerServiceKey || inferTariffServiceKey(lookupText))
+  const serviceKey = resolveTariffServiceKey({
+    currentServiceKey,
+    isFreshInternationalShipmentRequest,
+    recentEmsFollowUpCategory,
+    shouldRouteOversizedPackageToEms,
+    currentDeliveryMode,
+    isFreshShipmentRequestWithoutService,
+    shouldAskServiceForCurrentRoute,
+    isNewPackageQuestion,
+    isRouteChangeQuestion,
+    recentCustomerServiceKey,
+    isNewTariffQuestionWithoutService,
+    inferredServiceKey: inferTariffServiceKey(lookupText),
+  })
   const emsCategory = serviceKey === 'ems'
     ? inferEmsQuoteCategory({
         messageBody,
@@ -9677,6 +10362,7 @@ const buildGeneralAgentPrompt = ({
   packageContext,
   category = 'GENERAL',
   customInstruction = '',
+  tariffQuote = null,
   sender = '',
 }) =>
   [
@@ -9686,8 +10372,12 @@ const buildGeneralAgentPrompt = ({
     category === 'TARIFAS'
       ? 'El cliente consulta tarifas o cotizaciones para enviar paquetes. Mantente en cotizacion: no pidas numero de guia ni hables de tracking salvo que el cliente lo pida explicitamente. Si faltan servicio, modalidad, origen o destino, pide solo esos datos.'
       : 'El cliente hace una consulta general. Responde solo lo que pregunta y evita desviarte.',
+    'Si no puedes resolver exactamente la solicitud, no inventes una respuesta: ofrece continuar la cotización solicitando solo los datos faltantes o consultar el estado de una guía. Si hay una guía en el contexto, usa su estado real de la API.',
     category === 'TARIFAS'
       ? `Base de conocimiento EMS:\n${(botKnowledge.ems?.rules || []).join('\n')}\n\nBase de conocimiento Delivery Express:\n${(botKnowledge.deliveryExpress?.rules || []).join('\n')}`
+      : '',
+    category === 'TARIFAS' && tariffQuote
+      ? `Resultado estructurado del tarifario (úsalo como única fuente de precio y datos):\n${JSON.stringify(tariffQuote)}\nRedacta una respuesta natural. Si faltan datos, pide solo esos datos; si hay una tarifa, informa el precio y sus condiciones. No inventes ni cambies valores.`
       : '',
     'Responde solo en espanol, en 2 o 3 frases como maximo y con no mas de 40 palabras.',
     'Ve directo al punto: evita introducciones largas, listas y explicaciones innecesarias.',
@@ -9734,6 +10424,8 @@ const buildTrackingAgentPrompt = ({
     'Si el cliente saluda, responde con un saludo breve y presentacion amable.',
     'Si pide rastreo y no da guia, pide el numero de guia de forma breve.',
     'Si ya hay guia y contexto real, responde con una actualizacion clara, amable y facil de leer.',
+    'Si pregunta por la declaracion aduanera o el departamento declarado, usa el dato CDS y aclara que no confirma la ubicacion operativa actual.',
+    'Si el ultimo evento o estado indica aduana, responde que el paquete se encuentra en aduana, en revision u observacion aduanera.',
     'Si el cliente pregunta donde esta o hacia donde va, menciona estado, destino y sucursal de origen o destino cuando exista.',
     'Si existe una agencia o sucursal en las APIs, usa ese dato exacto y no inventes direcciones ni nombres.',
     (botKnowledge.tracking?.rules || []).length
@@ -10577,7 +11269,11 @@ const runWhatsAppStageWatcher = async () => {
       (lastNewPackageWelcomeCheckAt === 0 || Date.now() - lastNewPackageWelcomeCheckAt >= welcomeIntervalMs)
     const shouldRunRecentEventSync =
       WHATSAPP_STAGE_WATCHER_ENABLED &&
-      automationConfig.automaticStatusUpdates &&
+      (
+        automationConfig.automaticStatusUpdates ||
+        automationConfig.automaticInternationalArrivalTestNotifications ||
+        automationConfig.automaticVentanillaNotifications
+      ) &&
       (lastRecentPackageEventCheckAt === 0 || Date.now() - lastRecentPackageEventCheckAt >= recentEventIntervalMs)
     console.log(
       `Watcher WhatsApp: bienvenidas automaticas ${automationConfig.automaticWelcome ? 'activas' : 'desactivadas'}; ` +
@@ -10595,6 +11291,7 @@ const runWhatsAppStageWatcher = async () => {
       await syncRecentPackageAutomations({
         sendWelcome: shouldRunWelcomeSync,
         sendEvents: shouldRunRecentEventSync,
+        sendVentanillaEvents: shouldRunRecentEventSync,
       })
         .then(async (result) => {
           console.log(
@@ -10604,9 +11301,17 @@ const runWhatsAppStageWatcher = async () => {
               `(${JSON.stringify(result?.newPackageWelcome?.skippedByReason ?? {})})` +
               `${result?.newPackageWelcome?.reason ? ` (${result.newPackageWelcome.reason})` : ''}; ` +
               `eventos ${result?.eventNotifications?.sent ?? 0} enviado(s), omitidos ${result?.eventNotifications?.skipped ?? 0} ` +
-              `(${JSON.stringify(result?.eventNotifications?.skippedByReason ?? {})}).`,
+              `(${JSON.stringify(result?.eventNotifications?.skippedByReason ?? {})}); ` +
+              `llegadas internacionales ${result?.internationalArrivalNotifications?.sent ?? 0} enviada(s), omitidas ${result?.internationalArrivalNotifications?.skipped ?? 0} ` +
+              `(${JSON.stringify(result?.internationalArrivalNotifications?.skippedByReason ?? {})}); ` +
+              `ventanilla ${result?.ventanillaNotifications?.sent ?? 0} enviado(s), omitidos ${result?.ventanillaNotifications?.skipped ?? 0} ` +
+              `(${JSON.stringify(result?.ventanillaNotifications?.skippedByReason ?? {})}).`,
           )
-          for (const detail of result?.eventNotifications?.sentDetails ?? []) {
+          for (const detail of [
+            ...(result?.eventNotifications?.sentDetails ?? []),
+            ...(result?.internationalArrivalNotifications?.sentDetails ?? []),
+            ...(result?.ventanillaNotifications?.sentDetails ?? []),
+          ]) {
             console.log(
               `[${detail.packageCode}] Confirmacion de envio.\n` +
                 `  Numero: ${detail.recipient}\n` +
@@ -10627,6 +11332,20 @@ const runWhatsAppStageWatcher = async () => {
               eventSent: result?.eventNotifications?.sent ?? 0,
               eventSkipped: result?.eventNotifications?.skipped ?? 0,
               eventSkippedByReason: result?.eventNotifications?.skippedByReason ?? {},
+              eventReason: result?.eventNotifications?.reason ?? result?.eventNotifications?.error ?? null,
+              internationalArrivalSent: result?.internationalArrivalNotifications?.sent ?? 0,
+              internationalArrivalSkipped: result?.internationalArrivalNotifications?.skipped ?? 0,
+              internationalArrivalSkippedByReason:
+                result?.internationalArrivalNotifications?.skippedByReason ?? {},
+              internationalArrivalReason:
+                result?.internationalArrivalNotifications?.reason ??
+                result?.internationalArrivalNotifications?.error ??
+                null,
+              ventanillaSent: result?.ventanillaNotifications?.sent ?? 0,
+              ventanillaSkipped: result?.ventanillaNotifications?.skipped ?? 0,
+              ventanillaSkippedByReason: result?.ventanillaNotifications?.skippedByReason ?? {},
+              ventanillaReason:
+                result?.ventanillaNotifications?.reason ?? result?.ventanillaNotifications?.error ?? null,
               checkedAt: result?.syncedAt ?? new Date().toISOString(),
               lookbackMs: PACKAGE_NEW_PACKAGE_WELCOME_LOOKBACK_MS,
               welcomeIntervalMs,
@@ -10651,7 +11370,8 @@ const runWhatsAppStageWatcher = async () => {
       !shouldRunReconciliation &&
       (
         automationConfig.automaticWelcome ||
-        (WHATSAPP_STAGE_WATCHER_ENABLED && automationConfig.automaticStatusUpdates) ||
+        (WHATSAPP_STAGE_WATCHER_ENABLED &&
+        (automationConfig.automaticStatusUpdates || automationConfig.automaticVentanillaNotifications)) ||
         automationConfig.automaticReconciliation
       )
     ) {
@@ -10677,7 +11397,10 @@ const runWhatsAppStageWatcher = async () => {
     const shouldRunFullEventSync =
       !shouldRunReconciliation &&
       WHATSAPP_STAGE_WATCHER_ENABLED &&
-      automationConfig.automaticStatusUpdates &&
+      (
+        automationConfig.automaticStatusUpdates ||
+        automationConfig.automaticInternationalArrivalTestNotifications
+      ) &&
       (lastPackageEventChangeSyncAt === 0 || Date.now() - lastPackageEventChangeSyncAt >= fullEventSyncIntervalMs)
 
     if (shouldRunFullEventSync) {
@@ -10715,7 +11438,10 @@ const runWhatsAppStageWatcher = async () => {
     } else if (
       !shouldRunReconciliation &&
       WHATSAPP_STAGE_WATCHER_ENABLED &&
-      automationConfig.automaticStatusUpdates
+      (
+        automationConfig.automaticStatusUpdates ||
+        automationConfig.automaticInternationalArrivalTestNotifications
+      )
     ) {
       const nextFullMinutes = lastPackageEventChangeSyncAt > 0
         ? Math.max(0, Math.ceil((fullEventSyncIntervalMs - (Date.now() - lastPackageEventChangeSyncAt)) / 60000))
@@ -10741,14 +11467,22 @@ const runWhatsAppStageWatcher = async () => {
         const result = await ensurePackagePipelineSync({ force: true, reconciliation: true })
         const welcomeResult = result?.newPackageWelcome ?? {}
         const eventResult = result?.eventNotifications ?? {}
+        const internationalArrivalResult = result?.internationalArrivalNotifications ?? {}
+        const ventanillaResult = result?.ventanillaNotifications ?? {}
         const checkedAt = new Date().toISOString()
-        const sentTotal = (Number(welcomeResult.sent) || 0) + (Number(eventResult.sent) || 0)
+        const sentTotal =
+          (Number(welcomeResult.sent) || 0) +
+          (Number(eventResult.sent) || 0) +
+          (Number(internationalArrivalResult.sent) || 0) +
+          (Number(ventanillaResult.sent) || 0)
         const sourceFailures = Array.isArray(result?.packageSourceFailures)
           ? result.packageSourceFailures
           : []
         const notificationFailures = [
           welcomeResult.error ? 'welcome-send-failed' : null,
           eventResult.error ? 'event-send-failed' : null,
+          internationalArrivalResult.error ? 'international-arrival-send-failed' : null,
+          ventanillaResult.error ? 'ventanilla-send-failed' : null,
         ].filter(Boolean)
         const details = {
           startedAt: reconciliationStartedAt,
@@ -10768,10 +11502,22 @@ const runWhatsAppStageWatcher = async () => {
           eventSkipped: Number(eventResult.skipped) || 0,
           eventSkippedByReason: eventResult.skippedByReason ?? {},
           eventReason: eventResult.reason ?? eventResult.error ?? null,
+          internationalArrivalSent: Number(internationalArrivalResult.sent) || 0,
+          internationalArrivalSkipped: Number(internationalArrivalResult.skipped) || 0,
+          internationalArrivalSkippedByReason: internationalArrivalResult.skippedByReason ?? {},
+          internationalArrivalReason:
+            internationalArrivalResult.reason ?? internationalArrivalResult.error ?? null,
+          ventanillaSent: Number(ventanillaResult.sent) || 0,
+          ventanillaSkipped: Number(ventanillaResult.skipped) || 0,
+          ventanillaSkippedByReason: ventanillaResult.skippedByReason ?? {},
+          ventanillaReason: ventanillaResult.reason ?? ventanillaResult.error ?? null,
           sourceFailures,
           notificationFailures,
           automaticWelcome: automationConfig.automaticWelcome,
           automaticStatusUpdates: automationConfig.automaticStatusUpdates,
+          automaticInternationalArrivalTestNotifications:
+            automationConfig.automaticInternationalArrivalTestNotifications,
+          automaticVentanillaNotifications: automationConfig.automaticVentanillaNotifications,
         }
         await writeSystemLog({
           event: 'whatsapp_package_reconciliation_completed',
@@ -10784,7 +11530,7 @@ const runWhatsAppStageWatcher = async () => {
         lastPackageEventChangeSyncAt = Date.now()
         console.log(
           `Comprobador WhatsApp: ${details.totalPackages} paquete(s), ${sentTotal} mensaje(s) enviado(s), ` +
-            `${details.welcomeSkipped + details.eventSkipped} omitido(s).`,
+            `${details.welcomeSkipped + details.eventSkipped + details.internationalArrivalSkipped + details.ventanillaSkipped} omitido(s).`,
         )
       } catch (error) {
         lastPackageReconciliationCheckAt =
@@ -10841,10 +11587,21 @@ const startWhatsAppStageWatcher = () => {
       welcomeEnabled: automationConfig.automaticWelcome,
       welcomeIntervalMs: automationConfig.welcomeResponseIntervalMs,
       lastWelcomeCheckAt: lastNewPackageWelcomeCheckAt,
-      eventUpdatesEnabled: WHATSAPP_STAGE_WATCHER_ENABLED && automationConfig.automaticStatusUpdates,
+      eventUpdatesEnabled:
+        WHATSAPP_STAGE_WATCHER_ENABLED &&
+        (
+          automationConfig.automaticStatusUpdates ||
+          automationConfig.automaticInternationalArrivalTestNotifications ||
+          automationConfig.automaticVentanillaNotifications
+        ),
       eventChangeIntervalMs: automationConfig.eventChangeResponseIntervalMs,
       lastEventCheckAt: lastRecentPackageEventCheckAt,
-      fullEventSyncEnabled: WHATSAPP_STAGE_WATCHER_ENABLED && automationConfig.automaticStatusUpdates,
+      fullEventSyncEnabled:
+        WHATSAPP_STAGE_WATCHER_ENABLED &&
+        (
+          automationConfig.automaticStatusUpdates ||
+          automationConfig.automaticInternationalArrivalTestNotifications
+        ),
       fullEventSyncIntervalMs,
       lastFullEventSyncAt: lastPackageEventChangeSyncAt,
       reconciliationEnabled: automationConfig.automaticReconciliation,
@@ -11575,6 +12332,14 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
       isGreetingOnly || isGratitudeOnly || !hasPackageInquiry
         ? getEmptyPackageContext()
         : await fetchMatchingPackageContext(sender, packageCode)
+    const packageDeclarationReply =
+      packageCode && isPackageDeclarationQuestion(messageBody)
+        ? buildPackageDeclarationReply({
+            packageCode,
+            declaration: packageContext.cdsDeclaration,
+            destinations: packageContext.declaredDestinations,
+          })
+        : ''
     const multiPackageResults =
       !isInjectionAttempt && packageCodes.length > 1
         ? await Promise.all(
@@ -11683,7 +12448,7 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
       'Devuelve solo el texto final de la respuesta, sin comillas, sin explicaciones ni markdown.',
     ].join('\n')
 
-    let finalReply = isGreetingOnly
+    let finalReply = packageDeclarationReply || (isGreetingOnly
       ? `Â¡Hola! ${getBoliviaDayGreeting()}, soy Jaimito de Correos de Bolivia. Puedo ayudarte a encontrar tu paquete y cotizar el costo de envÃ­o. Â¿QuÃ© necesitas?`
       : isExplicitPackageTrackingRequest
         ? packageRetryScheduled
@@ -11705,8 +12470,8 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
               `No pude localizar el paquete ${packageCode}. Verifica el codigo e intentalo nuevamente, por favor.`
       : needsEmsWeightUnitClarification
         ? buildEmsWeightSpecificationsPrompt(messageBody, pendingEmsCategory)
-        : tariffQuote
-        ? await buildTariffReply(tariffQuote, { messageBody })
+      : tariffQuote
+        ? ''
       : isPackageInquiryWithoutCode
         ? normalizeReference(botKnowledge.responses?.tracking?.missingCode) || '¡Perfecto! Dejame tu numero de guia y lo revisamos de inmediato.'
         : packageLookupUnavailable
@@ -11724,9 +12489,9 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
               buildFallbackAgentReply({ contact, messageBody, currentStatus: contact?.status ?? 'Nuevo', packageContext })
             : packageCode && packageContext.matched
               ? buildFallbackAgentReply({ contact, messageBody, currentStatus: contact?.status ?? 'Nuevo', packageContext })
-        : ''
+        : '')
 
-    if (multiPackageResults.length > 1) {
+    if (multiPackageResults.length > 1 && !packageDeclarationReply) {
       finalReply = buildMultiPackageContextReply(multiPackageResults)
     }
 
@@ -11775,6 +12540,7 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
             recentConversation,
             packageContext,
             category: routedIntent.category,
+            tariffQuote,
             sender,
           }),
           model: getAiConfig().generalModel,
@@ -11801,7 +12567,10 @@ const autoReplyInboundWhatsAppMessage = async ({ contactId, sender, messageBody,
     }
 
     if (!finalReply) {
-      finalReply = buildFallbackAgentReply({
+      finalReply = buildConversationRecoveryReply({
+        category: routedIntent.category,
+        packageCode,
+      }) || buildFallbackAgentReply({
         contact,
         messageBody,
         currentStatus: contact?.status ?? 'Nuevo',
@@ -12575,8 +13344,8 @@ app.get('/api/dashboard', authMiddleware, async (request, response) => {
           c.status,
           c.score,
           c.updated_at,
-          message_activity.last_message_at,
-          message_activity.last_inbound_at,
+          latest_message.created_at as last_message_at,
+          latest_inbound_message.created_at as last_inbound_at,
           latest_message.message_text as last_message_text,
           latest_message.direction as last_message_direction
         from contacts c
@@ -12587,27 +13356,53 @@ app.get('/api/dashboard', authMiddleware, async (request, response) => {
           limit 1
         ) whatsapp_profile on true
         left join lateral (
-          select
-            max(ml.created_at) as last_message_at,
-            max(ml.created_at) filter (where ml.direction = 'inbound') as last_inbound_at
-          from message_logs ml
-          where ml.contact_id = c.id
-            or (
-              coalesce(whatsapp_profile.whatsapp_reference, '') <> ''
-              and regexp_replace(coalesce(ml.recipient_reference, ''), '[^0-9]', '', 'g') = whatsapp_profile.whatsapp_reference
+          select candidate.created_at, candidate.id, candidate.message_text, candidate.direction
+          from (
+            (
+              select ml.created_at, ml.id, ml.message_text, ml.direction
+              from message_logs ml
+              where ml.contact_id = c.id
+              order by ml.created_at desc, ml.id desc
+              limit 1
             )
-        ) message_activity on true
-        left join lateral (
-          select ml.message_text, ml.direction
-          from message_logs ml
-          where ml.contact_id = c.id
-            or (
-              coalesce(whatsapp_profile.whatsapp_reference, '') <> ''
-              and regexp_replace(coalesce(ml.recipient_reference, ''), '[^0-9]', '', 'g') = whatsapp_profile.whatsapp_reference
+            union all
+            (
+              select ml.created_at, ml.id, ml.message_text, ml.direction
+              from message_logs ml
+              where whatsapp_profile.whatsapp_reference <> ''
+                and regexp_replace(coalesce(ml.recipient_reference, ''), '[^0-9]', '', 'g') = whatsapp_profile.whatsapp_reference
+              order by ml.created_at desc, ml.id desc
+              limit 1
             )
-          order by ml.created_at desc, ml.id desc
+          ) candidate
+          order by candidate.created_at desc, candidate.id desc
           limit 1
         ) latest_message on true
+        left join lateral (
+          select candidate.created_at, candidate.id
+          from (
+            (
+              select ml.created_at, ml.id
+              from message_logs ml
+              where ml.contact_id = c.id
+                and ml.direction = 'inbound'
+              order by ml.created_at desc, ml.id desc
+              limit 1
+            )
+            union all
+            (
+              select ml.created_at, ml.id
+              from message_logs ml
+              where whatsapp_profile.whatsapp_reference <> ''
+                and ml.direction = 'inbound'
+                and regexp_replace(coalesce(ml.recipient_reference, ''), '[^0-9]', '', 'g') = whatsapp_profile.whatsapp_reference
+              order by ml.created_at desc, ml.id desc
+              limit 1
+            )
+          ) candidate
+          order by candidate.created_at desc, candidate.id desc
+          limit 1
+        ) latest_inbound_message on true
         order by c.updated_at desc;
       `),
       pool.query(`
@@ -12852,6 +13647,7 @@ app.post('/api/internacionales/sync', authMiddleware, async (request, response) 
       total: Number(countResult.rows[0]?.total ?? 0),
       source: 'tracking-api',
       syncedAt: new Date().toISOString(),
+      ...(catalog?.warning ? { warning: catalog.warning } : {}),
     })
   } catch (error) {
     response.status(502).json({

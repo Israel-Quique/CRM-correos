@@ -4,6 +4,7 @@ import { parsePhoneNumberFromString } from 'libphonenumber-js'
 import type { CountryCode } from 'libphonenumber-js'
 import * as XLSX from 'xlsx'
 import { renderAuthenticatedApp, renderLoginScreen } from './layout'
+import { getDeclaredDestinationEntries, getSafeDeclaredDepartment } from './utils/declaredDestination'
 
 type ViewKey =
   | 'ems'
@@ -16,6 +17,7 @@ type ViewKey =
   | 'chat'
   | 'contactos'
   | 'agrupaciones'
+  | 'mensajes-personalizados'
   | 'usuarios'
   | 'logs'
   | 'configuraciones'
@@ -166,6 +168,14 @@ type TrackingApiPackage = {
     detalle?: string | null
     movimiento_bolivia?: string | null
   }>
+  destinos_declarados?: Array<{
+    codigo_objeto?: string | null
+    numero_declaracion?: string | null
+    ciudad?: string | null
+    departamento?: string | null
+    codigo_postal?: string | null
+    pais_codigo?: string | null
+  }>
   origen:
   | {
     codigo: string | null
@@ -181,6 +191,37 @@ type TrackingApiPackage = {
     telefono?: string | null
   }
   | string
+  declaracion_cds?: {
+    estado: 'declarada' | 'objeto_sin_declaracion' | 'sin_objeto_cds' | 'consulta_incompleta' | string
+    truncado: boolean
+    objetos: Array<{
+      id_objeto_cds: number | string | null
+      codigo: string | null
+      identificador_local: string | null
+      identificador_local_2: string | null
+      estado_objeto: string | null
+      fecha_registro: string | null
+      declaraciones: Array<{
+        id: number | string | null
+        numero: string | null
+        estado: string | null
+        etapa: string | null
+        estado_datos: string | null
+        resumen_contenido: string | null
+        cantidad_articulos: number
+        cantidad_documentos: number
+        campos: Record<string, string>
+        articulos: Array<Record<string, string>>
+        documentos: Array<{ type: string; fields: Record<string, string> }>
+        destino_declarado?: {
+          ciudad?: string | null
+          departamento?: string | null
+          codigo_postal?: string | null
+          pais_codigo?: string | null
+        } | null
+      }>
+    }>
+  }
 }
 
 type TrackingApiEvent = NonNullable<TrackingApiPackage['eventos']>[number]
@@ -745,6 +786,7 @@ const menuGroups: Array<{
         { view: 'chat', label: 'Chat' },
         { view: 'contactos', label: 'Contactos' },
         { view: 'agrupaciones', label: 'Agrupaciones' },
+        { view: 'mensajes-personalizados', label: 'Mensajes personalizados' },
       ],
     },
     {
@@ -1189,6 +1231,8 @@ const state: {
   automationConfig: {
     automaticWelcome: boolean
     automaticStatusUpdates: boolean
+    automaticInternationalArrivalTestNotifications: boolean
+    automaticVentanillaNotifications: boolean
     automaticReconciliation: boolean
     aiAutoReply: boolean
     welcomeResponseIntervalMs: number
@@ -1206,6 +1250,10 @@ const state: {
     eventSkipped: number
     eventSkippedByReason: Record<string, number>
     eventReason: string | null
+    ventanillaSent: number
+    ventanillaSkipped: number
+    ventanillaSkippedByReason: Record<string, number>
+    ventanillaReason: string | null
     packageCountsBySource: Record<string, number>
     packageSourceFailures: string[]
     welcomeSkippedByReason: Record<string, number>
@@ -1223,6 +1271,10 @@ const state: {
     eventSkipped: number
     eventSkippedByReason: Record<string, number>
     eventReason: string | null
+    ventanillaSent: number
+    ventanillaSkipped: number
+    ventanillaSkippedByReason: Record<string, number>
+    ventanillaReason: string | null
     sourceFailures: string[]
     notificationFailures: string[]
   } | null
@@ -1240,6 +1292,9 @@ const state: {
   prontsConfigState: 'idle' | 'submitting'
   prontsConfigError: string | null
   prontsSimulationState: 'idle' | 'running'
+  customTransitMessage: string
+  personalizedMessageScope: 'nacional' | 'internacional'
+  personalizedMessageIndex: number
   pipelineConfig: PipelineConfig
   pipelineConfigState: 'idle' | 'submitting'
   pipelineConfigError: string | null
@@ -1431,6 +1486,9 @@ const state: {
   prontsConfigState: 'idle',
   prontsConfigError: null,
   prontsSimulationState: 'idle',
+  customTransitMessage: '¡Hola, Germany! 👋 Tenemos una actualización de tu paquete CP000118322BO.\n\n🚚 Tu paquete ya está en camino hacia Germany.\n📍 Última actualización registrada.\n📲 Te notificaremos cuando registre un nuevo movimiento.',
+  personalizedMessageScope: 'nacional',
+  personalizedMessageIndex: 0,
   pipelineConfig: createDefaultPipelineConfig(),
   pipelineConfigState: 'idle',
   pipelineConfigError: null,
@@ -1760,7 +1818,7 @@ const loadTrackingApiPackages = async () => {
 
   try {
     const response = await authFetch(
-      `/api/tracking/paquetes?page=${state.trackingApiPage}&per_page=${state.trackingApiPageSize}`,
+      `/api/tracking/paquetes?page=${state.trackingApiPage}&per_page=${state.trackingApiPageSize}&include_declaration=1`,
     )
     const payload = await parseApiPayload(response)
 
@@ -2802,6 +2860,7 @@ const getTrackingApiTableHead = () => {
     <thead>
       <tr>
         <th>Código</th>
+        <th>Destino declarado CDS</th>
         <th>Origen</th>
         <th>Estado</th>
         <th>Destino</th>
@@ -2812,6 +2871,34 @@ const getTrackingApiTableHead = () => {
       </tr>
     </thead>
   `
+}
+
+const getTrackingDeclaredDestinationSummary = (item: TrackingApiPackage) => {
+  const declaration = item.declaracion_cds
+  if (declaration?.estado !== 'declarada') {
+    return declaration?.estado === 'consulta_incompleta' ? 'Consulta CDS incompleta' : '—'
+  }
+
+  const declarations = (declaration.objetos ?? []).flatMap((object) => object.declaraciones ?? [])
+  const destinations = getDeclaredDestinationEntries(
+    item.destinos_declarados,
+    declarations,
+  )
+  const labels = [...new Set(destinations.flatMap((destination) => {
+    const department = getSafeDeclaredDepartment(destination.departamento)
+    return [
+      department ? `Departamento: ${department}` : '',
+      destination.ciudad ? `Ciudad: ${destination.ciudad}` : '',
+      destination.codigo_postal ? `CP: ${destination.codigo_postal}` : '',
+      destination.pais_codigo ? `País: ${destination.pais_codigo}` : '',
+    ].filter(Boolean)
+  }))]
+
+  return labels.length > 0 ? labels.join('; ') : 'Destino declarado no informado'
+}
+
+const renderTrackingDeclarationSummary = (item: TrackingApiPackage) => {
+  return escapeHtml(getTrackingDeclaredDestinationSummary(item))
 }
 
 const getContactPackagesPagination = () => {
@@ -3034,7 +3121,7 @@ const renderTrackingApiRows = () => {
   if (items.length === 0) {
     return `
       <tr>
-        <td class="international-empty" colspan="8">
+        <td class="international-empty" colspan="9">
           ${state.trackingApiState === 'loading' || isLoadingTrackingStates
         ? 'Cargando paquetes desde la API de tracking...'
         : state.packageCodeLookupQuery.trim()
@@ -3053,9 +3140,10 @@ const renderTrackingApiRows = () => {
       (item) => `
         <tr>
           <td><strong>${escapeHtml(item.codigo_s10 || item.codigo || 'Sin código')}</strong></td>
+          <td>${renderTrackingDeclarationSummary(item)}</td>
           <td>${escapeHtml(getTrackingOriginPlaceValue(item))}</td>
           <td>${escapeHtml(getTrackingVisibleStateValue(item))}</td>
-          <td>${escapeHtml(getTrackingDestinationLocationValue(item))}</td>
+          <td>${escapeHtml(getTrackingInternationalDestinationValue(item))}</td>
           <td>${escapeHtml(item.peso == null ? '—' : `${item.peso} Kg`)}</td>
           <td>${escapeHtml(getTrackingOriginPhoneValue(item))}</td>
           <td>${escapeHtml(getTrackingDestinationPhoneValue(item))}</td>
@@ -3456,6 +3544,31 @@ const getTrackingOriginPlaceValue = (item: TrackingApiPackage) => {
 const getTrackingDestinationLocationValue = (item: TrackingApiPackage) =>
   getTrackingLocationName(item.destino)
 
+const getTrackingInternationalDestinationValue = (item: TrackingApiPackage) => {
+  const destination = getTrackingDestinationLocationValue(item)
+  if (normalizeCountryKey(destination) !== 'sin dato') return destination
+
+  const packageCode = getTrackingPackageCode(item)
+  if (!/^[A-Z]{2}\d{9}[A-Z]{2}$/.test(packageCode) || isNationalPackageCode(packageCode)) {
+    return destination
+  }
+
+  const latestEvent = getTrackingLatestEvent(item)
+  const eventText = normalizeCountryKey(
+    [
+      latestEvent?.nombre,
+      latestEvent?.evento_api,
+      latestEvent?.evento_original,
+      latestEvent?.movimiento_bolivia,
+      latestEvent?.detalle,
+    ]
+      .filter(Boolean)
+      .join(' '),
+  )
+
+  return /\b(entrada|inbound|importacion)\b/.test(eventText) ? 'Bolivia' : destination
+}
+
 const getTrackingOriginPhoneValue = (item: TrackingApiPackage) =>
   normalizeText(item.telefonos?.remitente ?? null) ||
   normalizeText(item.remitente?.telefono ?? null) ||
@@ -3483,10 +3596,16 @@ const getInternationalIpsStage = (event?: TrackingApiEvent | null): EmsColumnKey
   if (!event) return null
 
   const eventId = Number(event.evento_id ?? event.codigo_evento ?? event.event_code ?? event.event_type_cd ?? event.event_id)
+  const eventText = normalizeCountryKey(
+    [event.nombre, event.evento_api, event.evento_original, event.movimiento_bolivia, event.detalle]
+      .filter(Boolean)
+      .join(' '),
+  )
   if (eventId === 37) return 'delivered'
   if (eventId === 76) return 'cancelled'
   if ([32, 36, 39, 73, 74, 75].includes(eventId)) return 'courier'
   if ([13, 14, 35, 71, 72].includes(eventId)) return 'regional'
+  if (eventId === 38 && (eventText.includes('devol') || eventText.includes('return'))) return 'cancelled'
   if ([31, 34, 38].includes(eventId)) return 'transit'
   if ([1, 2, 3, 8, 12, 30].includes(eventId)) return 'received'
 
@@ -3511,7 +3630,7 @@ const getPackageEventStage = (event?: TrackingApiEvent | null): EmsColumnKey | n
   )
 
   if (eventText.includes('cancel') || eventText.includes('anul') || eventText.includes('rechaz')) return 'cancelled'
-  if (eventText.includes('devuelto')) return 'cancelled'
+  if (eventText.includes('devuelt') || eventText.includes('devolv') || eventText.includes('return')) return 'cancelled'
   if (eventText.includes('entreg')) return 'delivered'
   if (eventText.includes('cartero') || eventText.includes('reparto')) return 'courier'
   if (
@@ -3573,7 +3692,13 @@ const hasPackageTransfer = (item: Record<string, unknown>) =>
 
 const getTrackingApiLookupPackage = () => {
   const lookupResult = state.packageCodeLookupResult as Record<string, any> | null
-  return lookupResult?.found && lookupResult?.tracking?.record ? (lookupResult.tracking.record as TrackingApiPackage) : null
+  if (!lookupResult?.found) return null
+
+  const trackingRecord = lookupResult?.tracking?.record
+  if (trackingRecord) return trackingRecord as TrackingApiPackage
+
+  const cdsRecord = lookupResult?.cds?.found ? lookupResult.cds.record : null
+  return cdsRecord ? (cdsRecord as TrackingApiPackage) : null
 }
 
 const getTrackingApiSourcePackages = () =>
@@ -3812,7 +3937,11 @@ const getContactPackagePipelineStage = (item: ContactPackagesApiItem): EmsColumn
   if (
     status.includes('cancel') ||
     status.includes('anul') ||
-    status.includes('rechaz')
+    status.includes('rechaz') ||
+    status.includes('devuelt') ||
+    status.includes('devolv') ||
+    status.includes('retorn') ||
+    status.includes('return')
   ) {
     return 'cancelled'
   }
@@ -4321,6 +4450,18 @@ const ensureWhatsAppTestModeSourcesLoaded = async () => {
 const getTrackingPipelineStage = (item: TrackingApiPackage): EmsColumnKey => {
   const postalState = normalizeCountryKey(item.estado_postal)
   const latestEvent = getTrackingLatestEvent(item)
+  if (
+    postalState.includes('cancel') ||
+    postalState.includes('anul') ||
+    postalState.includes('rechaz') ||
+    postalState.includes('devuelt') ||
+    postalState.includes('devolv') ||
+    postalState.includes('retorn') ||
+    postalState.includes('return')
+  ) {
+    return 'cancelled'
+  }
+
   const ipsStage = getInternationalIpsStage(latestEvent)
   if (ipsStage) return ipsStage
 
@@ -4353,9 +4494,16 @@ const getTrackingPipelineStage = (item: TrackingApiPackage): EmsColumnKey => {
   if (
     postalState.includes('cancel') ||
     postalState.includes('anul') ||
+    postalState.includes('devuelt') ||
+    postalState.includes('devolv') ||
+    postalState.includes('retorn') ||
+    postalState.includes('return') ||
     latestEventText.includes('cancel') ||
     latestEventText.includes('anul') ||
-    latestEventText.includes('rechaz')
+    latestEventText.includes('rechaz') ||
+    latestEventText.includes('devuelt') ||
+    latestEventText.includes('devolv') ||
+    latestEventText.includes('return')
   ) {
     return 'cancelled'
   }
@@ -4380,8 +4528,7 @@ const getTrackingPipelineStage = (item: TrackingApiPackage): EmsColumnKey => {
     latestEventText.includes('proceso') ||
     latestEventText.includes('proces') ||
     latestEventText.includes('en curso') ||
-    latestEventText.includes('ruta') ||
-    latestEventText.includes('clasific')
+    latestEventText.includes('ruta')
   ) {
     return 'transit'
   }
@@ -4405,7 +4552,10 @@ const getTrackingPipelineStage = (item: TrackingApiPackage): EmsColumnKey => {
     latestEventText.includes('sucursal de destino') ||
     latestEventText.includes('recibido destino') ||
     latestEventText.includes('recibido regional') ||
-    latestEventText.includes('pasar a recoger')
+    latestEventText.includes('pasar a recoger') ||
+    latestEventText.includes('ubicacion nacional') ||
+    latestEventText.includes('traslado') ||
+    latestEventText.includes('clasific')
   ) {
     return 'regional'
   }
@@ -4513,16 +4663,37 @@ const getTrackingApiStateLabel = (item: TrackingApiPackage) => {
 }
 
 const getApiPipelineStateOptions = (scope: EmsColumnKey | null = null): ApiPipelineStateOption[] => {
-  const trackingPackages = getTrackingApiSourcePackages().filter(isNationalTrackingPackage)
-  const contactPackages = getEffectiveContactPackages().filter(isNationalContactPackage)
+  const isInternationalPipeline = state.activeView === 'internacionales-tablero'
+  const trackingPackages = getTrackingApiSourcePackages().filter((item) =>
+    isInternationalPipeline ? !isNationalTrackingPackage(item) : isNationalTrackingPackage(item),
+  )
+  const contactPackages = isInternationalPipeline
+    ? []
+    : getEffectiveContactPackages().filter(isNationalContactPackage)
+  const matchesPipelineFilters = (dateValue: unknown, departmentValue: unknown) => {
+    if (!isInternationalPipeline) {
+      return matchesEmsPipelineFilters(dateValue, departmentValue)
+    }
+
+    const dateKey = getEmsPipelineDateKey(dateValue)
+    if (
+      !dateKey ||
+      dateKey < state.internationalPipelineDateStart ||
+      dateKey > state.internationalPipelineDateEnd
+    ) {
+      return false
+    }
+    if (state.internationalPipelineDepartment === 'all') return true
+    return getBolivianDepartmentKey(departmentValue) === state.internationalPipelineDepartment
+  }
   const filteredTrackingPackages = trackingPackages.filter((item) =>
-    matchesEmsPipelineFilters(
+    matchesPipelineFilters(
       getTrackingLatestEvent(item)?.fecha || item?.fecha_registro,
       getEmsPipelineEventLocation(item),
     ),
   )
   const filteredContactPackages = contactPackages.filter((item) =>
-    matchesEmsPipelineFilters(item?.fecha_registro, getEmsPipelineEventLocation(item)),
+    matchesPipelineFilters(item?.fecha_registro, getEmsPipelineEventLocation(item)),
   )
   const stateMap = new Map<
     string,
@@ -5084,6 +5255,8 @@ const loadAutomationConfig = async ({ force = false } = {}) => {
 const saveAutomationSettings = async (config: {
   automaticWelcome: boolean
   automaticStatusUpdates: boolean
+  automaticInternationalArrivalTestNotifications: boolean
+  automaticVentanillaNotifications: boolean
   aiAutoReply: boolean
   welcomeResponseIntervalMs: number
   eventChangeResponseIntervalMs: number
@@ -8985,7 +9158,8 @@ const closeContactProfileModal = () => {
 const openTrackingInfoModal = (trackingId: string | number) => {
   const pipelinePackages = Object.values(state.internationalPipelineColumns)
     .flatMap((column) => column.items)
-  const packages = [...state.trackingApiPackages, ...pipelinePackages]
+  const lookupPackage = getTrackingApiLookupPackage()
+  const packages = [...state.trackingApiPackages, ...pipelinePackages, ...(lookupPackage ? [lookupPackage] : [])]
   const selectedPackage =
     packages.find(
       (item) =>
@@ -9486,6 +9660,8 @@ const renderAppNow = () => {
     void saveAutomationSettings({
       automaticWelcome: getSetting('automaticWelcome'),
       automaticStatusUpdates: getSetting('automaticStatusUpdates'),
+      automaticInternationalArrivalTestNotifications: getSetting('automaticInternationalArrivalTestNotifications'),
+      automaticVentanillaNotifications: getSetting('automaticVentanillaNotifications'),
       aiAutoReply: getSetting('aiAutoReply'),
       automaticReconciliation: getSetting('automaticReconciliation'),
       welcomeResponseIntervalMs: getIntervalMs('welcomeResponseIntervalMs', state.automationConfig?.welcomeResponseIntervalMs ?? 5 * 60 * 1000),
@@ -9900,6 +10076,10 @@ const renderAppNow = () => {
     renderApp()
   })
 
+  document.querySelector<HTMLTextAreaElement>('[data-custom-transit-message]')?.addEventListener('input', (event) => {
+    state.customTransitMessage = (event.target as HTMLTextAreaElement).value
+  })
+
   document.querySelectorAll<HTMLInputElement>('[data-pipeline-title-input]').forEach((input) => {
     input.addEventListener('input', () => {
       const column = input.dataset.pipelineTitleInput as EmsColumnKey | undefined
@@ -9907,6 +10087,42 @@ const renderAppNow = () => {
       setPipelineColumnConfig(column, { title: input.value })
       renderApp()
     })
+  })
+
+  document.querySelector<HTMLButtonElement>('#save-personalized-messages')?.addEventListener('click', () => {
+    const messages: Record<string, string> = {}
+    document.querySelectorAll<HTMLTextAreaElement>('[data-personalized-message]').forEach((textarea) => {
+      messages[textarea.dataset.personalizedMessage || ''] = textarea.value.trim()
+    })
+    localStorage.setItem('crm-personalized-messages', JSON.stringify(messages))
+    state.notice = 'Los mensajes personalizados se guardaron correctamente.'
+    renderApp()
+  })
+
+  document.querySelectorAll<HTMLButtonElement>('[data-message-scope]').forEach((button) => button.addEventListener('click', () => {
+    state.personalizedMessageScope = button.dataset.messageScope === 'internacional' ? 'internacional' : 'nacional'
+    state.personalizedMessageIndex = 0
+    renderApp()
+  }))
+  document.querySelectorAll<HTMLButtonElement>('[data-message-index]').forEach((button) => button.addEventListener('click', () => {
+    state.personalizedMessageIndex = Number(button.dataset.messageIndex || 0)
+    renderApp()
+  }))
+  document.querySelectorAll<HTMLInputElement>('[data-message-enabled]').forEach((input) => input.addEventListener('change', () => {
+    let enabled: Record<string, boolean> = {}
+    try { enabled = JSON.parse(localStorage.getItem('crm-personalized-messages-enabled') || '{}') } catch {}
+    enabled[input.dataset.messageEnabled || ''] = input.checked
+    localStorage.setItem('crm-personalized-messages-enabled', JSON.stringify(enabled))
+    renderApp()
+  }))
+  document.querySelector<HTMLButtonElement>('#save-selected-personalized-message')?.addEventListener('click', () => {
+    const key = `${state.personalizedMessageScope}-${state.personalizedMessageIndex}`
+    let saved: Record<string, string> = {}
+    try { saved = JSON.parse(localStorage.getItem('crm-personalized-messages-v2') || '{}') } catch {}
+    saved[key] = document.querySelector<HTMLTextAreaElement>('#personalized-message-editor')?.value || ''
+    localStorage.setItem('crm-personalized-messages-v2', JSON.stringify(saved))
+    state.notice = 'El mensaje personalizado se guardó correctamente.'
+    renderApp()
   })
 
   document.querySelectorAll<HTMLInputElement>('[data-pipeline-helper-input]').forEach((input) => {
@@ -11249,6 +11465,12 @@ const submitLogin = async () => {
       }),
     })
 
+    if ([502, 503, 504].includes(response.status)) {
+      throw new Error(
+        `El backend no responde (HTTP ${response.status}). Inícialo con \`npm --prefix backend run dev\` y vuelve a intentar.`,
+      )
+    }
+
     const payload = await parseApiPayload(response)
 
     if (!response.ok) {
@@ -11261,7 +11483,11 @@ const submitLogin = async () => {
   } catch (error) {
     state.loginState = 'idle'
     state.loginError =
-      error instanceof Error ? error.message : 'Ocurrio un error inesperado al iniciar sesion.'
+      error instanceof TypeError
+        ? 'No se pudo conectar con el backend. Inícialo con `npm --prefix backend run dev` y vuelve a intentar.'
+        : error instanceof Error
+          ? error.message
+          : 'Ocurrio un error inesperado al iniciar sesion.'
     renderApp()
   }
 }

@@ -187,6 +187,28 @@ alter table message_logs
 alter table message_logs
   add column if not exists media_filename text;
 
+create index if not exists message_logs_contact_latest_idx
+  on message_logs (contact_id, created_at desc, id desc);
+
+create index if not exists message_logs_inbound_contact_latest_idx
+  on message_logs (contact_id, created_at desc, id desc)
+  where direction = 'inbound';
+
+create index if not exists message_logs_recipient_latest_idx
+  on message_logs (
+    (regexp_replace(coalesce(recipient_reference, ''), '[^0-9]', '', 'g')),
+    created_at desc,
+    id desc
+  );
+
+create index if not exists message_logs_inbound_recipient_latest_idx
+  on message_logs (
+    (regexp_replace(coalesce(recipient_reference, ''), '[^0-9]', '', 'g')),
+    created_at desc,
+    id desc
+  )
+  where direction = 'inbound';
+
 create table if not exists contact_groups (
   id serial primary key,
   name text not null,
